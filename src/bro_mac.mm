@@ -59,6 +59,10 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
   if (self) {
     self.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
 
+    // Performance: Enable layer-backing for GPU compositing
+    self.wantsLayer = YES;
+    self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+
     // Create navigation buttons
     CGFloat x = 80.0;  // Leave space for window controls
     CGFloat y = (frame.size.height - kButtonSize) / 2.0;
@@ -411,6 +415,10 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
     _tabs = [NSMutableArray array];
     _activeTabId = -1;
     self.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+
+    // Performance: Enable layer-backing for GPU compositing
+    self.wantsLayer = YES;
+    self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
 
     // New tab button
     _addTabButton = [[NSButton alloc] initWithFrame:NSMakeRect(8, 4, 28, 28)];
@@ -1226,8 +1234,18 @@ int main(int argc, char* argv[]) {
     CefString(&settings.root_cache_path).FromString([cachePath UTF8String]);
     CefString(&settings.cache_path).FromString([cachePath UTF8String]);
 
-    // Enable logging for debugging
+    // Reduce logging in Release builds
+#ifdef NDEBUG
+    settings.log_severity = LOGSEVERITY_WARNING;
+#else
     settings.log_severity = LOGSEVERITY_INFO;
+#endif
+
+    // Performance: Persist session cookies for faster repeat visits
+    settings.persist_session_cookies = true;
+
+    // Performance: Set background color to reduce flash-of-white
+    settings.background_color = CefColorSetARGB(255, 30, 30, 30);
 
     // BroApp implements application-level callbacks for the browser process.
     CefRefPtr<BroApp> app(new BroApp);

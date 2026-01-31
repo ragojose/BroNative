@@ -1,6 +1,22 @@
 cmake_minimum_required(VERSION 3.21)
 project(Bro)
 
+# Default to Release build if not specified
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo")
+endif()
+
+# Release build optimizations
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto")
+
+# Strip symbols in Release
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
+endif()
+
 # CEF binary distribution path
 set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/cef_binary_145.0.21+gd7459b1+chromium-145.0.7632.26_macosarm64_beta_minimal")
 

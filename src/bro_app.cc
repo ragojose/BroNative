@@ -13,35 +13,10 @@ BroApp::BroApp() = default;
 void BroApp::OnBeforeCommandLineProcessing(
     const CefString& process_type,
     CefRefPtr<CefCommandLine> command_line) {
-  // Enable GPU acceleration and WebGL/WebGPU support
-
-  // Enable hardware acceleration
+  // Minimal flags - only what's needed for basic GPU acceleration
   command_line->AppendSwitch("enable-gpu");
-  command_line->AppendSwitch("enable-gpu-rasterization");
-
-  // Enable WebGL
-  command_line->AppendSwitch("enable-webgl");
-  command_line->AppendSwitch("enable-webgl2-compute-context");
-
-  // Enable WebGPU
-  command_line->AppendSwitch("enable-unsafe-webgpu");
-  command_line->AppendSwitch("enable-features=Vulkan,WebGPU");
-
-  // Use ANGLE for WebGL on macOS (better compatibility)
   command_line->AppendSwitchWithValue("use-angle", "metal");
-
-  // Enable zero-copy for better performance
-  command_line->AppendSwitch("enable-zero-copy");
-
-  // Disable some restrictions that might block GPU features
   command_line->AppendSwitch("ignore-gpu-blocklist");
-  command_line->AppendSwitch("disable-gpu-driver-bug-workarounds");
-
-  // Enable accelerated 2D canvas
-  command_line->AppendSwitch("enable-accelerated-2d-canvas");
-
-  // For macOS-specific GPU improvements
-  command_line->AppendSwitch("use-mock-keychain");
 }
 
 void BroApp::OnContextInitialized() {
