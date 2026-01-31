@@ -1,0 +1,31 @@
+# Build outputs
+build/
+cmake-build-*/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# CEF project (separate repo)
+cef-project/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.dylib
+*.so
+
+# Debug files
+*.log
+debug.log
