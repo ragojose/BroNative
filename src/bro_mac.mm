@@ -4,6 +4,7 @@
 // found in the LICENSE file.
 
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -27,12 +28,31 @@
 static const CGFloat kToolbarHeight = 52.0;
 static const CGFloat kButtonSize = 28.0;
 static const CGFloat kButtonSpacing = 4.0;
-static const CGFloat kTabPillMaxWidth = 300.0;
+// Wide enough that the "Enter URL or search" placeholder reads in full.
+static const CGFloat kTabPillMaxWidth = 180.0;
 static const CGFloat kTabPillMinWidth = 110.0;
-static const CGFloat kTabPillHeight = 32.0;
-static const CGFloat kPillCornerRadius = 10.0;
+// In narrow windows (mobile shell) pills may shrink below the comfortable
+// minimum rather than overlap the controls to the right of the strip.
+static const CGFloat kTabPillHardMinWidth = 64.0;
+// Pills narrower than this drop their close button so it doesn't crowd the
+// favicon and title.
+static const CGFloat kTabPillCloseMinWidth = 80.0;
+static const CGFloat kTabPillHeight = 28.0;
+// The "+" button is half the pill's size, centered on the same midline.
+static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
+static const CGFloat kPillCornerRadius = 8.0;
 static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
+static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
+// Shell width while the window hugs the mobile viewport: the 390pt column
+// plus bezels wide enough that the chrome row (~460pt minimum) still fits.
+static const CGFloat kMobileShellWidth = 480.0;
+static const NSTimeInterval kViewportAnimDuration = 0.28;
+// Black-glass tuning: tint over the behind-window blur and the hairline frame
+// traced around the window edge.
+static const CGFloat kGlassTintAlpha = 0.5;
+static const CGFloat kWindowBorderAlpha = 0.12;
+static const CGFloat kWindowCornerRadiusFallback = 12.0;
 
 // Global references
 static BroWindow* g_main_window = nil;
@@ -41,6 +61,11 @@ static BroTabBar* g_tab_bar = nil;
 
 // Map browser IDs to their container views
 static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
+
+// Tabs currently on a blank page (about:blank or no committed URL yet). Their
+// container stays hidden even while active so the glass window shows through
+// as the new-tab state.
+static NSMutableSet<NSNumber*>* g_blank_tab_ids = nil;
 
 // Containers created for incoming popup browsers, keyed by popup ID. Entries
 // are removed when the popup's browser is adopted as a tab, or on abort.
@@ -54,10 +79,39 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 // emulation is per-tab).
 static void UpdateChromeLayout(void);
 
+// Animates the window between its desktop frame and a shell that hugs the
+// mobile viewport, tracking the active tab's viewport mode.
+static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate);
+
+// Desktop frame to restore when leaving mobile layout; NSZeroRect = none
+// saved. Saved only when empty and cleared only when a desktop restore
+// completes, so interrupted toggle cycles never overwrite the original.
+static NSRect g_saved_desktop_frame = NSZeroRect;
+// Whether the shell currently hugs the mobile viewport (set at animation
+// start, so re-entrant calls see consistent state).
+static BOOL g_window_in_mobile_layout = NO;
+// Stale-completion guard: a superseded animation must not restore masks.
+static int g_viewport_anim_token = 0;
+
 // True if the given tab has mobile emulation active.
 static BOOL TabIsMobile(int browser_id) {
   BroHandler* handler = BroHandler::GetInstance();
   return handler && handler->IsTabMobile(browser_id);
+}
+
+// Implicit-animation actions so state changes (hover/focus/active) fade
+// instead of snapping. Backing layers suppress implicit animations by
+// default; installing explicit actions re-enables them for these keys.
+static NSDictionary* BroLayerTransitionActions(void) {
+  NSMutableDictionary* actions = [NSMutableDictionary dictionary];
+  for (NSString* key in @[ @"borderColor", @"backgroundColor", @"borderWidth" ]) {
+    CABasicAnimation* fade = [CABasicAnimation animationWithKeyPath:key];
+    fade.duration = 0.15;
+    fade.timingFunction =
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    actions[key] = fade;
+  }
+  return actions;
 }
 
 #pragma mark - BroHoverButton
@@ -68,11 +122,15 @@ static BOOL TabIsMobile(int browser_id) {
 @interface BroHoverButton : NSButton
 // Persistent "selected" background for toggle buttons (viewport modes).
 @property (nonatomic, assign) BOOL selectedState;
+// Resting border, restored when the white keyboard-focus ring goes away.
+@property (nonatomic, assign) CGFloat baseBorderWidth;
+@property (nonatomic, strong) NSColor* baseBorderColor;
 @end
 
 @implementation BroHoverButton {
   BOOL hovered_;
   BOOL pressed_;
+  BOOL focused_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -80,7 +138,10 @@ static BOOL TabIsMobile(int browser_id) {
   if (self) {
     self.wantsLayer = YES;
     self.layer.cornerRadius = 6.0;
-    self.focusRingType = NSFocusRingTypeExterior;
+    self.layer.actions = BroLayerTransitionActions();
+    // Keyboard focus shows as the same white ring the tab pills use, not the
+    // system's accent-colored ring.
+    self.focusRingType = NSFocusRingTypeNone;
     NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
         initWithRect:NSZeroRect
              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
@@ -100,26 +161,55 @@ static BOOL TabIsMobile(int browser_id) {
   return self.enabled && !self.hiddenOrHasHiddenAncestor;
 }
 
-- (void)drawFocusRingMask {
-  [[NSBezierPath bezierPathWithRoundedRect:self.bounds
-                                   xRadius:self.layer.cornerRadius
-                                   yRadius:self.layer.cornerRadius] fill];
+- (void)refreshBorder {
+  if (focused_) {
+    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.9].CGColor;
+    self.layer.borderWidth = 2.0;
+  } else {
+    self.layer.borderColor = _baseBorderColor.CGColor;
+    self.layer.borderWidth = _baseBorderWidth;
+  }
 }
 
-- (NSRect)focusRingMaskBounds {
-  return self.bounds;
+- (void)setBaseBorderWidth:(CGFloat)width {
+  _baseBorderWidth = width;
+  [self refreshBorder];
 }
 
+- (void)setBaseBorderColor:(NSColor*)color {
+  _baseBorderColor = color;
+  [self refreshBorder];
+}
+
+- (BOOL)becomeFirstResponder {
+  BOOL ok = [super becomeFirstResponder];
+  if (ok) {
+    focused_ = YES;
+    [self refreshBorder];
+  }
+  return ok;
+}
+
+- (BOOL)resignFirstResponder {
+  BOOL ok = [super resignFirstResponder];
+  if (ok) {
+    focused_ = NO;
+    [self refreshBorder];
+  }
+  return ok;
+}
+
+// Hover/pressed feedback needs an enabled button, but the selected
+// background persists even when the toggle is disabled (a selected viewport
+// mode is inert until the other one is chosen).
 - (void)refreshBackground {
   CGFloat alpha = 0.0;
-  if (self.enabled) {
-    if (pressed_) {
-      alpha = 0.16;
-    } else if (_selectedState) {
-      alpha = hovered_ ? 0.14 : 0.10;
-    } else if (hovered_) {
-      alpha = 0.08;
-    }
+  if (pressed_) {
+    alpha = 0.16;
+  } else if (_selectedState) {
+    alpha = (self.enabled && hovered_) ? 0.14 : 0.10;
+  } else if (self.enabled && hovered_) {
+    alpha = 0.08;
   }
   self.layer.backgroundColor =
       alpha > 0 ? [NSColor colorWithWhite:1.0 alpha:alpha].CGColor
@@ -204,6 +294,18 @@ static BOOL TabIsMobile(int browser_id) {
 
 @implementation BroAddressField
 
+// While idle the field is click-through: the pill underneath owns the mouse,
+// so the active tab can be dragged to reorder from anywhere on its surface,
+// and a plain click focuses the field on mouse-up (selecting the whole URL,
+// like other browsers). Once editing starts, the field editor takes over and
+// the mouse behaves like a normal text field.
+- (NSView*)hitTest:(NSPoint)point {
+  if (!self.currentEditor) {
+    return nil;
+  }
+  return [super hitTest:point];
+}
+
 - (BOOL)becomeFirstResponder {
   BOOL ok = [super becomeFirstResponder];
   if (ok && [self.delegate isKindOfClass:[BroToolbar class]]) {
@@ -264,6 +366,10 @@ static BOOL TabIsMobile(int browser_id) {
     _addressField.delegate = self;
     _addressField.cell.scrollable = YES;
     _addressField.cell.usesSingleLineMode = YES;
+    // Long URLs/hosts show an ellipsis at rest; the field editor still
+    // scrolls while typing.
+    _addressField.cell.lineBreakMode = NSLineBreakByTruncatingTail;
+    _addressField.cell.truncatesLastVisibleLine = YES;
     _addressField.accessibilityLabel = @"Address and search bar";
 
     // Viewport mode toggles pinned to the right edge. Exposed as a radio
@@ -284,6 +390,10 @@ static BOOL TabIsMobile(int browser_id) {
     _desktopButton.autoresizingMask = NSViewMinXMargin;
     [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
     [self addSubview:_desktopButton];
+    // The selected toggle is disabled but must keep its bright tint, so don't
+    // let AppKit dim the icon.
+    ((NSButtonCell*)_mobileButton.cell).imageDimsWhenDisabled = NO;
+    ((NSButtonCell*)_desktopButton.cell).imageDimsWhenDisabled = NO;
     [self setViewportMode:NO];
 
     // Initial button states
@@ -406,7 +516,7 @@ static BOOL TabIsMobile(int browser_id) {
   }
   handler->SetTabMobileEmulation(activeId, mobile);
   [self setViewportMode:mobile];
-  UpdateChromeLayout();
+  UpdateWindowForViewportMode(mobile, YES);
 }
 
 - (void)setViewportMode:(BOOL)mobile {
@@ -416,21 +526,34 @@ static BOOL TabIsMobile(int browser_id) {
   _mobileButton.contentTintColor = mobile ? active : inactive;
   _desktopButton.selectedState = !mobile;
   _mobileButton.selectedState = mobile;
+
+  // The mode already in effect is inert: no hover, no click, no tab stop.
+  BroHoverButton* selected = mobile ? _mobileButton : _desktopButton;
+  BroHoverButton* other = mobile ? _desktopButton : _mobileButton;
+  selected.enabled = NO;
+  other.enabled = YES;
+  if (self.window.firstResponder == selected) {
+    [self.window makeFirstResponder:other];
+  }
 }
 
 #pragma mark - NSTextFieldDelegate
 
 - (void)addressFieldDidFocus {
-  // Show the full URL for editing and brighten the host pill while focused.
+  // Show the full URL for editing; the host pill shows the focused look
+  // (#ccc hairline border, pure white text) from click-in through typing.
   if (_fullURL.length > 0) {
     _addressField.stringValue = _fullURL;
   }
   _addressField.superview.layer.borderColor =
-      [NSColor colorWithWhite:1.0 alpha:0.30].CGColor;
+      [NSColor colorWithWhite:0xCC / 255.0 alpha:1.0].CGColor;
+  _addressField.superview.layer.borderWidth = 1.0;
+  _addressField.textColor = [NSColor whiteColor];
   dispatch_async(dispatch_get_main_queue(), ^{
     NSTextView* editor = (NSTextView*)[self.addressField currentEditor];
     if ([editor isKindOfClass:[NSTextView class]]) {
       editor.insertionPointColor = [NSColor whiteColor];
+      editor.textColor = [NSColor whiteColor];
       editor.drawsBackground = NO;
       [editor selectAll:nil];
     }
@@ -447,8 +570,11 @@ static BOOL TabIsMobile(int browser_id) {
         [self.window makeFirstResponder:nil];
       });
     }
+    // Back to the active pill's resting border (mirrors updateAppearance).
     _addressField.superview.layer.borderColor =
-        [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+        [NSColor colorWithWhite:0x22 / 255.0 alpha:1.0].CGColor;
+    _addressField.superview.layer.borderWidth = 1.0;
+    _addressField.textColor = [NSColor labelColor];
     [self displayCompactURL];
   }
 }
@@ -467,6 +593,10 @@ static BOOL TabIsMobile(int browser_id) {
 }
 
 - (void)updateURL:(NSString*)url {
+  // Blank pages keep the field empty rather than showing "about:blank".
+  if ([url isEqualToString:@"about:blank"]) {
+    url = @"";
+  }
   self.fullURL = url ?: @"";
   // Don't clobber text the user is currently typing.
   if ([_addressField currentEditor]) {
@@ -493,6 +623,8 @@ static BOOL TabIsMobile(int browser_id) {
 @property (nonatomic, strong) NSButton* closeButton;
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, assign) BOOL isLoading;
+// NO on a lone tab: closing it would close the window, so the pill hides ✕.
+@property (nonatomic, assign) BOOL closable;
 @property (nonatomic, copy) NSString* tabURL;
 @property (nonatomic, weak) id target;
 @property (nonatomic, assign) SEL selectAction;
@@ -520,11 +652,18 @@ static BOOL TabIsMobile(int browser_id) {
 - (void)updateTabLoading:(int)browserId loading:(BOOL)loading;
 // Moves keyboard focus to the pill `offset` positions from `tab`.
 - (void)focusTabRelativeTo:(BroTabView*)tab offset:(NSInteger)offset;
+// Drag-to-reorder: a pill arms on mouse-down, starts dragging once the mouse
+// moves past a small threshold, and reports on mouse-up whether a drag
+// actually happened (a plain click if not).
+- (void)beginPotentialDragForTab:(BroTabView*)tab withEvent:(NSEvent*)event;
+- (void)dragTab:(BroTabView*)tab withEvent:(NSEvent*)event;
+- (BOOL)endDragForTab:(BroTabView*)tab;
 @end
 
 @implementation BroTabView {
   BOOL hovered_;
   BOOL focused_;
+  BOOL wasActiveAtMouseDown_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame browserId:(int)browserId {
@@ -538,6 +677,7 @@ static BOOL TabIsMobile(int browser_id) {
     self.wantsLayer = YES;
     self.layer.cornerRadius = kPillCornerRadius;
     self.layer.borderWidth = 1.0;
+    self.layer.actions = BroLayerTransitionActions();
     // Keyboard focus shows as a white pill border instead of the system's
     // accent-colored ring.
     self.focusRingType = NSFocusRingTypeNone;
@@ -548,7 +688,7 @@ static BOOL TabIsMobile(int browser_id) {
     _faviconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     // Default globe icon
     _faviconView.image = RadixIconImage(RadixIconGlobe, 15);
-    _faviconView.contentTintColor = [NSColor secondaryLabelColor];
+    _faviconView.contentTintColor = [NSColor colorWithWhite:0x33 / 255.0 alpha:1.0];
     [self addSubview:_faviconView];
 
     // Loading spinner (same position as favicon, hidden by default)
@@ -574,7 +714,8 @@ static BOOL TabIsMobile(int browser_id) {
     _titleLabel.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_titleLabel];
 
-    // Close button (always visible, like the mockup)
+    // Close button (visible whenever the pill is closable; the tab bar hides
+    // it on a lone tab)
     BroHoverButton* closeButton = [[BroHoverButton alloc]
         initWithFrame:NSMakeRect(frame.size.width - 26,
                                  (kTabPillHeight - 16) / 2.0, 16, 16)];
@@ -633,7 +774,7 @@ static BOOL TabIsMobile(int browser_id) {
 // Hosts the toolbar's shared address field (this pill is the active tab).
 - (void)attachAddressField:(NSTextField*)field {
   NSRect bounds = self.bounds;
-  field.frame = NSMakeRect(32, (bounds.size.height - 18) / 2.0,
+  field.frame = NSMakeRect(32, (bounds.size.height - 18) / 2.0 - 1.0,
                            bounds.size.width - 32 - 26, 18);
   field.autoresizingMask = NSViewWidthSizable;
   [self addSubview:field];
@@ -659,7 +800,7 @@ static BOOL TabIsMobile(int browser_id) {
 - (void)updateAppearance {
   if (_isActive) {
     self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
-    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    self.layer.borderColor = [NSColor colorWithWhite:0x22 / 255.0 alpha:1.0].CGColor;
     _titleLabel.textColor = [NSColor labelColor];
   } else {
     CGFloat bg = hovered_ ? 0.06 : 0.03;
@@ -675,6 +816,14 @@ static BOOL TabIsMobile(int browser_id) {
   } else {
     self.layer.borderWidth = 1.0;
   }
+  // The active pill always shows ✕; inactive pills reveal it on hover or
+  // keyboard focus.
+  _closeButton.hidden = !(_closable && (_isActive || hovered_ || focused_));
+}
+
+- (void)setClosable:(BOOL)closable {
+  _closable = closable;
+  [self updateAppearance];
 }
 
 - (void)setIsActive:(BOOL)isActive {
@@ -691,8 +840,34 @@ static BOOL TabIsMobile(int browser_id) {
   }
 }
 
+// Switching tabs happens on mouse-down (like real browsers). Focusing the
+// active pill's address field waits until mouse-up so starting a drag on the
+// active tab doesn't drop into URL editing. Any pill can be picked up and
+// dragged to reorder the strip.
 - (void)mouseDown:(NSEvent*)event {
-  [self performSelect];
+  wasActiveAtMouseDown_ = _isActive;
+  if (!_isActive) {
+    [self performSelect];
+  }
+  if ([self.superview isKindOfClass:[BroTabBar class]]) {
+    [(BroTabBar*)self.superview beginPotentialDragForTab:self withEvent:event];
+  }
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+  if ([self.superview isKindOfClass:[BroTabBar class]]) {
+    [(BroTabBar*)self.superview dragTab:self withEvent:event];
+  }
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  BOOL dragged = NO;
+  if ([self.superview isKindOfClass:[BroTabBar class]]) {
+    dragged = [(BroTabBar*)self.superview endDragForTab:self];
+  }
+  if (!dragged && wasActiveAtMouseDown_) {
+    [self performSelect];
+  }
 }
 
 - (void)mouseEntered:(NSEvent*)event {
@@ -801,7 +976,12 @@ static BOOL TabIsMobile(int browser_id) {
 
 #pragma mark - BroTabBar
 
-@implementation BroTabBar
+@implementation BroTabBar {
+  BroTabView* draggingTab_;
+  BOOL dragging_;
+  CGFloat dragStartX_;
+  CGFloat dragOffsetX_;
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
   self = [super initWithFrame:frame];
@@ -813,19 +993,22 @@ static BOOL TabIsMobile(int browser_id) {
     // Performance: Enable layer-backing for GPU compositing
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
+    // Pills that still don't fit at their hard minimum width are clipped
+    // rather than drawn over the controls to the right of the strip.
+    self.layer.masksToBounds = YES;
 
     // Bordered rounded-rect "+" button, repositioned after the last pill.
-    CGFloat pillY = (frame.size.height - kTabPillHeight) / 2.0;
+    CGFloat addY = (frame.size.height - kAddTabButtonSize) / 2.0;
     _addTabButton = [[BroHoverButton alloc]
-        initWithFrame:NSMakeRect(0, pillY, kTabPillHeight, kTabPillHeight)];
+        initWithFrame:NSMakeRect(0, addY, kAddTabButtonSize, kAddTabButtonSize)];
     _addTabButton.bordered = NO;
     _addTabButton.title = @"";
-    _addTabButton.image = RadixIconImage(RadixIconPlus, 15);
+    _addTabButton.image = RadixIconImage(RadixIconPlus, 10);
     _addTabButton.imagePosition = NSImageOnly;
     _addTabButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
-    _addTabButton.layer.cornerRadius = 8.0;
-    _addTabButton.layer.borderWidth = 1.0;
-    _addTabButton.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    _addTabButton.layer.cornerRadius = 4.0;
+    _addTabButton.baseBorderWidth = 1.0;
+    _addTabButton.baseBorderColor = [NSColor colorWithWhite:1.0 alpha:0.15];
     _addTabButton.target = self;
     _addTabButton.action = @selector(createNewTab:);
     _addTabButton.accessibilityLabel = @"New tab";
@@ -865,8 +1048,92 @@ static BOOL TabIsMobile(int browser_id) {
   [_tabs addObject:tab];
   [self addSubview:tab];
 
-  [self layoutTabs];
+  // The new pill starts at its final slot fully transparent and fades in
+  // while its neighbors and the "+" button slide over to make room.
+  CGFloat tabWidth = [self fittedTabWidth];
+  tab.frame = NSMakeRect((_tabs.count - 1) * (tabWidth + 8.0), pillY, tabWidth,
+                         kTabPillHeight);
+  tab.alphaValue = 0.0;
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = 0.22;
+    ctx.timingFunction = [CAMediaTimingFunction
+        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [self applyTabLayout:YES];
+    tab.animator.alphaValue = 1.0;
+  } completionHandler:nil];
   [self.window recalculateKeyViewLoop];
+}
+
+#pragma mark Drag to reorder
+
+- (void)beginPotentialDragForTab:(BroTabView*)tab withEvent:(NSEvent*)event {
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  draggingTab_ = tab;
+  dragging_ = NO;
+  dragStartX_ = p.x;
+  dragOffsetX_ = p.x - tab.frame.origin.x;
+}
+
+- (void)dragTab:(BroTabView*)tab withEvent:(NSEvent*)event {
+  if (tab != draggingTab_) {
+    return;
+  }
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  if (!dragging_) {
+    // A few points of slop separates a click from a drag.
+    if (fabs(p.x - dragStartX_) < 4.0) {
+      return;
+    }
+    dragging_ = YES;
+    // The dragged pill rides above the pills it passes.
+    tab.layer.zPosition = 10.0;
+  }
+
+  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
+  CGFloat tabWidth = [self fittedTabWidth];
+  CGFloat slotWidth = tabWidth + 8.0;
+  CGFloat maxX = ((CGFloat)_tabs.count - 1) * slotWidth;
+  CGFloat newX = MIN(MAX(p.x - dragOffsetX_, 0.0), maxX);
+  tab.frame = NSMakeRect(newX, pillY, tabWidth, kTabPillHeight);
+
+  // When the pill is carried past a neighbor's slot, the array reorders and
+  // everyone else slides to their new home (the dragged pill keeps following
+  // the mouse; applyTabLayout skips it while a drag is live).
+  NSInteger current = [_tabs indexOfObject:tab];
+  NSInteger target = lround(newX / slotWidth);
+  target = MIN(MAX(target, (NSInteger)0), (NSInteger)_tabs.count - 1);
+  if (target != current) {
+    [_tabs removeObjectAtIndex:current];
+    [_tabs insertObject:tab atIndex:target];
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = 0.15;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+      [self applyTabLayout:YES];
+    } completionHandler:nil];
+  }
+}
+
+- (BOOL)endDragForTab:(BroTabView*)tab {
+  if (tab != draggingTab_) {
+    return NO;
+  }
+  BOOL didDrag = dragging_;
+  draggingTab_ = nil;
+  dragging_ = NO;
+  if (didDrag) {
+    // Snap the released pill into its slot, then drop it back to pill level.
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = 0.15;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+      [self applyTabLayout:YES];
+    } completionHandler:^{
+      tab.layer.zPosition = 0.0;
+    }];
+    [self.window recalculateKeyViewLoop];
+  }
+  return didDrag;
 }
 
 - (void)focusTabRelativeTo:(BroTabView*)tab offset:(NSInteger)offset {
@@ -901,9 +1168,26 @@ static BOOL TabIsMobile(int browser_id) {
       }
       [self.window makeFirstResponder:neighbor];
     }
-    [tabToRemove removeFromSuperview];
     [_tabs removeObject:tabToRemove];
-    [self layoutTabs];
+
+    // The closing pill collapses and fades while the survivors slide over to
+    // fill the gap; it leaves the hierarchy once the animation finishes. Its
+    // content stops autoresizing (a 0-width pill would invert the labels)
+    // and gets clipped by the shrinking layer instead.
+    tabToRemove.autoresizesSubviews = NO;
+    tabToRemove.layer.masksToBounds = YES;
+    NSRect collapsed = tabToRemove.frame;
+    collapsed.size.width = 0.0;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = 0.18;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+      tabToRemove.animator.frame = collapsed;
+      tabToRemove.animator.alphaValue = 0.0;
+      [self applyTabLayout:YES];
+    } completionHandler:^{
+      [tabToRemove removeFromSuperview];
+    }];
     [self.window recalculateKeyViewLoop];
   }
 }
@@ -966,23 +1250,57 @@ static BOOL TabIsMobile(int browser_id) {
   }
 }
 
-- (void)layoutTabs {
-  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
-
-  // Fit pills to the available strip width (minus the "+" button), between
-  // a floor and the mockup's pill width.
-  CGFloat availableWidth = self.frame.size.width - (kTabPillHeight + 8.0);
+// Fits pills to the available strip width (minus the "+" button), between a
+// floor and the mockup's pill width. When even the comfortable minimum
+// doesn't fit, pills shrink down to a hard floor instead of overlapping the
+// controls to the right of the strip; the bar clips whatever still can't fit.
+- (CGFloat)fittedTabWidth {
+  CGFloat availableWidth = self.frame.size.width - (kAddTabButtonSize + 8.0);
   NSUInteger count = MAX(_tabs.count, (NSUInteger)1);
   CGFloat fitWidth = availableWidth / count - 8.0;
   CGFloat tabWidth = MIN(MAX(fitWidth, kTabPillMinWidth), kTabPillMaxWidth);
+  if (tabWidth > fitWidth) {
+    tabWidth = MAX(fitWidth, kTabPillHardMinWidth);
+  }
+  return tabWidth;
+}
+
+// Positions pills and the "+" button. When `animated`, frames move through
+// the animator proxy, so this must run inside an NSAnimationContext group.
+- (void)applyTabLayout:(BOOL)animated {
+  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
+  CGFloat tabWidth = [self fittedTabWidth];
+
+  // Narrow pills also drop the close button so it doesn't crowd the favicon
+  // and title.
+  BOOL closable = _tabs.count > 1 && tabWidth >= kTabPillCloseMinWidth;
 
   CGFloat x = 0.0;
   for (BroTabView* tab in _tabs) {
-    tab.frame = NSMakeRect(x, pillY, tabWidth, kTabPillHeight);
+    NSRect target = NSMakeRect(x, pillY, tabWidth, kTabPillHeight);
+    if (dragging_ && tab == draggingTab_) {
+      // The dragged pill follows the mouse; its slot stays reserved.
+    } else if (animated) {
+      tab.animator.frame = target;
+    } else {
+      tab.frame = target;
+    }
+    tab.closable = closable;
     x += tabWidth + 8.0;
   }
 
-  _addTabButton.frame = NSMakeRect(x, pillY, kTabPillHeight, kTabPillHeight);
+  NSRect addTarget =
+      NSMakeRect(x, (self.frame.size.height - kAddTabButtonSize) / 2.0,
+                 kAddTabButtonSize, kAddTabButtonSize);
+  if (animated) {
+    _addTabButton.animator.frame = addTarget;
+  } else {
+    _addTabButton.frame = addTarget;
+  }
+}
+
+- (void)layoutTabs {
+  [self applyTabLayout:NO];
 }
 
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
@@ -1021,10 +1339,36 @@ static BOOL TabIsMobile(int browser_id) {
 
 #pragma mark - BroWindow
 
+// Click-through overlay that draws the 1px hairline frame above everything,
+// including the windowed CEF child views.
+@interface BroWindowBorderView : NSView
+@end
+
+@implementation BroWindowBorderView
+- (NSView*)hitTest:(NSPoint)point {
+  return nil;
+}
+@end
+
+// The system frame view already masks the full-size content (including the
+// CEF child views) to the window shape, so the hairline only has to trace the
+// same curve. The radius varies across macOS releases; probe the frame view.
+static CGFloat BroWindowCornerRadius(NSWindow* window) {
+  NSView* frameView = window.contentView.superview;  // NSThemeFrame
+  if ([frameView respondsToSelector:@selector(cornerRadius)]) {
+    CGFloat r = [[frameView valueForKey:@"cornerRadius"] doubleValue];
+    if (r > 0.5) {
+      return r;
+    }
+  }
+  return kWindowCornerRadiusFallback;
+}
+
 @interface BroWindow : NSWindow
 @property (nonatomic, strong) NSView* browserContainer;
 @property (nonatomic, strong) BroToolbar* navToolbar;
 @property (nonatomic, strong) BroTabBar* tabBar;
+@property (nonatomic, strong) NSView* borderOverlay;
 @end
 
 @implementation BroWindow
@@ -1059,15 +1403,16 @@ static BOOL TabIsMobile(int browser_id) {
     NSVisualEffectView* content = [[NSVisualEffectView alloc] initWithFrame:frame];
     content.material = NSVisualEffectMaterialHUDWindow;
     content.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-    content.state = NSVisualEffectStateFollowsWindowActiveState;
+    content.state = NSVisualEffectStateActive;
     content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.contentView = content;
 
-    // Dark tint over the blur to stay close to the mockup's near-black.
+    // Black tint over the blur: dark enough to read as black glass, light
+    // enough that the desktop clearly glows through the whole window.
     NSView* tint = [[NSView alloc] initWithFrame:frame];
     tint.wantsLayer = YES;
     tint.layer.backgroundColor =
-        [[NSColor blackColor] colorWithAlphaComponent:0.35].CGColor;
+        [[NSColor blackColor] colorWithAlphaComponent:kGlassTintAlpha].CGColor;
     tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:tint];
 
@@ -1093,8 +1438,22 @@ static BOOL TabIsMobile(int browser_id) {
     _browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:_browserContainer];
 
+    // Hairline frame on top of everything (added last so it draws above the
+    // CEF child views).
+    BroWindowBorderView* border = [[BroWindowBorderView alloc] initWithFrame:frame];
+    border.wantsLayer = YES;
+    border.layer.borderWidth = 1.0;
+    border.layer.borderColor =
+        [[NSColor whiteColor] colorWithAlphaComponent:kWindowBorderAlpha].CGColor;
+    border.layer.cornerRadius = BroWindowCornerRadius(self);
+    border.layer.cornerCurve = kCACornerCurveContinuous;
+    border.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [content addSubview:border];
+    _borderOverlay = border;
+
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
+    g_blank_tab_ids = [NSMutableSet set];
 
     // Keep the Tab-key loop current as pills and buttons come and go.
     self.autorecalculatesKeyViewLoop = YES;
@@ -1143,6 +1502,21 @@ static NSView* CreateTabContainerView(void) {
   return browserContainer;
 }
 
+// Blank pages (and browsers with no committed URL yet) keep their opaque CEF
+// view hidden so the glass window shows through instead of a black rectangle.
+static BOOL BroURLIsBlank(NSString* url) {
+  return url.length == 0 || [url isEqualToString:@"about:blank"];
+}
+
+// Central visibility rule: only the active tab's container is visible, and
+// not even that one while the tab is blank (glass new-tab state).
+static void UpdateTabContainerVisibility(int active_browser_id) {
+  for (NSNumber* key in g_browser_views) {
+    g_browser_views[key].hidden = (key.intValue != active_browser_id) ||
+                                  [g_blank_tab_ids containsObject:key];
+  }
+}
+
 static void UpdateChromeLayout(void) {
   if (!g_main_window || !g_main_window.browserContainer) {
     return;
@@ -1151,6 +1525,96 @@ static void UpdateChromeLayout(void) {
     ApplyViewportFrameToContainer(g_browser_views[key],
                                   TabIsMobile(key.intValue));
   }
+}
+
+// Resizes the shell to hug the mobile viewport (or back to the saved desktop
+// frame), animating the window and the active tab's container as one motion.
+static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
+  if (!g_main_window) {
+    return;
+  }
+  // In native fullscreen the shell can't hug the viewport; keep the current
+  // centered-column behavior. windowDidExitFullScreen: re-syncs afterwards.
+  if ((g_main_window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+    UpdateChromeLayout();
+    return;
+  }
+  if (mobile == g_window_in_mobile_layout) {
+    UpdateChromeLayout();
+    return;
+  }
+  g_window_in_mobile_layout = mobile;
+  const int token = ++g_viewport_anim_token;
+
+  NSScreen* screen = g_main_window.screen ?: [NSScreen mainScreen];
+  NSRect current = g_main_window.frame;
+  NSRect target;
+  if (mobile) {
+    if (NSIsEmptyRect(g_saved_desktop_frame)) {
+      g_saved_desktop_frame = current;
+    }
+    g_main_window.minSize = NSMakeSize(kMobileShellWidth, 400);
+    NSRect contentRect = NSMakeRect(0, 0, kMobileShellWidth,
+                                    kToolbarHeight + kMobileViewportHeight);
+    target = [g_main_window frameRectForContentRect:contentRect];
+    target.size.height =
+        MIN(target.size.height, screen.visibleFrame.size.height);
+    // Anchor the top edge and horizontal center.
+    target.origin.x = NSMidX(current) - target.size.width / 2.0;
+    target.origin.y = NSMaxY(current) - target.size.height;
+  } else {
+    target = NSIsEmptyRect(g_saved_desktop_frame) ? current
+                                                  : g_saved_desktop_frame;
+  }
+  target = [g_main_window constrainFrameRect:target toScreen:screen];
+
+  // The active container's final frame, in the browser area's final
+  // coordinates (mirrors ApplyViewportFrameToContainer).
+  NSRect targetContent = [g_main_window contentRectForFrameRect:target];
+  CGFloat contentWidth = targetContent.size.width;
+  CGFloat contentHeight = targetContent.size.height - kToolbarHeight;
+  CGFloat columnWidth = MIN(kMobileViewportWidth, contentWidth);
+  NSRect containerTarget =
+      mobile ? NSMakeRect((contentWidth - columnWidth) / 2.0, 0, columnWidth,
+                          contentHeight)
+             : NSMakeRect(0, 0, contentWidth, contentHeight);
+
+  BroHandler* handler = BroHandler::GetInstance();
+  int activeId = handler ? handler->GetActiveBrowserId() : -1;
+  NSView* activeContainer =
+      (activeId >= 0) ? g_browser_views[@(activeId)] : nil;
+
+  void (^finish)(void) = ^{
+    // A newer toggle owns the layout now; let its completion do the work.
+    if (token != g_viewport_anim_token || !g_main_window) {
+      return;
+    }
+    UpdateChromeLayout();  // exact frames + proper autoresizing masks
+    if (!mobile) {
+      g_main_window.minSize = NSMakeSize(760, 400);
+      g_saved_desktop_frame = NSZeroRect;
+    }
+  };
+
+  if (!animate) {
+    [g_main_window setFrame:target display:YES];
+    finish();
+    return;
+  }
+
+  // Freeze autoresizing on the visible container so the window animation's
+  // per-tick autoresize doesn't fight the animator; finish() restores the
+  // proper mask via ApplyViewportFrameToContainer.
+  activeContainer.autoresizingMask = NSViewNotSizable;
+  [NSAnimationContext
+      runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = kViewportAnimDuration;
+        ctx.timingFunction = [CAMediaTimingFunction
+            functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [[g_main_window animator] setFrame:target display:YES];
+        [[activeContainer animator] setFrame:containerTarget];
+      }
+      completionHandler:finish];
 }
 
 // Chrome's preset zoom stops. CEF zoom levels are logarithmic:
@@ -1273,6 +1737,9 @@ static void CreateNewBrowserTabWithURL(const std::string& url) {
 
   // Browser settings
   CefBrowserSettings browser_settings;
+  // Blank/unstyled pages render the shell's pure black instead of
+  // Chromium's default page background.
+  browser_settings.background_color = CefColorSetARGB(255, 0, 0, 0);
 
   // Window info - embed in the new container view
   CefWindowInfo window_info;
@@ -1288,7 +1755,7 @@ static void CreateNewBrowserTabWithURL(const std::string& url) {
 }
 
 static void CreateNewBrowserTab(void) {
-  CreateNewBrowserTabWithURL("https://www.google.com");
+  CreateNewBrowserTabWithURL("about:blank");
 }
 
 #pragma mark - BroAppDelegate
@@ -1498,6 +1965,9 @@ static void CreateNewBrowserTab(void) {
 
   // Browser settings
   CefBrowserSettings browser_settings;
+  // Blank/unstyled pages render the shell's pure black instead of
+  // Chromium's default page background.
+  browser_settings.background_color = CefColorSetARGB(255, 0, 0, 0);
 
   // Window info - embed in the container view
   CefWindowInfo window_info;
@@ -1507,14 +1977,13 @@ static void CreateNewBrowserTab(void) {
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  // Create the browser
-  std::string url = "https://www.google.com";
+  // Create the browser on a blank page; the address bar stays empty.
+  std::string url = "about:blank";
   CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
                                 nullptr, nullptr);
 
-  // Update address bar
   if (g_toolbar) {
-    [g_toolbar updateURL:@"https://www.google.com"];
+    [g_toolbar updateURL:@""];
   }
 }
 
@@ -1679,6 +2148,27 @@ static void CreateNewBrowserTab(void) {
   g_toolbar = nil;
   g_tab_bar = nil;
   [g_browser_views removeAllObjects];
+  [g_blank_tab_ids removeAllObjects];
+}
+
+// Fullscreen squares off the window corners, so the rounded hairline frame
+// would float inside them; hide it for the duration.
+- (void)windowWillEnterFullScreen:(NSNotification*)notification {
+  g_main_window.borderOverlay.hidden = YES;
+}
+
+- (void)windowWillExitFullScreen:(NSNotification*)notification {
+  g_main_window.borderOverlay.hidden = NO;
+}
+
+// While fullscreen the shell deliberately doesn't hug the mobile viewport;
+// re-sync it to the active tab's mode once fullscreen ends.
+- (void)windowDidExitFullScreen:(NSNotification*)notification {
+  BroHandler* handler = BroHandler::GetInstance();
+  int activeId = handler ? handler->GetActiveBrowserId() : -1;
+  if (activeId >= 0) {
+    UpdateWindowForViewportMode(TabIsMobile(activeId), YES);
+  }
 }
 
 @end
@@ -1737,19 +2227,25 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
     [g_pending_popup_containers removeObjectForKey:popupId];
   }
 
+  // New browsers usually arrive before their first commit (empty URL), so
+  // they start as glass and unhide when a real URL commits.
+  NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
+  if (BroURLIsBlank(urlStr)) {
+    [g_blank_tab_ids addObject:@(browser_id)];
+  }
+
   // Add tab to tab bar
   if (g_tab_bar) {
     [g_tab_bar addTabWithBrowserId:browser_id title:@"New Tab"];
-    NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
     [g_tab_bar updateTabURL:browser_id url:urlStr];
     [g_tab_bar setActiveTab:browser_id];
   }
 
-  // Show this browser's container, hide others
-  for (NSNumber* key in g_browser_views) {
-    NSView* view = g_browser_views[key];
-    view.hidden = (key.intValue != browser_id);
-  }
+  UpdateTabContainerVisibility(browser_id);
+
+  // A newly adopted tab becomes active without going through
+  // OnActiveTabChanged; the shell follows its viewport mode (desktop).
+  UpdateWindowForViewportMode(TabIsMobile(browser_id), YES);
   return true;
 }
 
@@ -1766,6 +2262,7 @@ void DetachTabView(int browser_id) {
       [containerView removeFromSuperview];
       [g_browser_views removeObjectForKey:@(browser_id)];
     }
+    [g_blank_tab_ids removeObject:@(browser_id)];
   });
 }
 
@@ -1809,6 +2306,18 @@ void OnTabURLChanged(int browser_id, const std::string& url) {
     if (g_tab_bar) {
       [g_tab_bar updateTabURL:browser_id url:urlStr];
     }
+
+    // Commit-time blank/loaded transition: unhide the CEF view for real
+    // pages, return to glass when the tab navigates back to about:blank.
+    if (BroURLIsBlank(urlStr)) {
+      [g_blank_tab_ids addObject:@(browser_id)];
+    } else {
+      [g_blank_tab_ids removeObject:@(browser_id)];
+    }
+    BroHandler* handler = BroHandler::GetInstance();
+    if (handler) {
+      UpdateTabContainerVisibility(handler->GetActiveBrowserId());
+    }
   });
 }
 
@@ -1843,6 +2352,7 @@ void OnTabClosed(int browser_id) {
       [containerView removeFromSuperview];
       [g_browser_views removeObjectForKey:@(browser_id)];
     }
+    [g_blank_tab_ids removeObject:@(browser_id)];
   });
 }
 
@@ -1853,11 +2363,10 @@ void OnActiveTabChanged(int browser_id) {
       [g_tab_bar setActiveTab:browser_id];
     }
 
-    // Show this browser's container, hide others
-    for (NSNumber* key in g_browser_views) {
-      NSView* view = g_browser_views[key];
-      view.hidden = (key.intValue != browser_id);
-    }
+    UpdateTabContainerVisibility(browser_id);
+
+    // The shell follows the active tab's viewport mode.
+    UpdateWindowForViewportMode(TabIsMobile(browser_id), YES);
   });
 }
 
@@ -1933,8 +2442,9 @@ int main(int argc, char* argv[]) {
     // Performance: Persist session cookies for faster repeat visits
     settings.persist_session_cookies = true;
 
-    // Performance: Set background color to reduce flash-of-white
-    settings.background_color = CefColorSetARGB(255, 30, 30, 30);
+    // Pure black pre-load background (matches the per-browser settings) so
+    // popups and navigations never flash a lighter rectangle over the glass.
+    settings.background_color = CefColorSetARGB(255, 0, 0, 0);
 
     // BroApp implements application-level callbacks for the browser process.
     CefRefPtr<BroApp> app(new BroApp);
