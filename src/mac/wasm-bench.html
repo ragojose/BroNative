@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WASM Benchmark and Feature Check</title>
+<style>
+  body { font-family: -apple-system, Menlo, monospace; margin: 2rem; max-width: 720px; }
+  h1 { font-size: 1.2rem; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  td, th { border: 1px solid #999; padding: 4px 10px; text-align: left; font-size: 0.9rem; }
+  .ok { color: #0a7a0a; } .no { color: #b00020; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: 10px; font-size: 0.85rem; }
+  button { font-size: 1rem; padding: 6px 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1e1e1e; color: #ddd; }
+    #log { background: #2a2a2a; }
+    td, th { border-color: #555; }
+    .ok { color: #4caf50; } .no { color: #ff5c5c; }
+  }
+</style>
+</head>
+<body>
+<h1>WASM Benchmark and Feature Check (self-contained, no network)</h1>
+<table id="features"><tr><th>Feature</th><th>Status</th></tr></table>
+<button id="run">Run benchmark</button>
+<div id="log"></div>
+<script>
+"use strict";
+
+/* ---- Hand-assembled wasm modules (byte-verified) ---- */
+
+/* (module (func (export "sum") (param $n i32) (result f64)
+     (local $i i32) (local $acc f64)
+     for (i=0; i<n; i++) acc += (f64)i * 0.5;  return acc )) */
+const MAIN_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x01,0x06, 0x01, 0x60,0x01,0x7f,0x01,0x7c,
+  0x03,0x02, 0x01, 0x00,
+  0x07,0x07, 0x01, 0x03,0x73,0x75,0x6d, 0x00,0x00,
+  0x0a,0x32, 0x01, 0x30,
+    0x02, 0x01,0x7f, 0x01,0x7c,
+    0x02,0x40,
+    0x03,0x40,
+    0x20,0x01,
+    0x20,0x00,
+    0x4e,
+    0x0d,0x01,
+    0x20,0x02,
+    0x20,0x01,
+    0xb7,
+    0x44,0x00,0x00,0x00,0x00,0x00,0x00,0xe0,0x3f,
+    0xa2,
+    0xa0,
+    0x21,0x02,
+    0x20,0x01,
+    0x41,0x01,
+    0x6a,
+    0x21,0x01,
+    0x0c,0x00,
+    0x0b,
+    0x0b,
+    0x20,0x02,
+    0x0b
+]);
+
+/* (module (func (result v128) (v128.const i32x4 0 0 0 0))) -- validates iff SIMD */
+const SIMD_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x01,0x05, 0x01, 0x60,0x00,0x01,0x7b,
+  0x03,0x02, 0x01, 0x00,
+  0x0a,0x16, 0x01, 0x14, 0x00,
+    0xfd,0x0c, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0x0b
+]);
+
+/* (module (memory 1 1 shared)) -- validates iff threads/atomics supported */
+const THREADS_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x05,0x04, 0x01, 0x03,0x01,0x01
+]);
+
+/* (module (type (struct))) -- validates iff wasm-GC supported */
+const GC_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  0x01,0x03, 0x01, 0x5f,0x00
+]);
+
+/* ---- Feature detection ---- */
+const rows = [];
+function feat(name, val, note) {
+  rows.push([name, !!val, note || ""]);
+}
+const hasWasm = typeof WebAssembly === "object" && typeof WebAssembly.validate === "function";
+const hasSimd = hasWasm && WebAssembly.validate(SIMD_BYTES);
+const hasThreads = hasWasm && WebAssembly.validate(THREADS_BYTES);
+const hasGC = hasWasm && WebAssembly.validate(GC_BYTES);
+feat("WebAssembly API", hasWasm);
+feat("Main module validates", hasWasm && WebAssembly.validate(MAIN_BYTES));
+feat("SIMD (v128)", hasSimd);
+feat("Threads (shared memory validates)", hasThreads);
+feat("crossOriginIsolated", self.crossOriginIsolated,
+     self.crossOriginIsolated ? "" : "(SharedArrayBuffer gated: page not served with COOP/COEP)");
+feat("SharedArrayBuffer global", typeof SharedArrayBuffer !== "undefined");
+feat("Wasm GC", hasGC);
+feat("Streaming compile API", hasWasm && typeof WebAssembly.instantiateStreaming === "function",
+     "(caching/streaming only apply to http(s) fetches, not this file)");
+feat("JSPI (WebAssembly.Suspending)", hasWasm && typeof WebAssembly.Suspending === "function");
+
+const table = document.getElementById("features");
+for (const [name, ok, note] of rows) {
+  const tr = document.createElement("tr");
+  const td1 = document.createElement("td"); td1.textContent = name;
+  const td2 = document.createElement("td");
+  td2.textContent = (ok ? "yes" : "no") + (note ? " " + note : "");
+  td2.className = ok ? "ok" : "no";
+  tr.append(td1, td2); table.append(tr);
+}
+
+/* ---- Benchmark ---- */
+const logEl = document.getElementById("log");
+function log(s) { logEl.textContent += s + "\n"; }
+
+function jsSum(n) {
+  let acc = 0;
+  for (let i = 0; i < n; i++) acc += i * 0.5;
+  return acc;
+}
+
+function median(a) { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; }
+
+function bench(fn, n, warmups, reps) {
+  for (let i = 0; i < warmups; i++) fn(n);       // let tiering warm up
+  const times = [];
+  let sink = 0;
+  for (let i = 0; i < reps; i++) {
+    const t0 = performance.now();
+    sink = fn(n);
+    times.push(performance.now() - t0);
+  }
+  return { ms: median(times), all: times, result: sink };
+}
+
+function runBenchmark() {
+  logEl.textContent = "";
+  if (!hasWasm || !WebAssembly.validate(MAIN_BYTES)) {
+    log("WASM unavailable; aborting.");
+    document.title = "WASMBENCH FAIL wasm-unavailable";
+    return;
+  }
+
+  const t0 = performance.now();
+  const module = new WebAssembly.Module(MAIN_BYTES);
+  const instance = new WebAssembly.Instance(module);
+  log("sync compile+instantiate: " + (performance.now() - t0).toFixed(3) + " ms (tiny module)");
+
+  const wasmSum = instance.exports.sum;
+  const N = 20_000_000, WARMUP = 3, REPS = 9;
+  const expected = 0.5 * N * (N - 1) / 2;   // exact in f64 for this N
+
+  log("N = " + N.toLocaleString() + ", median of " + REPS + " runs after " + WARMUP + " warmups\n");
+
+  const js = bench(jsSum, N, WARMUP, REPS);
+  const wa = bench(wasmSum, N, WARMUP, REPS);
+
+  log("JS   loop: " + js.ms.toFixed(2) + " ms  (" + (N / js.ms / 1000).toFixed(1) + " Miter/s)");
+  log("WASM loop: " + wa.ms.toFixed(2) + " ms  (" + (N / wa.ms / 1000).toFixed(1) + " Miter/s)");
+  log("WASM/JS speed ratio: " + (js.ms / wa.ms).toFixed(2) + "x");
+  log("");
+  const pass = js.result === expected && wa.result === expected;
+  log("correctness: js=" + js.result + " wasm=" + wa.result + " expected=" + expected +
+      "  -> " + (pass ? "PASS (bit-exact)" : "FAIL"));
+  log("");
+  log("userAgent: " + navigator.userAgent);
+  log("hardwareConcurrency: " + navigator.hardwareConcurrency);
+
+  // Machine-readable summary (read via the DevTools protocol for automated verification)
+  document.title = "WASMBENCH " + (pass ? "PASS" : "FAIL") +
+      " ratio=" + (js.ms / wa.ms).toFixed(2) +
+      " wasm_ms=" + wa.ms.toFixed(2) +
+      " simd=" + (hasSimd ? 1 : 0) +
+      " gc=" + (hasGC ? 1 : 0) +
+      " threads=" + (hasThreads ? 1 : 0);
+}
+
+document.getElementById("run").onclick = runBenchmark;
+
+if (location.hash === "#autorun") {
+  window.addEventListener("load", () => setTimeout(runBenchmark, 0));
+}
+</script>
+</body>
+</html>

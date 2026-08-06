@@ -10,17 +10,30 @@
 #include <list>
 #include <map>
 
-// Forward declare UI callback functions (implemented in bro_mac.mm)
+// Forward declare UI callback functions (implemented in bro_mac.mm).
+// All of these are invoked on the CEF UI thread, which is the main thread.
 void UpdateNavigationState(bool canGoBack, bool canGoForward);
 void UpdateURL(const std::string& url);
 void SetLoading(bool loading);
-void OnTabCreated(int browser_id, const std::string& url);
+// Adopts the browser as a tab if its native view lives in the tab container.
+// Returns false for browsers hosted elsewhere (e.g. DevTools).
+bool OnTabCreated(int browser_id, const std::string& url, void* native_view);
 void OnTabTitleChanged(int browser_id, const std::string& title);
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url);
 void OnTabClosed(int browser_id);
 void OnActiveTabChanged(int browser_id);
 void OnTabLoadingChanged(int browser_id, bool is_loading);
 void OpenLinkInNewTab(const std::string& url);
+// Detaches a tab's container view so CEF can finish destroying the browser.
+void DetachTabView(int browser_id);
+// True if the browser was adopted as a tab in the main window.
+bool HasTabView(int browser_id);
+// Creates a hidden tab container view for an incoming popup browser and
+// returns its CefWindowHandle plus current bounds. Returns nullptr if no
+// window is available to host it.
+void* CreatePopupTabContainer(int popup_id, int* width, int* height);
+// Removes a popup container that never received its browser (popup aborted).
+void RemovePopupTabContainer(int popup_id);
 
 class BroHandler : public CefClient,
                    public CefDisplayHandler,
@@ -49,6 +62,11 @@ class BroHandler : public CefClient,
   // Close a specific browser (tab)
   void CloseBrowser(int browser_id);
 
+  // Toggle mobile device emulation (viewport metrics, user agent, touch) for
+  // all tabs via the DevTools protocol. New tabs inherit the current mode.
+  void SetMobileEmulation(bool enabled);
+  bool mobile_emulation() const { return mobile_emulation_; }
+
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
@@ -65,6 +83,21 @@ class BroHandler : public CefClient,
                           const std::vector<CefString>& icon_urls) override;
 
   // CefLifeSpanHandler methods:
+  bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                     CefRefPtr<CefFrame> frame,
+                     int popup_id,
+                     const CefString& target_url,
+                     const CefString& target_frame_name,
+                     WindowOpenDisposition target_disposition,
+                     bool user_gesture,
+                     const CefPopupFeatures& popupFeatures,
+                     CefWindowInfo& windowInfo,
+                     CefRefPtr<CefClient>& client,
+                     CefBrowserSettings& settings,
+                     CefRefPtr<CefDictionaryValue>& extra_info,
+                     bool* no_javascript_access) override;
+  void OnBeforePopupAborted(CefRefPtr<CefBrowser> browser,
+                            int popup_id) override;
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
   bool DoClose(CefRefPtr<CefBrowser> browser) override;
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
@@ -107,8 +140,14 @@ class BroHandler : public CefClient,
   void PlatformShowWindow(CefRefPtr<CefBrowser> browser);
 
  private:
+  // Applies (or clears) the device emulation overrides on one browser.
+  void ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser, bool reload);
+
   // True if using Alloy style (native windows)
   const bool is_alloy_style_;
+
+  // True while mobile device emulation is active.
+  bool mobile_emulation_ = false;
 
   // List of existing browser windows.
   typedef std::list<CefRefPtr<CefBrowser>> BrowserList;
@@ -120,6 +159,11 @@ class BroHandler : public CefClient,
 
   // Active browser ID (current tab)
   int active_browser_id_ = -1;
+
+  // True while CloseAllBrowsers is tearing everything down (window close /
+  // app quit). Individual tab closes are handled by detaching the tab's view
+  // in DoClose; the whole-window close goes through the OS close path.
+  bool closing_all_ = false;
 
   bool is_closing_ = false;
 

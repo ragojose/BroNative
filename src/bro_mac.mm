@@ -5,6 +5,8 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <cstdlib>
+
 #include "include/cef_application_mac.h"
 #include "include/cef_browser.h"
 #include "include/cef_command_line.h"
@@ -12,6 +14,7 @@
 #include "include/wrapper/cef_library_loader.h"
 #include "bro_app.h"
 #include "bro_handler.h"
+#import "radix_icons.h"
 
 // Forward declarations
 @class BroWindow;
@@ -21,11 +24,24 @@
 
 // Constants
 static const CGFloat kToolbarHeight = 52.0;
-static const CGFloat kTabBarHeight = 36.0;
+static const CGFloat kTabRowHeight = 32.0;
 static const CGFloat kButtonSize = 28.0;
 static const CGFloat kButtonSpacing = 4.0;
 static const CGFloat kTabMinWidth = 120.0;
 static const CGFloat kTabMaxWidth = 240.0;
+static const CGFloat kURLPillWidth = 300.0;
+static const CGFloat kURLPillHeight = 32.0;
+static const CGFloat kPillCornerRadius = 10.0;
+static const CGFloat kTrafficLightInset = 80.0;
+static const CGFloat kMobileViewportWidth = 390.0;
+
+// Chrome background matching the design mockup (near-black).
+static NSColor* ChromeBackgroundColor(void) {
+  return [NSColor colorWithSRGBRed:10.0 / 255.0
+                             green:10.0 / 255.0
+                              blue:10.0 / 255.0
+                             alpha:1.0];
+}
 
 // Global references
 static BroWindow* g_main_window = nil;
@@ -35,12 +51,21 @@ static BroTabBar* g_tab_bar = nil;
 // Map browser IDs to their container views
 static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
 
-// Pending container view for browser creation (set before CreateBrowser, consumed by OnTabCreated)
-static NSView* g_pending_browser_container = nil;
+// Containers created for incoming popup browsers, keyed by popup ID. Entries
+// are removed when the popup's browser is adopted as a tab, or on abort.
+static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
+
+// True while the mobile viewport mode is active (UI mirror of
+// BroHandler::mobile_emulation()).
+static BOOL g_mobile_mode = NO;
 
 // Forward declaration of tab creation functions (implemented after BroWindow)
 static void CreateNewBrowserTab(void);
 static void CreateNewBrowserTabWithURL(const std::string& url);
+
+// Recomputes chrome layout: tab-row visibility, browser container height and
+// per-tab container framing for the current viewport mode.
+static void UpdateChromeLayout(void);
 
 #pragma mark - BroToolbar
 
@@ -88,8 +113,8 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
     [self addSubview:_refreshButton];
     x += kButtonSize + kButtonSpacing + 8.0;
 
-    // Address field
-    CGFloat addressWidth = frame.size.width - x - 16.0;
+    // Address field, leaving room for the loading indicator on its right
+    CGFloat addressWidth = frame.size.width - x - 16.0 - 24.0;
     _addressField = [[NSTextField alloc] initWithFrame:NSMakeRect(x, y + 2, addressWidth, kButtonSize - 4)];
     _addressField.autoresizingMask = NSViewWidthSizable;
     _addressField.font = [NSFont systemFontOfSize:13.0];
@@ -104,8 +129,8 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
     _addressField.cell.usesSingleLineMode = YES;
     [self addSubview:_addressField];
 
-    // Loading indicator (hidden by default)
-    _loadingIndicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(x + addressWidth - 24, y + 6, 16, 16)];
+    // Loading indicator to the right of the address field (hidden by default)
+    _loadingIndicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(x + addressWidth + 6, y + 6, 16, 16)];
     _loadingIndicator.autoresizingMask = NSViewMinXMargin;
     _loadingIndicator.style = NSProgressIndicatorStyleSpinning;
     _loadingIndicator.controlSize = NSControlSizeSmall;
@@ -170,25 +195,40 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 }
 
 - (void)navigateToURL:(NSString*)urlString {
+  urlString = [urlString stringByTrimmingCharactersInSet:
+      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
   if (urlString.length == 0) return;
 
-  // Add https:// if no scheme
-  if (![urlString containsString:@"://"]) {
-    // Check if it looks like a URL
-    if ([urlString containsString:@"."] && ![urlString containsString:@" "]) {
-      urlString = [@"https://" stringByAppendingString:urlString];
-    } else {
-      // Treat as search query
-      NSString* encoded = [urlString stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-      urlString = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded];
+  NSString* lower = urlString.lowercaseString;
+  NSString* target = nil;
+
+  if ([urlString containsString:@"://"]) {
+    // Only navigate to safe schemes; anything else (javascript:, data:, ...)
+    // falls through to search.
+    if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"] ||
+        [lower hasPrefix:@"file://"]) {
+      target = urlString;
     }
+  } else if ([lower hasPrefix:@"about:"]) {
+    target = urlString;
+  } else if ([urlString containsString:@"."] && ![urlString containsString:@" "]) {
+    target = [@"https://" stringByAppendingString:urlString];
+  }
+
+  if (!target) {
+    // Treat as search query. Encode everything outside the unreserved set so
+    // characters like & and + can't alter the query string.
+    NSMutableCharacterSet* allowed = [NSMutableCharacterSet alphanumericCharacterSet];
+    [allowed addCharactersInString:@"-._~"];
+    NSString* encoded = [urlString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+    target = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded ?: @""];
   }
 
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
-      browser->GetMainFrame()->LoadURL([urlString UTF8String]);
+      browser->GetMainFrame()->LoadURL([target UTF8String]);
     }
   }
 }
@@ -213,6 +253,10 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 }
 
 - (void)updateURL:(NSString*)url {
+  // Don't clobber text the user is currently typing.
+  if ([_addressField currentEditor]) {
+    return;
+  }
   _addressField.stringValue = url ?: @"";
 }
 
@@ -441,14 +485,7 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 }
 
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title {
-  CGFloat x = 40.0;  // After new tab button
-  for (BroTabView* tab in _tabs) {
-    x += tab.frame.size.width + 4.0;
-  }
-
-  CGFloat tabWidth = MIN(MAX(kTabMinWidth, (self.frame.size.width - 48) / (_tabs.count + 1)), kTabMaxWidth);
-
-  BroTabView* tab = [[BroTabView alloc] initWithFrame:NSMakeRect(x, 2, tabWidth, kTabBarHeight - 4)
+  BroTabView* tab = [[BroTabView alloc] initWithFrame:NSMakeRect(0, 2, kTabMinWidth, kTabBarHeight - 4)
                                             browserId:browserId];
   tab.titleLabel.stringValue = title ?: @"New Tab";
   tab.target = self;
@@ -513,8 +550,11 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 - (void)layoutTabs {
   if (_tabs.count == 0) return;
 
+  // Fit tabs to the available space, shrinking below kTabMinWidth (down to a
+  // hard floor) rather than overflowing past the window edge.
   CGFloat availableWidth = self.frame.size.width - 48.0;  // Space after new tab button
-  CGFloat tabWidth = MIN(MAX(kTabMinWidth, availableWidth / _tabs.count - 4.0), kTabMaxWidth);
+  CGFloat fitWidth = availableWidth / _tabs.count - 4.0;
+  CGFloat tabWidth = MIN(MAX(fitWidth, 60.0), kTabMaxWidth);
 
   CGFloat x = 40.0;
   for (BroTabView* tab in _tabs) {
@@ -536,8 +576,9 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 }
 
 - (void)tabClosed:(BroTabView*)tab {
-  // Don't close the last tab
   if (_tabs.count <= 1) {
+    // Closing the last tab closes the window (and quits, like a browser).
+    [self.window performClose:nil];
     return;
   }
 
@@ -619,24 +660,30 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 
 #pragma mark - CreateNewBrowserTab
 
-static void CreateNewBrowserTabWithURL(const std::string& url) {
+// Creates a hidden per-tab container view inside the main browser area.
+// The browser created into it is adopted as a tab in OnTabCreated, which
+// finds the container as the superview of the browser's native view.
+static NSView* CreateTabContainerView(void) {
   if (!g_main_window || !g_main_window.browserContainer) {
-    return;
+    return nil;
   }
+  NSView* browserContainer = [[NSView alloc] initWithFrame:g_main_window.browserContainer.bounds];
+  browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  browserContainer.hidden = YES;  // Will be shown when tab is activated
+  [g_main_window.browserContainer addSubview:browserContainer];
+  return browserContainer;
+}
 
+static void CreateNewBrowserTabWithURL(const std::string& url) {
   BroHandler* handler = BroHandler::GetInstance();
   if (!handler) {
     return;
   }
 
-  // Create a container view for the new browser
-  NSView* browserContainer = [[NSView alloc] initWithFrame:g_main_window.browserContainer.bounds];
-  browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  browserContainer.hidden = YES;  // Will be shown when tab is activated
-  [g_main_window.browserContainer addSubview:browserContainer];
-
-  // Store pending container for OnTabCreated to pick up
-  g_pending_browser_container = browserContainer;
+  NSView* browserContainer = CreateTabContainerView();
+  if (!browserContainer) {
+    return;
+  }
 
   // Browser settings
   CefBrowserSettings browser_settings;
@@ -780,6 +827,11 @@ static void CreateNewBrowserTab(void) {
   devToolsF12.hidden = YES;  // Hide from menu but still active
   [viewMenu addItem:devToolsF12];
 
+  [viewMenu addItem:[NSMenuItem separatorItem]];
+  [viewMenu addItemWithTitle:@"WebAssembly Benchmark"
+                      action:@selector(openWasmBenchmark:)
+               keyEquivalent:@""];
+
   viewMenuItem.submenu = viewMenu;
   [mainMenu addItem:viewMenuItem];
 
@@ -800,9 +852,6 @@ static void CreateNewBrowserTab(void) {
   NSMenuItem* fileMenuItem = [[NSMenuItem alloc] init];
   NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
 
-  [fileMenu addItemWithTitle:@"New Window"
-                      action:@selector(newWindow:)
-               keyEquivalent:@"n"];
   [fileMenu addItemWithTitle:@"New Tab"
                       action:@selector(newTab:)
                keyEquivalent:@"t"];
@@ -838,32 +887,16 @@ static void CreateNewBrowserTab(void) {
 
 - (void)createBrowserInWindow {
   if (!g_main_window || !g_main_window.browserContainer) {
-    fprintf(stderr, "[BRO] createBrowserInWindow: g_main_window or browserContainer is nil\n");
     return;
   }
-
-  NSRect containerBounds = g_main_window.browserContainer.bounds;
-  NSRect containerFrame = g_main_window.browserContainer.frame;
-  fprintf(stderr, "[BRO] createBrowserInWindow called\n");
-  fprintf(stderr, "[BRO] g_main_window.browserContainer.bounds = %.0f x %.0f\n",
-          containerBounds.size.width, containerBounds.size.height);
-  fprintf(stderr, "[BRO] g_main_window.browserContainer.frame = %.0f, %.0f, %.0f x %.0f\n",
-          containerFrame.origin.x, containerFrame.origin.y,
-          containerFrame.size.width, containerFrame.size.height);
 
   // Create the handler (shared across all browsers)
   CefRefPtr<BroHandler> handler(new BroHandler(true));
 
-  // Create a container view for the first browser
-  NSView* browserContainer = [[NSView alloc] initWithFrame:g_main_window.browserContainer.bounds];
-  browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [g_main_window.browserContainer addSubview:browserContainer];
-
-  fprintf(stderr, "[BRO] browserContainer bounds: %.0f x %.0f\n",
-          browserContainer.bounds.size.width, browserContainer.bounds.size.height);
-
-  // Store pending container for OnTabCreated to pick up
-  g_pending_browser_container = browserContainer;
+  NSView* browserContainer = CreateTabContainerView();
+  if (!browserContainer) {
+    return;
+  }
 
   // Browser settings
   CefBrowserSettings browser_settings;
@@ -871,10 +904,6 @@ static void CreateNewBrowserTab(void) {
   // Window info - embed in the container view
   CefWindowInfo window_info;
   NSRect bounds = browserContainer.bounds;
-
-  fprintf(stderr, "[BRO] Creating browser with bounds: %.0f x %.0f\n",
-          bounds.size.width, bounds.size.height);
-
   window_info.SetAsChild(
       CAST_NSVIEW_TO_CEF_WINDOW_HANDLE(browserContainer),
       CefRect(0, 0, bounds.size.width, bounds.size.height));
@@ -882,9 +911,8 @@ static void CreateNewBrowserTab(void) {
 
   // Create the browser
   std::string url = "https://www.google.com";
-  bool result = CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
+  CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
                                 nullptr, nullptr);
-  fprintf(stderr, "[BRO] CefBrowserHost::CreateBrowser returned: %d\n", result);
 
   // Update address bar
   if (g_toolbar) {
@@ -906,6 +934,9 @@ static void CreateNewBrowserTab(void) {
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
                     hasVisibleWindows:(BOOL)flag {
   if (!flag && g_main_window) {
+    if (g_main_window.miniaturized) {
+      [g_main_window deminiaturize:nil];
+    }
     [g_main_window makeKeyAndOrderFront:nil];
   }
   return NO;
@@ -954,36 +985,6 @@ static void CreateNewBrowserTab(void) {
   }
 }
 
-- (void)newWindow:(id)sender {
-  // Create a new window with a new browser
-  BroWindow* newWindow = [[BroWindow alloc] init];
-  newWindow.delegate = self;
-  newWindow.title = @"Bro";
-  [newWindow makeKeyAndOrderFront:nil];
-
-  // Create a browser in the new window
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler && newWindow.browserContainer) {
-    NSView* browserContainer = [[NSView alloc] initWithFrame:newWindow.browserContainer.bounds];
-    browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [newWindow.browserContainer addSubview:browserContainer];
-
-    g_pending_browser_container = browserContainer;
-
-    CefBrowserSettings browser_settings;
-    CefWindowInfo window_info;
-    NSRect bounds = browserContainer.bounds;
-    window_info.SetAsChild(
-        CAST_NSVIEW_TO_CEF_WINDOW_HANDLE(browserContainer),
-        CefRect(0, 0, bounds.size.width, bounds.size.height));
-    window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-
-    std::string url = "https://www.google.com";
-    CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
-                                  nullptr, nullptr);
-  }
-}
-
 - (void)newTab:(id)sender {
   if (g_tab_bar) {
     [g_tab_bar createNewTab:sender];
@@ -994,10 +995,21 @@ static void CreateNewBrowserTab(void) {
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     int activeId = handler->GetActiveBrowserId();
-    // Only close if there's more than one tab
     if (g_tab_bar && g_tab_bar.tabs.count > 1) {
       handler->CloseBrowser(activeId);
+    } else if (g_main_window) {
+      // Closing the last tab closes the window (and quits, like a browser).
+      [g_main_window performClose:sender];
     }
+  }
+}
+
+- (void)openWasmBenchmark:(id)sender {
+  NSString* path = [[NSBundle mainBundle] pathForResource:@"wasm-bench"
+                                                   ofType:@"html"];
+  if (path) {
+    NSURL* url = [NSURL fileURLWithPath:path];
+    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
   }
 }
 
@@ -1087,9 +1099,13 @@ void UpdateNavigationState(bool canGoBack, bool canGoForward) {
 }
 
 void UpdateURL(const std::string& url) {
+  // Convert before dispatching: the block would otherwise capture the
+  // std::string parameter by reference, which dangles once the caller
+  // returns (use-after-free; crashed with garbage/NULL c_str()).
+  NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
   dispatch_async(dispatch_get_main_queue(), ^{
     if (g_toolbar) {
-      [g_toolbar updateURL:[NSString stringWithUTF8String:url.c_str()]];
+      [g_toolbar updateURL:urlStr];
     }
   });
 }
@@ -1102,53 +1118,99 @@ void SetLoading(bool loading) {
   });
 }
 
-void OnTabCreated(int browser_id, const std::string& url) {
-  fprintf(stderr, "[BRO] OnTabCreated called with browser_id=%d, url=%s\n", browser_id, url.c_str());
+bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
+  // Called on the CEF UI thread, which is the main thread here, so AppKit
+  // access and synchronous adoption are safe (a deferred handoff through a
+  // shared "pending container" global raced when two tabs were created
+  // quickly).
+  NSView* cefView = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(
+      static_cast<CefWindowHandle>(native_view));
+  NSView* container = cefView.superview;
+
+  // Only adopt browsers whose view was created inside a per-tab container in
+  // the main window. Anything else (e.g. DevTools) gets no tab and must not
+  // touch tab state.
+  if (!container || !g_main_window ||
+      container == g_main_window.browserContainer ||
+      ![container isDescendantOf:g_main_window.browserContainer]) {
+    return false;
+  }
+
+  g_browser_views[@(browser_id)] = container;
+
+  // If this was a popup's container, it is no longer pending.
+  for (NSNumber* popupId in [g_pending_popup_containers allKeysForObject:container]) {
+    [g_pending_popup_containers removeObjectForKey:popupId];
+  }
+
+  // Add tab to tab bar
+  if (g_tab_bar) {
+    [g_tab_bar addTabWithBrowserId:browser_id title:@"New Tab"];
+    [g_tab_bar setActiveTab:browser_id];
+  }
+
+  // Show this browser's container, hide others
+  for (NSNumber* key in g_browser_views) {
+    NSView* view = g_browser_views[key];
+    view.hidden = (key.intValue != browser_id);
+  }
+  return true;
+}
+
+bool HasTabView(int browser_id) {
+  return g_browser_views[@(browser_id)] != nil;
+}
+
+void DetachTabView(int browser_id) {
+  // Deferred so the view teardown (which destroys the CEF browser) doesn't
+  // re-enter CEF from inside DoClose.
   dispatch_async(dispatch_get_main_queue(), ^{
-    // Store the pending container view for this browser ID
-    if (g_pending_browser_container) {
-      g_browser_views[@(browser_id)] = g_pending_browser_container;
-      fprintf(stderr, "[BRO] Stored pending container for browser_id=%d\n", browser_id);
-      NSRect frame = g_pending_browser_container.frame;
-      fprintf(stderr, "[BRO] Container frame: %.0f, %.0f, %.0f x %.0f\n",
-              frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
-      fprintf(stderr, "[BRO] Container hidden=%d\n", g_pending_browser_container.hidden);
-      fprintf(stderr, "[BRO] Container subviews count=%lu\n", (unsigned long)g_pending_browser_container.subviews.count);
-      g_pending_browser_container = nil;
-    } else {
-      fprintf(stderr, "[BRO] WARNING: g_pending_browser_container is nil!\n");
+    NSView* containerView = g_browser_views[@(browser_id)];
+    if (containerView) {
+      [containerView removeFromSuperview];
+      [g_browser_views removeObjectForKey:@(browser_id)];
     }
-
-    // Add tab to tab bar
-    if (g_tab_bar) {
-      [g_tab_bar addTabWithBrowserId:browser_id title:@"New Tab"];
-      [g_tab_bar setActiveTab:browser_id];
-      fprintf(stderr, "[BRO] Added tab for browser_id=%d\n", browser_id);
-    }
-
-    // Show this browser's container, hide others
-    for (NSNumber* key in g_browser_views) {
-      NSView* view = g_browser_views[key];
-      view.hidden = (key.intValue != browser_id);
-      fprintf(stderr, "[BRO] Browser view %d hidden=%d\n", key.intValue, view.hidden);
-    }
-    fprintf(stderr, "[BRO] Total browser views: %lu\n", (unsigned long)g_browser_views.count);
   });
 }
 
+void* CreatePopupTabContainer(int popup_id, int* width, int* height) {
+  NSView* container = CreateTabContainerView();
+  if (!container) {
+    return nullptr;
+  }
+  if (!g_pending_popup_containers) {
+    g_pending_popup_containers = [NSMutableDictionary dictionary];
+  }
+  g_pending_popup_containers[@(popup_id)] = container;
+  NSRect bounds = container.bounds;
+  *width = (int)bounds.size.width;
+  *height = (int)bounds.size.height;
+  return CAST_NSVIEW_TO_CEF_WINDOW_HANDLE(container);
+}
+
+void RemovePopupTabContainer(int popup_id) {
+  NSView* container = g_pending_popup_containers[@(popup_id)];
+  if (container) {
+    [container removeFromSuperview];
+    [g_pending_popup_containers removeObjectForKey:@(popup_id)];
+  }
+}
+
 void OnTabTitleChanged(int browser_id, const std::string& title) {
+  // Convert before dispatching (see UpdateURL).
+  NSString* titleStr = [NSString stringWithUTF8String:title.c_str()] ?: @"";
   dispatch_async(dispatch_get_main_queue(), ^{
     if (g_tab_bar) {
-      NSString* titleStr = [NSString stringWithUTF8String:title.c_str()];
       [g_tab_bar updateTabTitle:browser_id title:titleStr];
     }
   });
 }
 
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url) {
+  // Convert before dispatching (see UpdateURL).
+  NSString* urlStr = [NSString stringWithUTF8String:favicon_url.c_str()] ?: @"";
   dispatch_async(dispatch_get_main_queue(), ^{
     if (g_tab_bar) {
-      NSString* urlStr = [NSString stringWithUTF8String:favicon_url.c_str()];
       [g_tab_bar updateTabFavicon:browser_id faviconURL:urlStr];
     }
   });
@@ -1194,8 +1256,10 @@ void OnActiveTabChanged(int browser_id) {
 }
 
 void OpenLinkInNewTab(const std::string& url) {
+  // Copy before dispatching (see UpdateURL): the block must own the string.
+  std::string url_copy = url;
   dispatch_async(dispatch_get_main_queue(), ^{
-    CreateNewBrowserTabWithURL(url);
+    CreateNewBrowserTabWithURL(url_copy);
   });
 }
 
@@ -1226,11 +1290,30 @@ int main(int argc, char* argv[]) {
     settings.no_sandbox = true;
 #endif
 
-    // Enable remote debugging (useful for troubleshooting)
+    // Remote debugging gives any local process full control of the browser,
+    // so never enable it unconditionally: Debug builds listen on 9222,
+    // Release builds only when BRO_REMOTE_DEBUG_PORT is set.
+#ifndef NDEBUG
     settings.remote_debugging_port = 9222;
+#else
+    if (const char* debug_port = getenv("BRO_REMOTE_DEBUG_PORT")) {
+      int port = atoi(debug_port);
+      if (port > 1024 && port < 65536) {
+        settings.remote_debugging_port = port;
+      }
+    }
+#endif
 
-    // Set a cache path for persistent data
-    NSString* cachePath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"BroCache"];
+    // Persistent cache in Application Support (the temp directory is purged
+    // by the OS, which silently discarded the HTTP cache and the V8/WASM
+    // compiled-code caches between launches).
+    NSString* appSupport = NSSearchPathForDirectoriesInDomains(
+        NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    NSString* cachePath = [appSupport stringByAppendingPathComponent:@"Bro"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:cachePath
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
     CefString(&settings.root_cache_path).FromString([cachePath UTF8String]);
     CefString(&settings.cache_path).FromString([cachePath UTF8String]);
 

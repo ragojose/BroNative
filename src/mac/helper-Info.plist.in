@@ -5,23 +5,23 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>${EXECUTABLE_NAME}</string>
+	<string>@HELPER_EXECUTABLE_NAME@</string>
 	<key>CFBundleExecutable</key>
-	<string>${EXECUTABLE_NAME}</string>
+	<string>@HELPER_EXECUTABLE_NAME@</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.cef.cefsimple.helper${BUNDLE_ID_SUFFIX}</string>
+	<string>com.bro.browser.helper@HELPER_BUNDLE_ID_SUFFIX@</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>${PRODUCT_NAME}</string>
+	<string>@HELPER_EXECUTABLE_NAME@</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>
-	<string>${VERSION_SHORT}</string>
+	<string>@VERSION_SHORT@</string>
 	<key>CFBundleShortVersionString</key>
-	<string>${VERSION_SHORT}</string>
+	<string>@VERSION_SHORT@</string>
 	<key>LSEnvironment</key>
 	<dict>
 		<key>MallocNanoZone</key>

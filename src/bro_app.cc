@@ -13,7 +13,17 @@ BroApp::BroApp() = default;
 void BroApp::OnBeforeCommandLineProcessing(
     const CefString& process_type,
     CefRefPtr<CefCommandLine> command_line) {
-  // Minimal flags - only what's needed for basic GPU acceleration
+  // Only modify the browser process command line; switches propagate to
+  // child processes automatically.
+  if (!process_type.empty()) {
+    return;
+  }
+
+  // Minimal flags - only what's needed for basic GPU acceleration. This set
+  // was chosen after aggressive flags broke form submissions and navigation;
+  // do not add feature-forcing switches here. WebAssembly (SIMD, GC, tiering,
+  // code caching) and BackForwardCache are already enabled by default in
+  // Chromium and need no flags.
   command_line->AppendSwitch("enable-gpu");
   command_line->AppendSwitchWithValue("use-angle", "metal");
   command_line->AppendSwitch("ignore-gpu-blocklist");

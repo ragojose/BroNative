@@ -6,6 +6,8 @@
 	<string>English</string>
 	<key>CFBundleExecutable</key>
 	<string>Bro</string>
+	<key>CFBundleIconFile</key>
+	<string>cefsimple.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.bro.browser</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -17,7 +19,7 @@
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.0</string>
+	<string>@VERSION_SHORT@</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>LSEnvironment</key>
@@ -27,6 +29,8 @@
 	</dict>
 	<key>LSMinimumSystemVersion</key>
 	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>NSPrincipalClass</key>
 	<string>BroApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
