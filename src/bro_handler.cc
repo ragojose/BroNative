@@ -118,28 +118,30 @@ void BroHandler::CloseBrowser(int browser_id) {
   }
 }
 
-void BroHandler::SetMobileEmulation(bool enabled) {
+void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
   if (!CefCurrentlyOn(TID_UI)) {
-    CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetMobileEmulation, this,
-                                       enabled));
+    CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetTabMobileEmulation,
+                                       this, browser_id, enabled));
     return;
   }
 
-  if (mobile_emulation_ == enabled) {
+  if (IsTabMobile(browser_id) == enabled) {
     return;
   }
-  mobile_emulation_ = enabled;
+  if (enabled) {
+    mobile_tab_ids_.insert(browser_id);
+  } else {
+    mobile_tab_ids_.erase(browser_id);
+  }
 
-  for (auto& entry : browser_map_) {
-    // Only tabs get emulation; browsers hosted elsewhere (e.g. DevTools)
-    // must keep their normal environment.
-    if (HasTabView(entry.first)) {
-      ApplyEmulationToBrowser(entry.second, /*reload=*/true);
-    }
+  auto it = browser_map_.find(browser_id);
+  if (it != browser_map_.end()) {
+    ApplyEmulationToBrowser(it->second, enabled, /*reload=*/true);
   }
 }
 
 void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
+                                         bool mobile,
                                          bool reload) {
   if (!browser) {
     return;
@@ -149,7 +151,7 @@ void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
     return;
   }
 
-  if (mobile_emulation_) {
+  if (mobile) {
     CefRefPtr<CefDictionaryValue> metrics = CefDictionaryValue::Create();
     metrics->SetInt("width", 390);
     metrics->SetInt("height", 844);
@@ -209,9 +211,13 @@ void BroHandler::OnAddressChange(CefRefPtr<CefBrowser> browser,
                                  const CefString& url) {
   CEF_REQUIRE_UI_THREAD();
 
-  // Only update UI for main frame of the active tab
-  if (frame->IsMain() && browser->GetIdentifier() == active_browser_id_) {
-    UpdateURL(url.ToString());
+  if (frame->IsMain()) {
+    // Every tab pill shows its own URL's host.
+    OnTabURLChanged(browser->GetIdentifier(), url.ToString());
+    // The editable address field only tracks the active tab.
+    if (browser->GetIdentifier() == active_browser_id_) {
+      UpdateURL(url.ToString());
+    }
   }
 }
 
@@ -278,10 +284,6 @@ void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
                    browser->GetHost()->GetWindowHandle());
   if (adopted) {
     active_browser_id_ = browser_id;
-    if (mobile_emulation_) {
-      // No reload: the overrides land before the first navigation commits.
-      ApplyEmulationToBrowser(browser, /*reload=*/false);
-    }
   }
 }
 
@@ -323,6 +325,7 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     }
   }
   browser_map_.erase(browser_id);
+  mobile_tab_ids_.erase(browser_id);
 
   // Notify UI about tab closure
   OnTabClosed(browser_id);

@@ -9,6 +9,7 @@
 
 #include <list>
 #include <map>
+#include <set>
 
 // Forward declare UI callback functions (implemented in bro_mac.mm).
 // All of these are invoked on the CEF UI thread, which is the main thread.
@@ -19,6 +20,7 @@ void SetLoading(bool loading);
 // Returns false for browsers hosted elsewhere (e.g. DevTools).
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view);
 void OnTabTitleChanged(int browser_id, const std::string& title);
+void OnTabURLChanged(int browser_id, const std::string& url);
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url);
 void OnTabClosed(int browser_id);
 void OnActiveTabChanged(int browser_id);
@@ -63,9 +65,11 @@ class BroHandler : public CefClient,
   void CloseBrowser(int browser_id);
 
   // Toggle mobile device emulation (viewport metrics, user agent, touch) for
-  // all tabs via the DevTools protocol. New tabs inherit the current mode.
-  void SetMobileEmulation(bool enabled);
-  bool mobile_emulation() const { return mobile_emulation_; }
+  // a single tab via the DevTools protocol. Other tabs are unaffected.
+  void SetTabMobileEmulation(int browser_id, bool enabled);
+  bool IsTabMobile(int browser_id) const {
+    return mobile_tab_ids_.count(browser_id) > 0;
+  }
 
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
@@ -141,13 +145,15 @@ class BroHandler : public CefClient,
 
  private:
   // Applies (or clears) the device emulation overrides on one browser.
-  void ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser, bool reload);
+  void ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
+                               bool mobile,
+                               bool reload);
 
   // True if using Alloy style (native windows)
   const bool is_alloy_style_;
 
-  // True while mobile device emulation is active.
-  bool mobile_emulation_ = false;
+  // Tabs with mobile device emulation active.
+  std::set<int> mobile_tab_ids_;
 
   // List of existing browser windows.
   typedef std::list<CefRefPtr<CefBrowser>> BrowserList;
