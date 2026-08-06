@@ -5,6 +5,7 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <cmath>
 #include <cstdlib>
 
 #include "include/cef_application_mac.h"
@@ -24,24 +25,14 @@
 
 // Constants
 static const CGFloat kToolbarHeight = 52.0;
-static const CGFloat kTabRowHeight = 32.0;
 static const CGFloat kButtonSize = 28.0;
 static const CGFloat kButtonSpacing = 4.0;
-static const CGFloat kTabMinWidth = 120.0;
-static const CGFloat kTabMaxWidth = 240.0;
-static const CGFloat kURLPillWidth = 300.0;
-static const CGFloat kURLPillHeight = 32.0;
+static const CGFloat kTabPillMaxWidth = 300.0;
+static const CGFloat kTabPillMinWidth = 110.0;
+static const CGFloat kTabPillHeight = 32.0;
 static const CGFloat kPillCornerRadius = 10.0;
-static const CGFloat kTrafficLightInset = 80.0;
+static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
-
-// Chrome background matching the design mockup (near-black).
-static NSColor* ChromeBackgroundColor(void) {
-  return [NSColor colorWithSRGBRed:10.0 / 255.0
-                             green:10.0 / 255.0
-                              blue:10.0 / 255.0
-                             alpha:1.0];
-}
 
 // Global references
 static BroWindow* g_main_window = nil;
@@ -55,26 +46,172 @@ static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
 
-// True while the mobile viewport mode is active (UI mirror of
-// BroHandler::mobile_emulation()).
-static BOOL g_mobile_mode = NO;
-
 // Forward declaration of tab creation functions (implemented after BroWindow)
 static void CreateNewBrowserTab(void);
 static void CreateNewBrowserTabWithURL(const std::string& url);
 
-// Recomputes chrome layout: tab-row visibility, browser container height and
-// per-tab container framing for the current viewport mode.
+// Reframes every per-tab container for its own viewport mode (mobile
+// emulation is per-tab).
 static void UpdateChromeLayout(void);
+
+// True if the given tab has mobile emulation active.
+static BOOL TabIsMobile(int browser_id) {
+  BroHandler* handler = BroHandler::GetInstance();
+  return handler && handler->IsTabMobile(browser_id);
+}
+
+#pragma mark - BroHoverButton
+
+// Icon button with hover/pressed/selected backgrounds, a pointing-hand
+// cursor, and keyboard focus (tabbable even when the system's Full Keyboard
+// Access setting is off).
+@interface BroHoverButton : NSButton
+// Persistent "selected" background for toggle buttons (viewport modes).
+@property (nonatomic, assign) BOOL selectedState;
+@end
+
+@implementation BroHoverButton {
+  BOOL hovered_;
+  BOOL pressed_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 6.0;
+    self.focusRingType = NSFocusRingTypeExterior;
+    NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:trackingArea];
+  }
+  return self;
+}
+
+- (BOOL)acceptsFirstResponder {
+  return self.enabled;
+}
+
+- (BOOL)canBecomeKeyView {
+  return self.enabled && !self.hiddenOrHasHiddenAncestor;
+}
+
+- (void)drawFocusRingMask {
+  [[NSBezierPath bezierPathWithRoundedRect:self.bounds
+                                   xRadius:self.layer.cornerRadius
+                                   yRadius:self.layer.cornerRadius] fill];
+}
+
+- (NSRect)focusRingMaskBounds {
+  return self.bounds;
+}
+
+- (void)refreshBackground {
+  CGFloat alpha = 0.0;
+  if (self.enabled) {
+    if (pressed_) {
+      alpha = 0.16;
+    } else if (_selectedState) {
+      alpha = hovered_ ? 0.14 : 0.10;
+    } else if (hovered_) {
+      alpha = 0.08;
+    }
+  }
+  self.layer.backgroundColor =
+      alpha > 0 ? [NSColor colorWithWhite:1.0 alpha:alpha].CGColor
+                : [NSColor clearColor].CGColor;
+}
+
+- (void)setSelectedState:(BOOL)selectedState {
+  _selectedState = selectedState;
+  self.accessibilityValue = @(selectedState);
+  [self refreshBackground];
+}
+
+- (void)setEnabled:(BOOL)enabled {
+  [super setEnabled:enabled];
+  [self refreshBackground];
+  // Disabled buttons show the plain arrow cursor, not the pointing hand.
+  [self.window invalidateCursorRectsForView:self];
+}
+
+- (void)resetCursorRects {
+  if (self.enabled) {
+    [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+  }
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+  hovered_ = YES;
+  [self refreshBackground];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  hovered_ = NO;
+  pressed_ = NO;
+  [self refreshBackground];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  if (!self.enabled) {
+    return;
+  }
+  pressed_ = YES;
+  [self refreshBackground];
+  // Runs the tracking loop synchronously; returns after mouse-up.
+  [super mouseDown:event];
+  pressed_ = NO;
+  [self refreshBackground];
+}
+
+- (void)keyDown:(NSEvent*)event {
+  // Space is handled by NSButton; add Return as an activator too.
+  NSString* chars = event.charactersIgnoringModifiers;
+  unichar c = chars.length > 0 ? [chars characterAtIndex:0] : 0;
+  if (c == '\r' || c == NSEnterCharacter) {
+    [self performClick:self];
+    return;
+  }
+  [super keyDown:event];
+}
+
+@end
 
 #pragma mark - BroToolbar
 
+// NSTextField subclass that tells the toolbar when it gains focus, so the
+// pill can swap from host-only display to the full editable URL.
+@interface BroAddressField : NSTextField
+@end
+
 @interface BroToolbar : NSView <NSTextFieldDelegate>
-@property (nonatomic, strong) NSButton* backButton;
-@property (nonatomic, strong) NSButton* forwardButton;
-@property (nonatomic, strong) NSButton* refreshButton;
+@property (nonatomic, strong) BroHoverButton* backButton;
+@property (nonatomic, strong) BroHoverButton* forwardButton;
+@property (nonatomic, strong) BroHoverButton* refreshButton;
 @property (nonatomic, strong) NSTextField* addressField;
-@property (nonatomic, strong) NSProgressIndicator* loadingIndicator;
+@property (nonatomic, strong) BroHoverButton* desktopButton;
+@property (nonatomic, strong) BroHoverButton* mobileButton;
+@property (nonatomic, copy) NSString* fullURL;
+- (void)addressFieldDidFocus;
+- (void)setViewportMode:(BOOL)mobile;
+- (void)updateURL:(NSString*)url;
+- (void)focusAddressField;
+@end
+
+@implementation BroAddressField
+
+- (BOOL)becomeFirstResponder {
+  BOOL ok = [super becomeFirstResponder];
+  if (ok && [self.delegate isKindOfClass:[BroToolbar class]]) {
+    [(BroToolbar*)self.delegate addressFieldDidFocus];
+  }
+  return ok;
+}
+
 @end
 
 @implementation BroToolbar
@@ -88,54 +225,66 @@ static void UpdateChromeLayout(void);
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
 
-    // Create navigation buttons
-    CGFloat x = 80.0;  // Leave space for window controls
+    _fullURL = @"";
+
+    // Navigation buttons, inline with the traffic lights.
+    CGFloat x = kTrafficLightInset;
     CGFloat y = (frame.size.height - kButtonSize) / 2.0;
 
-    // Back button
     _backButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                        image:@"chevron.left"
-                                       action:@selector(goBack:)];
+                                         icon:RadixIconArrowLeft
+                                       action:@selector(goBack:)
+                                        label:@"Back"];
     [self addSubview:_backButton];
     x += kButtonSize + kButtonSpacing;
 
-    // Forward button
     _forwardButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                           image:@"chevron.right"
-                                          action:@selector(goForward:)];
+                                            icon:RadixIconArrowRight
+                                          action:@selector(goForward:)
+                                           label:@"Forward"];
     [self addSubview:_forwardButton];
     x += kButtonSize + kButtonSpacing;
 
-    // Refresh button
     _refreshButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                           image:@"arrow.clockwise"
-                                          action:@selector(refresh:)];
+                                            icon:RadixIconReload
+                                          action:@selector(refresh:)
+                                           label:@"Reload page"];
     [self addSubview:_refreshButton];
-    x += kButtonSize + kButtonSpacing + 8.0;
 
-    // Address field, leaving room for the loading indicator on its right
-    CGFloat addressWidth = frame.size.width - x - 16.0 - 24.0;
-    _addressField = [[NSTextField alloc] initWithFrame:NSMakeRect(x, y + 2, addressWidth, kButtonSize - 4)];
-    _addressField.autoresizingMask = NSViewWidthSizable;
-    _addressField.font = [NSFont systemFontOfSize:13.0];
-    _addressField.bezeled = YES;
-    _addressField.bezelStyle = NSTextFieldRoundedBezel;
-    _addressField.drawsBackground = YES;
-    _addressField.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.1];
+    // The editable address field lives inside the ACTIVE tab pill (the tab
+    // strip re-parents it on tab switches); created here without a superview.
+    _addressField = [[BroAddressField alloc] initWithFrame:NSMakeRect(0, 0, 100, 18)];
+    _addressField.font = [NSFont systemFontOfSize:12.0];
+    _addressField.bezeled = NO;
+    _addressField.bordered = NO;
+    _addressField.drawsBackground = NO;
+    _addressField.focusRingType = NSFocusRingTypeNone;
     _addressField.textColor = [NSColor labelColor];
     _addressField.placeholderString = @"Enter URL or search";
     _addressField.delegate = self;
     _addressField.cell.scrollable = YES;
     _addressField.cell.usesSingleLineMode = YES;
-    [self addSubview:_addressField];
+    _addressField.accessibilityLabel = @"Address and search bar";
 
-    // Loading indicator to the right of the address field (hidden by default)
-    _loadingIndicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(x + addressWidth + 6, y + 6, 16, 16)];
-    _loadingIndicator.autoresizingMask = NSViewMinXMargin;
-    _loadingIndicator.style = NSProgressIndicatorStyleSpinning;
-    _loadingIndicator.controlSize = NSControlSizeSmall;
-    _loadingIndicator.hidden = YES;
-    [self addSubview:_loadingIndicator];
+    // Viewport mode toggles pinned to the right edge. Exposed as a radio
+    // group: exactly one of desktop/mobile is selected at a time.
+    CGFloat rightX = frame.size.width - 12.0 - kButtonSize;
+    _mobileButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
+                                           icon:RadixIconMobile
+                                         action:@selector(selectMobileMode:)
+                                          label:@"Mobile viewport"];
+    _mobileButton.autoresizingMask = NSViewMinXMargin;
+    [_mobileButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
+    [self addSubview:_mobileButton];
+    rightX -= kButtonSize + kButtonSpacing;
+    _desktopButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
+                                            icon:RadixIconDesktop
+                                          action:@selector(selectDesktopMode:)
+                                           label:@"Desktop viewport"];
+    _desktopButton.autoresizingMask = NSViewMinXMargin;
+    [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
+    [self addSubview:_desktopButton];
+    [self setViewportMode:NO];
 
     // Initial button states
     _backButton.enabled = NO;
@@ -144,21 +293,21 @@ static void UpdateChromeLayout(void);
   return self;
 }
 
-- (NSButton*)createButtonWithFrame:(NSRect)frame image:(NSString*)imageName action:(SEL)action {
-  NSButton* button = [[NSButton alloc] initWithFrame:frame];
+- (BroHoverButton*)createButtonWithFrame:(NSRect)frame
+                                    icon:(RadixIcon)icon
+                                  action:(SEL)action
+                                   label:(NSString*)label {
+  BroHoverButton* button = [[BroHoverButton alloc] initWithFrame:frame];
   button.bezelStyle = NSBezelStyleTexturedRounded;
   button.bordered = NO;
-
-  // Use SF Symbols
-  if (@available(macOS 11.0, *)) {
-    NSImage* image = [NSImage imageWithSystemSymbolName:imageName accessibilityDescription:nil];
-    NSImageSymbolConfiguration* config = [NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightMedium];
-    button.image = [image imageWithSymbolConfiguration:config];
-  }
-
+  button.title = @"";
+  button.image = RadixIconImage(icon, 15);
+  button.imagePosition = NSImageOnly;
+  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
   button.target = self;
   button.action = action;
-
+  button.accessibilityLabel = label;
+  button.toolTip = label;
   return button;
 }
 
@@ -228,12 +377,65 @@ static void UpdateChromeLayout(void);
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
+      // Show the destination immediately; OnAddressChange confirms it later.
+      self.fullURL = target;
       browser->GetMainFrame()->LoadURL([target UTF8String]);
     }
   }
 }
 
+#pragma mark - Toolbar Actions
+
+- (void)selectMobileMode:(id)sender {
+  [self applyViewportMode:YES];
+}
+
+- (void)selectDesktopMode:(id)sender {
+  [self applyViewportMode:NO];
+}
+
+// Applies the viewport mode to the ACTIVE tab only.
+- (void)applyViewportMode:(BOOL)mobile {
+  BroHandler* handler = BroHandler::GetInstance();
+  if (!handler) {
+    return;
+  }
+  int activeId = handler->GetActiveBrowserId();
+  if (activeId < 0 || handler->IsTabMobile(activeId) == (bool)mobile) {
+    return;
+  }
+  handler->SetTabMobileEmulation(activeId, mobile);
+  [self setViewportMode:mobile];
+  UpdateChromeLayout();
+}
+
+- (void)setViewportMode:(BOOL)mobile {
+  NSColor* active = [NSColor whiteColor];
+  NSColor* inactive = [NSColor colorWithWhite:1.0 alpha:0.35];
+  _desktopButton.contentTintColor = mobile ? inactive : active;
+  _mobileButton.contentTintColor = mobile ? active : inactive;
+  _desktopButton.selectedState = !mobile;
+  _mobileButton.selectedState = mobile;
+}
+
 #pragma mark - NSTextFieldDelegate
+
+- (void)addressFieldDidFocus {
+  // Show the full URL for editing and brighten the host pill while focused.
+  if (_fullURL.length > 0) {
+    _addressField.stringValue = _fullURL;
+  }
+  _addressField.superview.layer.borderColor =
+      [NSColor colorWithWhite:1.0 alpha:0.30].CGColor;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NSTextView* editor = (NSTextView*)[self.addressField currentEditor];
+    if ([editor isKindOfClass:[NSTextView class]]) {
+      editor.insertionPointColor = [NSColor whiteColor];
+      editor.drawsBackground = NO;
+      [editor selectAll:nil];
+    }
+  });
+}
 
 - (void)controlTextDidEndEditing:(NSNotification*)notification {
   NSTextField* textField = notification.object;
@@ -241,7 +443,19 @@ static void UpdateChromeLayout(void);
     NSNumber* reason = notification.userInfo[@"NSTextMovement"];
     if (reason && reason.integerValue == NSReturnTextMovement) {
       [self navigateToURL:_addressField.stringValue];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self.window makeFirstResponder:nil];
+      });
     }
+    _addressField.superview.layer.borderColor =
+        [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    [self displayCompactURL];
+  }
+}
+
+- (void)focusAddressField {
+  if (_addressField.superview) {
+    [self.window makeFirstResponder:_addressField];
   }
 }
 
@@ -253,21 +467,18 @@ static void UpdateChromeLayout(void);
 }
 
 - (void)updateURL:(NSString*)url {
+  self.fullURL = url ?: @"";
   // Don't clobber text the user is currently typing.
   if ([_addressField currentEditor]) {
     return;
   }
-  _addressField.stringValue = url ?: @"";
+  [self displayCompactURL];
 }
 
-- (void)setLoading:(BOOL)loading {
-  if (loading) {
-    _loadingIndicator.hidden = NO;
-    [_loadingIndicator startAnimation:nil];
-  } else {
-    [_loadingIndicator stopAnimation:nil];
-    _loadingIndicator.hidden = YES;
-  }
+// Shows just the host (like the mockup); the full URL appears on focus.
+- (void)displayCompactURL {
+  NSString* host = [NSURL URLWithString:_fullURL].host;
+  _addressField.stringValue = host.length > 0 ? host : _fullURL;
 }
 
 @end
@@ -282,14 +493,39 @@ static void UpdateChromeLayout(void);
 @property (nonatomic, strong) NSButton* closeButton;
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, assign) BOOL isLoading;
+@property (nonatomic, copy) NSString* tabURL;
 @property (nonatomic, weak) id target;
 @property (nonatomic, assign) SEL selectAction;
 @property (nonatomic, assign) SEL closeAction;
 - (void)setFaviconURL:(NSString*)urlString;
 - (void)setLoading:(BOOL)loading;
+- (void)setTabURL:(NSString*)url;
+- (void)attachAddressField:(NSTextField*)field;
 @end
 
-@implementation BroTabView
+// The tab strip lives INSIDE the toolbar row: each tab is a pill (favicon +
+// host + close), the active pill hosts the editable address field, and the
+// "+" button trails the last pill. Declared before BroTabView's
+// implementation so pills can route arrow-key focus through it.
+@interface BroTabBar : NSView
+@property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
+@property (nonatomic, strong) BroHoverButton* addTabButton;
+@property (nonatomic, assign) int activeTabId;
+- (void)addTabWithBrowserId:(int)browserId title:(NSString*)title;
+- (void)removeTabWithBrowserId:(int)browserId;
+- (void)setActiveTab:(int)browserId;
+- (void)updateTabTitle:(int)browserId title:(NSString*)title;
+- (void)updateTabURL:(int)browserId url:(NSString*)url;
+- (void)updateTabFavicon:(int)browserId faviconURL:(NSString*)url;
+- (void)updateTabLoading:(int)browserId loading:(BOOL)loading;
+// Moves keyboard focus to the pill `offset` positions from `tab`.
+- (void)focusTabRelativeTo:(BroTabView*)tab offset:(NSInteger)offset;
+@end
+
+@implementation BroTabView {
+  BOOL hovered_;
+  BOOL focused_;
+}
 
 - (instancetype)initWithFrame:(NSRect)frame browserId:(int)browserId {
   self = [super initWithFrame:frame];
@@ -297,54 +533,67 @@ static void UpdateChromeLayout(void);
     _browserId = browserId;
     _isActive = NO;
     _isLoading = NO;
+    _tabURL = @"";
 
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 6.0;
+    self.layer.cornerRadius = kPillCornerRadius;
+    self.layer.borderWidth = 1.0;
+    // Keyboard focus shows as a white pill border instead of the system's
+    // accent-colored ring.
+    self.focusRingType = NSFocusRingTypeNone;
 
     // Favicon view
-    _faviconView = [[NSImageView alloc] initWithFrame:NSMakeRect(6, 8, 16, 16)];
+    _faviconView = [[NSImageView alloc]
+        initWithFrame:NSMakeRect(10, (kTabPillHeight - 15) / 2.0, 15, 15)];
     _faviconView.imageScaling = NSImageScaleProportionallyUpOrDown;
     // Default globe icon
-    if (@available(macOS 11.0, *)) {
-      _faviconView.image = [NSImage imageWithSystemSymbolName:@"globe" accessibilityDescription:nil];
-      _faviconView.contentTintColor = [NSColor secondaryLabelColor];
-    }
+    _faviconView.image = RadixIconImage(RadixIconGlobe, 15);
+    _faviconView.contentTintColor = [NSColor secondaryLabelColor];
     [self addSubview:_faviconView];
 
     // Loading spinner (same position as favicon, hidden by default)
-    _loadingSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(6, 8, 16, 16)];
+    _loadingSpinner = [[NSProgressIndicator alloc] initWithFrame:_faviconView.frame];
     _loadingSpinner.style = NSProgressIndicatorStyleSpinning;
     _loadingSpinner.controlSize = NSControlSizeSmall;
     _loadingSpinner.hidden = YES;
     [self addSubview:_loadingSpinner];
 
-    // Title label (after favicon)
-    _titleLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(26, 8, frame.size.width - 50, 20)];
-    _titleLabel.stringValue = @"New Tab";
+    // Host label (hidden on the active pill, where the address field shows)
+    _titleLabel = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(32, (kTabPillHeight - 18) / 2.0,
+                                 frame.size.width - 32 - 26, 18)];
+    _titleLabel.stringValue = @"";
     _titleLabel.font = [NSFont systemFontOfSize:12.0];
     _titleLabel.textColor = [NSColor secondaryLabelColor];
     _titleLabel.bordered = NO;
     _titleLabel.editable = NO;
+    _titleLabel.selectable = NO;
     _titleLabel.drawsBackground = NO;
     _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _titleLabel.cell.truncatesLastVisibleLine = YES;
     _titleLabel.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_titleLabel];
 
-    // Close button
-    _closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 24, 8, 16, 16)];
-    _closeButton.bezelStyle = NSBezelStyleTexturedRounded;
-    _closeButton.bordered = NO;
-    if (@available(macOS 11.0, *)) {
-      NSImage* closeImage = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:@"Close"];
-      NSImageSymbolConfiguration* config = [NSImageSymbolConfiguration configurationWithPointSize:10 weight:NSFontWeightMedium];
-      _closeButton.image = [closeImage imageWithSymbolConfiguration:config];
-    }
-    _closeButton.target = self;
-    _closeButton.action = @selector(handleClose:);
-    _closeButton.autoresizingMask = NSViewMinXMargin;
-    _closeButton.hidden = YES;  // Show on hover
+    // Close button (always visible, like the mockup)
+    BroHoverButton* closeButton = [[BroHoverButton alloc]
+        initWithFrame:NSMakeRect(frame.size.width - 26,
+                                 (kTabPillHeight - 16) / 2.0, 16, 16)];
+    closeButton.bezelStyle = NSBezelStyleTexturedRounded;
+    closeButton.bordered = NO;
+    closeButton.title = @"";
+    closeButton.image = RadixIconImage(RadixIconCross2, 10);
+    closeButton.imagePosition = NSImageOnly;
+    closeButton.contentTintColor = [NSColor tertiaryLabelColor];
+    closeButton.layer.cornerRadius = 4.0;
+    closeButton.target = self;
+    closeButton.action = @selector(handleClose:);
+    closeButton.autoresizingMask = NSViewMinXMargin;
+    closeButton.accessibilityLabel = @"Close tab";
+    closeButton.toolTip = @"Close tab";
+    _closeButton = closeButton;
     [self addSubview:_closeButton];
+
+    [self updateAppearance];
 
     // Add tracking area for hover
     NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
@@ -375,6 +624,22 @@ static void UpdateChromeLayout(void);
   });
 }
 
+- (void)setTabURL:(NSString*)url {
+  _tabURL = [url copy] ?: @"";
+  NSString* host = [NSURL URLWithString:_tabURL].host;
+  _titleLabel.stringValue = host.length > 0 ? host : _tabURL;
+}
+
+// Hosts the toolbar's shared address field (this pill is the active tab).
+- (void)attachAddressField:(NSTextField*)field {
+  NSRect bounds = self.bounds;
+  field.frame = NSMakeRect(32, (bounds.size.height - 18) / 2.0,
+                           bounds.size.width - 32 - 26, 18);
+  field.autoresizingMask = NSViewWidthSizable;
+  [self addSubview:field];
+  _titleLabel.hidden = YES;
+}
+
 - (void)setLoading:(BOOL)loading {
   _isLoading = loading;
   if (loading) {
@@ -388,13 +653,27 @@ static void UpdateChromeLayout(void);
   }
 }
 
+// Selected (active) pills are brightest; hovered inactive pills sit between
+// the selected and resting looks. Keyboard focus overrides the border with a
+// solid white ring.
 - (void)updateAppearance {
   if (_isActive) {
-    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
     _titleLabel.textColor = [NSColor labelColor];
   } else {
-    self.layer.backgroundColor = [NSColor clearColor].CGColor;
+    CGFloat bg = hovered_ ? 0.06 : 0.03;
+    CGFloat border = hovered_ ? 0.12 : 0.08;
+    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:bg].CGColor;
+    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:border].CGColor;
     _titleLabel.textColor = [NSColor secondaryLabelColor];
+    _titleLabel.hidden = NO;  // the address field only lives in the active pill
+  }
+  if (focused_) {
+    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.9].CGColor;
+    self.layer.borderWidth = 2.0;
+  } else {
+    self.layer.borderWidth = 1.0;
   }
 }
 
@@ -403,7 +682,7 @@ static void UpdateChromeLayout(void);
   [self updateAppearance];
 }
 
-- (void)mouseDown:(NSEvent*)event {
+- (void)performSelect {
   if (_target && _selectAction) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
@@ -412,18 +691,101 @@ static void UpdateChromeLayout(void);
   }
 }
 
+- (void)mouseDown:(NSEvent*)event {
+  [self performSelect];
+}
+
 - (void)mouseEntered:(NSEvent*)event {
-  _closeButton.hidden = NO;
-  if (!_isActive) {
-    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
-  }
+  hovered_ = YES;
+  [self updateAppearance];
 }
 
 - (void)mouseExited:(NSEvent*)event {
-  _closeButton.hidden = YES;
-  if (!_isActive) {
-    self.layer.backgroundColor = [NSColor clearColor].CGColor;
+  hovered_ = NO;
+  [self updateAppearance];
+}
+
+#pragma mark Keyboard focus
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (BOOL)canBecomeKeyView {
+  return !self.hiddenOrHasHiddenAncestor;
+}
+
+- (BOOL)becomeFirstResponder {
+  BOOL ok = [super becomeFirstResponder];
+  if (ok) {
+    focused_ = YES;
+    [self updateAppearance];
   }
+  return ok;
+}
+
+- (BOOL)resignFirstResponder {
+  BOOL ok = [super resignFirstResponder];
+  if (ok) {
+    focused_ = NO;
+    [self updateAppearance];
+  }
+  return ok;
+}
+
+- (void)keyDown:(NSEvent*)event {
+  NSString* chars = event.charactersIgnoringModifiers;
+  unichar c = chars.length > 0 ? [chars characterAtIndex:0] : 0;
+  if (c == ' ' || c == '\r' || c == NSEnterCharacter) {
+    [self performSelect];
+    return;
+  }
+  if (c == NSLeftArrowFunctionKey || c == NSRightArrowFunctionKey) {
+    if ([self.superview isKindOfClass:[BroTabBar class]]) {
+      [(BroTabBar*)self.superview
+          focusTabRelativeTo:self
+                      offset:(c == NSRightArrowFunctionKey ? 1 : -1)];
+      return;
+    }
+  }
+  [super keyDown:event];
+}
+
+- (void)resetCursorRects {
+  [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+}
+
+#pragma mark Accessibility
+
+// Pills read as the radio buttons of a tab group (how AppKit exposes native
+// tab strips): label = host, value = selected.
+- (BOOL)isAccessibilityElement {
+  return YES;
+}
+
+- (NSString*)accessibilityRole {
+  return NSAccessibilityRadioButtonRole;
+}
+
+- (NSString*)accessibilityRoleDescription {
+  return @"tab";
+}
+
+- (NSString*)accessibilityLabel {
+  NSString* host = _titleLabel.stringValue;
+  if (host.length > 0) {
+    return host;
+  }
+  return self.toolTip.length > 0 ? self.toolTip : @"New Tab";
+}
+
+- (id)accessibilityValue {
+  return @(_isActive);
+}
+
+- (BOOL)accessibilityPerformPress {
+  [self performSelect];
+  return YES;
 }
 
 - (void)handleClose:(id)sender {
@@ -439,18 +801,6 @@ static void UpdateChromeLayout(void);
 
 #pragma mark - BroTabBar
 
-@interface BroTabBar : NSView
-@property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
-@property (nonatomic, strong) NSButton* addTabButton;
-@property (nonatomic, assign) int activeTabId;
-- (void)addTabWithBrowserId:(int)browserId title:(NSString*)title;
-- (void)removeTabWithBrowserId:(int)browserId;
-- (void)setActiveTab:(int)browserId;
-- (void)updateTabTitle:(int)browserId title:(NSString*)title;
-- (void)updateTabFavicon:(int)browserId faviconURL:(NSString*)url;
-- (void)updateTabLoading:(int)browserId loading:(BOOL)loading;
-@end
-
 @implementation BroTabBar
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -458,26 +808,45 @@ static void UpdateChromeLayout(void);
   if (self) {
     _tabs = [NSMutableArray array];
     _activeTabId = -1;
-    self.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    self.autoresizingMask = NSViewWidthSizable;
 
     // Performance: Enable layer-backing for GPU compositing
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
 
-    // New tab button
-    _addTabButton = [[NSButton alloc] initWithFrame:NSMakeRect(8, 4, 28, 28)];
-    _addTabButton.bezelStyle = NSBezelStyleTexturedRounded;
+    // Bordered rounded-rect "+" button, repositioned after the last pill.
+    CGFloat pillY = (frame.size.height - kTabPillHeight) / 2.0;
+    _addTabButton = [[BroHoverButton alloc]
+        initWithFrame:NSMakeRect(0, pillY, kTabPillHeight, kTabPillHeight)];
     _addTabButton.bordered = NO;
-    if (@available(macOS 11.0, *)) {
-      NSImage* plusImage = [NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:@"New Tab"];
-      NSImageSymbolConfiguration* config = [NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightMedium];
-      _addTabButton.image = [plusImage imageWithSymbolConfiguration:config];
-    }
+    _addTabButton.title = @"";
+    _addTabButton.image = RadixIconImage(RadixIconPlus, 15);
+    _addTabButton.imagePosition = NSImageOnly;
+    _addTabButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    _addTabButton.layer.cornerRadius = 8.0;
+    _addTabButton.layer.borderWidth = 1.0;
+    _addTabButton.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
     _addTabButton.target = self;
     _addTabButton.action = @selector(createNewTab:);
+    _addTabButton.accessibilityLabel = @"New tab";
+    _addTabButton.toolTip = @"New tab";
     [self addSubview:_addTabButton];
   }
   return self;
+}
+
+#pragma mark Accessibility
+
+- (BOOL)isAccessibilityElement {
+  return YES;
+}
+
+- (NSString*)accessibilityRole {
+  return NSAccessibilityTabGroupRole;
+}
+
+- (NSString*)accessibilityLabel {
+  return @"Tabs";
 }
 
 - (void)createNewTab:(id)sender {
@@ -485,9 +854,11 @@ static void UpdateChromeLayout(void);
 }
 
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title {
-  BroTabView* tab = [[BroTabView alloc] initWithFrame:NSMakeRect(0, 2, kTabMinWidth, kTabBarHeight - 4)
-                                            browserId:browserId];
-  tab.titleLabel.stringValue = title ?: @"New Tab";
+  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
+  BroTabView* tab = [[BroTabView alloc]
+      initWithFrame:NSMakeRect(0, pillY, kTabPillMaxWidth, kTabPillHeight)
+          browserId:browserId];
+  tab.toolTip = title ?: @"New Tab";
   tab.target = self;
   tab.selectAction = @selector(tabSelected:);
   tab.closeAction = @selector(tabClosed:);
@@ -495,6 +866,19 @@ static void UpdateChromeLayout(void);
   [self addSubview:tab];
 
   [self layoutTabs];
+  [self.window recalculateKeyViewLoop];
+}
+
+- (void)focusTabRelativeTo:(BroTabView*)tab offset:(NSInteger)offset {
+  NSInteger index = [_tabs indexOfObject:tab];
+  if (index == NSNotFound) {
+    return;
+  }
+  NSInteger next = index + offset;
+  if (next < 0 || next >= (NSInteger)_tabs.count) {
+    return;
+  }
+  [self.window makeFirstResponder:_tabs[next]];
 }
 
 - (void)removeTabWithBrowserId:(int)browserId {
@@ -507,23 +891,58 @@ static void UpdateChromeLayout(void);
   }
 
   if (tabToRemove) {
+    // If the closed pill held keyboard focus, hand it to a neighbor so focus
+    // doesn't silently fall back to the window.
+    if (self.window.firstResponder == tabToRemove) {
+      NSUInteger index = [_tabs indexOfObject:tabToRemove];
+      BroTabView* neighbor = nil;
+      if (index != NSNotFound && _tabs.count > 1) {
+        neighbor = _tabs[index + 1 < _tabs.count ? index + 1 : index - 1];
+      }
+      [self.window makeFirstResponder:neighbor];
+    }
     [tabToRemove removeFromSuperview];
     [_tabs removeObject:tabToRemove];
     [self layoutTabs];
+    [self.window recalculateKeyViewLoop];
   }
 }
 
 - (void)setActiveTab:(int)browserId {
   _activeTabId = browserId;
+  BroTabView* activeTab = nil;
   for (BroTabView* tab in _tabs) {
     tab.isActive = (tab.browserId == browserId);
+    if (tab.browserId == browserId) {
+      activeTab = tab;
+    }
+  }
+
+  // The active pill hosts the shared editable address field.
+  if (g_toolbar) {
+    [g_toolbar.addressField removeFromSuperview];
+    if (activeTab) {
+      [activeTab attachAddressField:g_toolbar.addressField];
+    }
+    // The viewport toggles reflect the active tab's own emulation state.
+    [g_toolbar setViewportMode:TabIsMobile(browserId)];
   }
 }
 
 - (void)updateTabTitle:(int)browserId title:(NSString*)title {
   for (BroTabView* tab in _tabs) {
     if (tab.browserId == browserId) {
-      tab.titleLabel.stringValue = title ?: @"New Tab";
+      // Pills display the host; the page title becomes a tooltip.
+      tab.toolTip = title ?: @"New Tab";
+      break;
+    }
+  }
+}
+
+- (void)updateTabURL:(int)browserId url:(NSString*)url {
+  for (BroTabView* tab in _tabs) {
+    if (tab.browserId == browserId) {
+      [tab setTabURL:url];
       break;
     }
   }
@@ -548,19 +967,22 @@ static void UpdateChromeLayout(void);
 }
 
 - (void)layoutTabs {
-  if (_tabs.count == 0) return;
+  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
 
-  // Fit tabs to the available space, shrinking below kTabMinWidth (down to a
-  // hard floor) rather than overflowing past the window edge.
-  CGFloat availableWidth = self.frame.size.width - 48.0;  // Space after new tab button
-  CGFloat fitWidth = availableWidth / _tabs.count - 4.0;
-  CGFloat tabWidth = MIN(MAX(fitWidth, 60.0), kTabMaxWidth);
+  // Fit pills to the available strip width (minus the "+" button), between
+  // a floor and the mockup's pill width.
+  CGFloat availableWidth = self.frame.size.width - (kTabPillHeight + 8.0);
+  NSUInteger count = MAX(_tabs.count, (NSUInteger)1);
+  CGFloat fitWidth = availableWidth / count - 8.0;
+  CGFloat tabWidth = MIN(MAX(fitWidth, kTabPillMinWidth), kTabPillMaxWidth);
 
-  CGFloat x = 40.0;
+  CGFloat x = 0.0;
   for (BroTabView* tab in _tabs) {
-    tab.frame = NSMakeRect(x, 2, tabWidth, kTabBarHeight - 4);
-    x += tabWidth + 4.0;
+    tab.frame = NSMakeRect(x, pillY, tabWidth, kTabPillHeight);
+    x += tabWidth + 8.0;
   }
+
+  _addTabButton.frame = NSMakeRect(x, pillY, kTabPillHeight, kTabPillHeight);
 }
 
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
@@ -569,6 +991,13 @@ static void UpdateChromeLayout(void);
 }
 
 - (void)tabSelected:(BroTabView*)tab {
+  if (tab.browserId == _activeTabId) {
+    // Clicking the active pill starts editing its URL.
+    if (g_toolbar) {
+      [g_toolbar focusAddressField];
+    }
+    return;
+  }
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     handler->SetActiveBrowser(tab.browserId);
@@ -611,47 +1040,70 @@ static void UpdateChromeLayout(void);
                             backing:NSBackingStoreBuffered
                               defer:NO];
   if (self) {
-    // Transparent titlebar for vibrancy effect
+    // Glassy near-black chrome: a behind-window blur tinted dark, so the
+    // desktop shows through the chrome as frosted glass. The transparent
+    // titlebar keeps the traffic lights floating inline with the toolbar row.
     self.titlebarAppearsTransparent = YES;
     self.titleVisibility = NSWindowTitleHidden;
     self.backgroundColor = [NSColor clearColor];
+    self.opaque = NO;
 
-    // Create visual effect view for vibrancy
-    NSVisualEffectView* visualEffect = [[NSVisualEffectView alloc] initWithFrame:frame];
-    visualEffect.material = NSVisualEffectMaterialUnderWindowBackground;
-    visualEffect.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-    visualEffect.state = NSVisualEffectStateFollowsWindowActiveState;
-    visualEffect.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    self.contentView = visualEffect;
+    // An empty unified toolbar grows the titlebar to the chrome row's height,
+    // which vertically centers the traffic lights on the same midline as the
+    // nav buttons and pills.
+    NSToolbar* titlebarSpacer = [[NSToolbar alloc] initWithIdentifier:@"BroTitlebarSpacer"];
+    titlebarSpacer.showsBaselineSeparator = NO;
+    self.toolbar = titlebarSpacer;
+    self.toolbarStyle = NSWindowToolbarStyleUnified;
 
-    // Create tab bar (at top, under title bar area)
-    // Leave 80px on left for traffic lights (close/minimize/zoom)
-    CGFloat trafficLightSpace = 80.0;
-    CGFloat tabBarY = frame.size.height - kTabBarHeight;
-    _tabBar = [[BroTabBar alloc] initWithFrame:NSMakeRect(trafficLightSpace, tabBarY, frame.size.width - trafficLightSpace, kTabBarHeight)];
-    [visualEffect addSubview:_tabBar];
-    g_tab_bar = _tabBar;
+    NSVisualEffectView* content = [[NSVisualEffectView alloc] initWithFrame:frame];
+    content.material = NSVisualEffectMaterialHUDWindow;
+    content.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    content.state = NSVisualEffectStateFollowsWindowActiveState;
+    content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.contentView = content;
 
-    // Create toolbar (below tab bar)
-    CGFloat toolbarY = tabBarY - kToolbarHeight;
+    // Dark tint over the blur to stay close to the mockup's near-black.
+    NSView* tint = [[NSView alloc] initWithFrame:frame];
+    tint.wantsLayer = YES;
+    tint.layer.backgroundColor =
+        [[NSColor blackColor] colorWithAlphaComponent:0.35].CGColor;
+    tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [content addSubview:tint];
+
+    // Single chrome row at the very top; its content is inset past the
+    // traffic lights.
+    CGFloat toolbarY = frame.size.height - kToolbarHeight;
     _navToolbar = [[BroToolbar alloc] initWithFrame:NSMakeRect(0, toolbarY, frame.size.width, kToolbarHeight)];
-    [visualEffect addSubview:_navToolbar];
+    [content addSubview:_navToolbar];
     g_toolbar = _navToolbar;
 
-    // Create container for browser views (below toolbar)
-    CGFloat browserHeight = toolbarY;
-    _browserContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, browserHeight)];
+    // Tab strip inline in the toolbar row: after the nav buttons, before the
+    // right-aligned viewport toggles.
+    CGFloat stripX = kTrafficLightInset + 3 * (kButtonSize + kButtonSpacing) + 8.0;
+    CGFloat stripRight = frame.size.width - 12.0 - kButtonSize - kButtonSpacing -
+                         kButtonSize - 16.0;
+    _tabBar = [[BroTabBar alloc]
+        initWithFrame:NSMakeRect(stripX, 0, stripRight - stripX, kToolbarHeight)];
+    [_navToolbar addSubview:_tabBar];
+    g_tab_bar = _tabBar;
+
+    // Create container for browser views (below chrome)
+    _browserContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, toolbarY)];
     _browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [visualEffect addSubview:_browserContainer];
+    [content addSubview:_browserContainer];
 
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
 
+    // Keep the Tab-key loop current as pills and buttons come and go.
+    self.autorecalculatesKeyViewLoop = YES;
+
     // Center the window
     [self center];
 
-    // Set minimum size
-    self.minSize = NSMakeSize(400, 300);
+    // Set minimum size (wide enough for the pill + right-side toggles)
+    self.minSize = NSMakeSize(760, 400);
   }
   return self;
 }
@@ -660,18 +1112,152 @@ static void UpdateChromeLayout(void);
 
 #pragma mark - CreateNewBrowserTab
 
+// Frames a per-tab container for that tab's viewport mode: full-bleed on
+// desktop, a centered 390pt column in mobile mode.
+static void ApplyViewportFrameToContainer(NSView* container, BOOL mobile) {
+  NSRect bounds = g_main_window.browserContainer.bounds;
+  if (mobile) {
+    CGFloat width = MIN(kMobileViewportWidth, bounds.size.width);
+    container.frame = NSMakeRect((bounds.size.width - width) / 2.0, 0, width,
+                                 bounds.size.height);
+    container.autoresizingMask =
+        NSViewMinXMargin | NSViewMaxXMargin | NSViewHeightSizable;
+  } else {
+    container.frame = bounds;
+    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  }
+}
+
 // Creates a hidden per-tab container view inside the main browser area.
 // The browser created into it is adopted as a tab in OnTabCreated, which
 // finds the container as the superview of the browser's native view.
+// New tabs always start in desktop mode.
 static NSView* CreateTabContainerView(void) {
   if (!g_main_window || !g_main_window.browserContainer) {
     return nil;
   }
-  NSView* browserContainer = [[NSView alloc] initWithFrame:g_main_window.browserContainer.bounds];
-  browserContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  NSView* browserContainer = [[NSView alloc] init];
+  ApplyViewportFrameToContainer(browserContainer, NO);
   browserContainer.hidden = YES;  // Will be shown when tab is activated
   [g_main_window.browserContainer addSubview:browserContainer];
   return browserContainer;
+}
+
+static void UpdateChromeLayout(void) {
+  if (!g_main_window || !g_main_window.browserContainer) {
+    return;
+  }
+  for (NSNumber* key in g_browser_views) {
+    ApplyViewportFrameToContainer(g_browser_views[key],
+                                  TabIsMobile(key.intValue));
+  }
+}
+
+// Chrome's preset zoom stops. CEF zoom levels are logarithmic:
+// scale = 1.2^level, so level = log(scale) / log(1.2).
+static const double kZoomPercents[] = {25,  33,  50,  67,  75,  80,
+                                       90,  100, 110, 125, 150, 175,
+                                       200, 250, 300, 400, 500};
+static const int kZoomPercentCount =
+    sizeof(kZoomPercents) / sizeof(kZoomPercents[0]);
+
+static double ZoomLevelToPercent(double level) {
+  return pow(1.2, level) * 100.0;
+}
+
+static double PercentToZoomLevel(double percent) {
+  return log(percent / 100.0) / log(1.2);
+}
+
+// Next ladder stop above/below |currentPercent|. The 0.5 slack absorbs
+// floating-point drift from the level<->percent round trip.
+static double NextZoomPercent(double currentPercent, BOOL zoomingIn) {
+  if (zoomingIn) {
+    for (int i = 0; i < kZoomPercentCount; ++i) {
+      if (kZoomPercents[i] > currentPercent + 0.5) {
+        return kZoomPercents[i];
+      }
+    }
+    return kZoomPercents[kZoomPercentCount - 1];
+  }
+  for (int i = kZoomPercentCount - 1; i >= 0; --i) {
+    if (kZoomPercents[i] < currentPercent - 0.5) {
+      return kZoomPercents[i];
+    }
+  }
+  return kZoomPercents[0];
+}
+
+// Transient bubble showing the current zoom percentage.
+static NSView* g_zoom_hud = nil;
+static NSTextField* g_zoom_hud_label = nil;
+static NSTimer* g_zoom_hud_timer = nil;
+
+static void ShowZoomHUD(int percent) {
+  if (!g_main_window || !g_main_window.browserContainer) {
+    return;
+  }
+  NSView* container = g_main_window.browserContainer;
+
+  if (!g_zoom_hud) {
+    g_zoom_hud = [[NSView alloc] initWithFrame:NSZeroRect];
+    g_zoom_hud.wantsLayer = YES;
+    g_zoom_hud.layer.cornerRadius = 8.0;
+    g_zoom_hud.layer.backgroundColor =
+        [NSColor colorWithWhite:0.15 alpha:0.92].CGColor;
+
+    g_zoom_hud_label = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    g_zoom_hud_label.editable = NO;
+    g_zoom_hud_label.selectable = NO;
+    g_zoom_hud_label.bezeled = NO;
+    g_zoom_hud_label.bordered = NO;
+    g_zoom_hud_label.drawsBackground = NO;
+    g_zoom_hud_label.font = [NSFont boldSystemFontOfSize:14.0];
+    g_zoom_hud_label.textColor = [NSColor whiteColor];
+    g_zoom_hud_label.alignment = NSTextAlignmentCenter;
+    [g_zoom_hud addSubview:g_zoom_hud_label];
+  }
+  // (Re-)add last so the HUD composites above the native CEF browser view.
+  if (g_zoom_hud.superview != container) {
+    [g_zoom_hud removeFromSuperview];
+    [container addSubview:g_zoom_hud];
+  }
+
+  g_zoom_hud_label.stringValue = [NSString stringWithFormat:@"%d%%", percent];
+  [g_zoom_hud_label sizeToFit];
+  NSSize labelSize = g_zoom_hud_label.frame.size;
+  const CGFloat padX = 14.0;
+  const CGFloat padY = 8.0;
+  NSSize hudSize =
+      NSMakeSize(labelSize.width + padX * 2, labelSize.height + padY * 2);
+  NSRect bounds = container.bounds;
+  g_zoom_hud.frame = NSMakeRect(NSMaxX(bounds) - hudSize.width - 16.0,
+                                NSMaxY(bounds) - hudSize.height - 16.0,
+                                hudSize.width, hudSize.height);
+  g_zoom_hud_label.frame =
+      NSMakeRect(padX, padY, labelSize.width, labelSize.height);
+
+  g_zoom_hud.hidden = NO;
+  g_zoom_hud.alphaValue = 1.0;
+
+  [g_zoom_hud_timer invalidate];
+  g_zoom_hud_timer =
+      [NSTimer scheduledTimerWithTimeInterval:1.2
+                                      repeats:NO
+                                        block:^(NSTimer* timer) {
+        g_zoom_hud_timer = nil;
+        [NSAnimationContext
+            runAnimationGroup:^(NSAnimationContext* ctx) {
+              ctx.duration = 0.25;
+              g_zoom_hud.animator.alphaValue = 0.0;
+            }
+            completionHandler:^{
+              // Skip hiding if another press restarted the HUD mid-fade.
+              if (!g_zoom_hud_timer) {
+                g_zoom_hud.hidden = YES;
+              }
+            }];
+      }];
 }
 
 static void CreateNewBrowserTabWithURL(const std::string& url) {
@@ -745,10 +1331,13 @@ static void CreateNewBrowserTab(void) {
 @implementation BroAppDelegate
 
 - (void)createApplication:(id)object {
+  // The chrome is designed dark-only; force dark so system controls match.
+  NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+
   // Create the main menu
   [self setupMainMenu];
 
-  // Create the main window with vibrancy
+  // Create the main window
   g_main_window = [[BroWindow alloc] init];
   g_main_window.delegate = self;
   g_main_window.title = @"Bro";
@@ -807,8 +1396,17 @@ static void CreateNewBrowserTab(void) {
   [viewMenu addItemWithTitle:@"Stop" action:@selector(stopLoading:) keyEquivalent:@"."];
   [viewMenu addItem:[NSMenuItem separatorItem]];
 
-  // Zoom controls
-  [viewMenu addItemWithTitle:@"Zoom In" action:@selector(zoomIn:) keyEquivalent:@"+"];
+  // Zoom controls. Cmd+"=" is the unshifted "+" key; a "+" key equivalent
+  // with a Command-only mask would never match because typing "+" requires
+  // Shift, which AppKit only auto-infers for uppercase letters.
+  [viewMenu addItemWithTitle:@"Zoom In" action:@selector(zoomIn:) keyEquivalent:@"="];
+  NSMenuItem* zoomInShifted = [[NSMenuItem alloc] initWithTitle:@"Zoom In"
+                                                         action:@selector(zoomIn:)
+                                                  keyEquivalent:@"+"];
+  zoomInShifted.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  zoomInShifted.hidden = YES;
+  [viewMenu addItem:zoomInShifted];
   [viewMenu addItemWithTitle:@"Zoom Out" action:@selector(zoomOut:) keyEquivalent:@"-"];
   [viewMenu addItemWithTitle:@"Actual Size" action:@selector(zoomReset:) keyEquivalent:@"0"];
   [viewMenu addItem:[NSMenuItem separatorItem]];
@@ -986,9 +1584,7 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)newTab:(id)sender {
-  if (g_tab_bar) {
-    [g_tab_bar createNewTab:sender];
-  }
+  CreateNewBrowserTab();
 }
 
 - (void)closeTab:(id)sender {
@@ -1014,32 +1610,31 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)focusAddressBar:(id)sender {
-  if (g_toolbar && g_toolbar.addressField) {
-    [g_main_window makeFirstResponder:g_toolbar.addressField];
-    [g_toolbar.addressField selectText:nil];
+  if (g_toolbar) {
+    [g_toolbar focusAddressField];
+  }
+}
+
+- (void)stepZoom:(BOOL)zoomingIn {
+  BroHandler* handler = BroHandler::GetInstance();
+  if (handler) {
+    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
+    if (browser) {
+      double currentPercent =
+          ZoomLevelToPercent(browser->GetHost()->GetZoomLevel());
+      double targetPercent = NextZoomPercent(currentPercent, zoomingIn);
+      browser->GetHost()->SetZoomLevel(PercentToZoomLevel(targetPercent));
+      ShowZoomHUD((int)lround(targetPercent));
+    }
   }
 }
 
 - (void)zoomIn:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser) {
-      double currentZoom = browser->GetHost()->GetZoomLevel();
-      browser->GetHost()->SetZoomLevel(currentZoom + 0.5);
-    }
-  }
+  [self stepZoom:YES];
 }
 
 - (void)zoomOut:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser) {
-      double currentZoom = browser->GetHost()->GetZoomLevel();
-      browser->GetHost()->SetZoomLevel(currentZoom - 0.5);
-    }
-  }
+  [self stepZoom:NO];
 }
 
 - (void)zoomReset:(id)sender {
@@ -1048,6 +1643,7 @@ static void CreateNewBrowserTab(void) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
       browser->GetHost()->SetZoomLevel(0.0);
+      ShowZoomHUD(100);
     }
   }
 }
@@ -1111,11 +1707,9 @@ void UpdateURL(const std::string& url) {
 }
 
 void SetLoading(bool loading) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    if (g_toolbar) {
-      [g_toolbar setLoading:loading];
-    }
-  });
+  // Loading state is shown per-tab (each pill swaps its favicon for a
+  // spinner via OnTabLoadingChanged); nothing extra to do for the active tab.
+  (void)loading;
 }
 
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
@@ -1146,6 +1740,8 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   // Add tab to tab bar
   if (g_tab_bar) {
     [g_tab_bar addTabWithBrowserId:browser_id title:@"New Tab"];
+    NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
+    [g_tab_bar updateTabURL:browser_id url:urlStr];
     [g_tab_bar setActiveTab:browser_id];
   }
 
@@ -1202,6 +1798,16 @@ void OnTabTitleChanged(int browser_id, const std::string& title) {
   dispatch_async(dispatch_get_main_queue(), ^{
     if (g_tab_bar) {
       [g_tab_bar updateTabTitle:browser_id title:titleStr];
+    }
+  });
+}
+
+void OnTabURLChanged(int browser_id, const std::string& url) {
+  // Convert before dispatching (see UpdateURL).
+  NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (g_tab_bar) {
+      [g_tab_bar updateTabURL:browser_id url:urlStr];
     }
   });
 }
