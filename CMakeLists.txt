@@ -10,15 +10,11 @@ endif()
 # Release build optimizations
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto")
-
-# Strip symbols in Release
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
-endif()
+# Applied per-config so dead stripping also happens under multi-config generators
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto -Wl,-dead_strip")
 
 # CEF binary distribution path
-set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/cef_binary_145.0.21+gd7459b1+chromium-145.0.7632.26_macosarm64_beta_minimal")
+set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal")
 
 # Use C++17
 set(CMAKE_CXX_STANDARD 17)
@@ -41,20 +37,27 @@ set(BRO_SRCS
     src/bro_handler.h
     src/bro_handler_mac.mm
     src/bro_mac.mm
+    src/radix_icons.h
+    src/radix_icons.mm
 )
 
 set(BRO_HELPER_SRCS
     src/process_helper_mac.cc
 )
 
-# Resources
-set(BRO_RESOURCES_SRCS
-    src/mac/Info.plist.in
+# Bundle resources
+set(BRO_RESOURCES
+    src/mac/cefsimple.icns
+    src/mac/wasm-bench.html
+)
+set_source_files_properties(${BRO_RESOURCES} PROPERTIES
+    MACOSX_PACKAGE_LOCATION "Resources"
 )
 
 # App bundle info
 set(PRODUCT_NAME "Bro")
 set(EXECUTABLE_NAME "Bro")
+set(VERSION_SHORT "1.0.0")
 
 # Configure Info.plist
 configure_file(
@@ -63,15 +66,8 @@ configure_file(
     @ONLY
 )
 
-# Helper app Info.plist
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mac/helper-Info.plist.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/helper-Info.plist"
-    @ONLY
-)
-
 # Main executable
-add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS})
+add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS} ${BRO_RESOURCES})
 
 # Include directories
 target_include_directories(${EXECUTABLE_NAME} PRIVATE
@@ -97,55 +93,72 @@ set_target_properties(${EXECUTABLE_NAME} PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.bro.browser"
     MACOSX_BUNDLE_BUNDLE_NAME "Bro"
-    MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${VERSION_SHORT}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
     OUTPUT_NAME "Bro"
 )
 
-# Helper executable
-add_executable(${EXECUTABLE_NAME}_Helper MACOSX_BUNDLE ${BRO_HELPER_SRCS})
+# Helper apps. Chromium on macOS launches subprocesses from helper bundles with
+# exact names: "Bro Helper.app", "Bro Helper (Alerts).app", "Bro Helper (GPU).app",
+# "Bro Helper (Plugin).app", "Bro Helper (Renderer).app". CEF_HELPER_APP_SUFFIXES
+# (from cef_variables.cmake) enumerates them as "<name suffix>:<target suffix>:<plist suffix>".
+foreach(_suffix_list ${CEF_HELPER_APP_SUFFIXES})
+  string(REPLACE ":" ";" _suffix_list ${_suffix_list})
+  list(GET _suffix_list 0 _name_suffix)
+  list(GET _suffix_list 1 _target_suffix)
+  list(GET _suffix_list 2 _plist_suffix)
 
-target_include_directories(${EXECUTABLE_NAME}_Helper PRIVATE
-    ${CEF_ROOT}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+  set(_helper_target "${EXECUTABLE_NAME}_Helper${_target_suffix}")
+  set(_helper_output_name "${EXECUTABLE_NAME} Helper${_name_suffix}")
 
-target_link_libraries(${EXECUTABLE_NAME}_Helper
-    libcef_dll_wrapper
-    ${CEF_STANDARD_LIBS}
-)
+  set(HELPER_EXECUTABLE_NAME "${_helper_output_name}")
+  set(HELPER_BUNDLE_ID_SUFFIX "${_plist_suffix}")
+  configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/mac/helper-Info.plist.in"
+      "${CMAKE_CURRENT_BINARY_DIR}/helper-Info${_target_suffix}.plist"
+      @ONLY
+  )
 
-target_compile_options(${EXECUTABLE_NAME}_Helper PRIVATE
-    ${CEF_CXX_COMPILER_FLAGS}
-)
+  add_executable(${_helper_target} MACOSX_BUNDLE ${BRO_HELPER_SRCS})
 
-set_target_properties(${EXECUTABLE_NAME}_Helper PROPERTIES
-    MACOSX_BUNDLE TRUE
-    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/helper-Info.plist"
-    OUTPUT_NAME "Bro Helper"
-)
+  target_include_directories(${_helper_target} PRIVATE
+      ${CEF_ROOT}
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+
+  target_link_libraries(${_helper_target}
+      libcef_dll_wrapper
+      ${CEF_STANDARD_LIBS}
+  )
+
+  target_compile_options(${_helper_target} PRIVATE
+      ${CEF_CXX_COMPILER_FLAGS}
+  )
+
+  set_target_properties(${_helper_target} PROPERTIES
+      MACOSX_BUNDLE TRUE
+      MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/helper-Info${_target_suffix}.plist"
+      OUTPUT_NAME "${_helper_output_name}"
+  )
+
+  add_dependencies(${EXECUTABLE_NAME} ${_helper_target})
+
+  # Copy the helper bundle into the main app bundle after the main app links,
+  # so the destination bundle already exists.
+  add_custom_command(TARGET ${EXECUTABLE_NAME} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "$<TARGET_BUNDLE_DIR:${_helper_target}>"
+          "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks/${_helper_output_name}.app"
+      COMMENT "Copying ${_helper_output_name}.app into app bundle"
+      VERBATIM
+  )
+endforeach()
 
 # Copy CEF framework to app bundle
 add_custom_command(TARGET ${EXECUTABLE_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CEF_ROOT}/Release/Chromium Embedded Framework.framework"
         "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks/Chromium Embedded Framework.framework"
     COMMENT "Copying CEF framework to app bundle"
+    VERBATIM
 )
-
-# Copy helper apps to app bundle
-add_custom_command(TARGET ${EXECUTABLE_NAME}_Helper POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}_Helper>"
-        "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks/Bro Helper.app"
-    COMMENT "Copying helper app to main bundle"
-)
-
-# Note: Helper variants will be copied manually after build
-# Run: ./copy_helpers.sh after building
-
-add_dependencies(${EXECUTABLE_NAME} ${EXECUTABLE_NAME}_Helper)

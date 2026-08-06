@@ -24,6 +24,23 @@ std::string GetDataURI(const std::string& data, const std::string& mime_type) {
              .ToString();
 }
 
+// Escapes a string for safe interpolation into HTML.
+std::string EscapeHTML(const std::string& text) {
+  std::string result;
+  result.reserve(text.size());
+  for (char c : text) {
+    switch (c) {
+      case '&':  result += "&amp;"; break;
+      case '<':  result += "&lt;"; break;
+      case '>':  result += "&gt;"; break;
+      case '"':  result += "&quot;"; break;
+      case '\'': result += "&#39;"; break;
+      default:   result += c; break;
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 BroHandler::BroHandler(bool is_alloy_style) : is_alloy_style_(is_alloy_style) {
@@ -83,6 +100,7 @@ void BroHandler::SetActiveBrowser(int browser_id) {
     if (browser) {
       UpdateURL(browser->GetMainFrame()->GetURL().ToString());
       UpdateNavigationState(browser->CanGoBack(), browser->CanGoForward());
+      SetLoading(browser->IsLoading());
     }
   }
 }
@@ -97,6 +115,80 @@ void BroHandler::CloseBrowser(int browser_id) {
   auto it = browser_map_.find(browser_id);
   if (it != browser_map_.end()) {
     it->second->GetHost()->CloseBrowser(false);
+  }
+}
+
+void BroHandler::SetMobileEmulation(bool enabled) {
+  if (!CefCurrentlyOn(TID_UI)) {
+    CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetMobileEmulation, this,
+                                       enabled));
+    return;
+  }
+
+  if (mobile_emulation_ == enabled) {
+    return;
+  }
+  mobile_emulation_ = enabled;
+
+  for (auto& entry : browser_map_) {
+    // Only tabs get emulation; browsers hosted elsewhere (e.g. DevTools)
+    // must keep their normal environment.
+    if (HasTabView(entry.first)) {
+      ApplyEmulationToBrowser(entry.second, /*reload=*/true);
+    }
+  }
+}
+
+void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
+                                         bool reload) {
+  if (!browser) {
+    return;
+  }
+  CefRefPtr<CefBrowserHost> host = browser->GetHost();
+  if (!host) {
+    return;
+  }
+
+  if (mobile_emulation_) {
+    CefRefPtr<CefDictionaryValue> metrics = CefDictionaryValue::Create();
+    metrics->SetInt("width", 390);
+    metrics->SetInt("height", 844);
+    metrics->SetDouble("deviceScaleFactor", 3.0);
+    metrics->SetBool("mobile", true);
+    host->ExecuteDevToolsMethod(0, "Emulation.setDeviceMetricsOverride",
+                                metrics);
+
+    CefRefPtr<CefDictionaryValue> ua = CefDictionaryValue::Create();
+    ua->SetString("userAgent",
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+                  "Mobile/15E148 Safari/604.1");
+    ua->SetString("platform", "iPhone");
+    host->ExecuteDevToolsMethod(0, "Emulation.setUserAgentOverride", ua);
+
+    CefRefPtr<CefDictionaryValue> touch = CefDictionaryValue::Create();
+    touch->SetBool("enabled", true);
+    touch->SetInt("maxTouchPoints", 5);
+    host->ExecuteDevToolsMethod(0, "Emulation.setTouchEmulationEnabled",
+                                touch);
+  } else {
+    host->ExecuteDevToolsMethod(0, "Emulation.clearDeviceMetricsOverride",
+                                nullptr);
+
+    // An empty user agent clears the override.
+    CefRefPtr<CefDictionaryValue> ua = CefDictionaryValue::Create();
+    ua->SetString("userAgent", "");
+    host->ExecuteDevToolsMethod(0, "Emulation.setUserAgentOverride", ua);
+
+    CefRefPtr<CefDictionaryValue> touch = CefDictionaryValue::Create();
+    touch->SetBool("enabled", false);
+    host->ExecuteDevToolsMethod(0, "Emulation.setTouchEmulationEnabled",
+                                touch);
+  }
+
+  if (reload) {
+    // The user agent override only takes effect on the next navigation.
+    browser->Reload();
   }
 }
 
@@ -135,6 +227,41 @@ void BroHandler::OnFaviconURLChange(CefRefPtr<CefBrowser> browser,
   }
 }
 
+bool BroHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                               CefRefPtr<CefFrame> frame,
+                               int popup_id,
+                               const CefString& target_url,
+                               const CefString& target_frame_name,
+                               WindowOpenDisposition target_disposition,
+                               bool user_gesture,
+                               const CefPopupFeatures& popupFeatures,
+                               CefWindowInfo& windowInfo,
+                               CefRefPtr<CefClient>& client,
+                               CefBrowserSettings& settings,
+                               CefRefPtr<CefDictionaryValue>& extra_info,
+                               bool* no_javascript_access) {
+  CEF_REQUIRE_UI_THREAD();
+
+  // Host the popup browser in a new tab instead of a bare native window.
+  // Keeping the original popup navigation (rather than cancel-and-reopen)
+  // preserves POST bodies, window.opener, and the window.open() return value.
+  int width = 0;
+  int height = 0;
+  void* container = CreatePopupTabContainer(popup_id, &width, &height);
+  if (container) {
+    windowInfo.SetAsChild(static_cast<CefWindowHandle>(container),
+                          CefRect(0, 0, width, height));
+    windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+  }
+  return false;
+}
+
+void BroHandler::OnBeforePopupAborted(CefRefPtr<CefBrowser> browser,
+                                      int popup_id) {
+  CEF_REQUIRE_UI_THREAD();
+  RemovePopupTabContainer(popup_id);
+}
+
 void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
 
@@ -144,13 +271,34 @@ void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   browser_list_.push_back(browser);
   browser_map_[browser_id] = browser;
 
-  // Set as active browser and notify UI
-  active_browser_id_ = browser_id;
-  OnTabCreated(browser_id, browser->GetMainFrame()->GetURL().ToString());
+  // Adopt as a tab if the browser's view lives in the tab container.
+  // Browsers hosted elsewhere (e.g. DevTools) are tracked but get no tab.
+  bool adopted =
+      OnTabCreated(browser_id, browser->GetMainFrame()->GetURL().ToString(),
+                   browser->GetHost()->GetWindowHandle());
+  if (adopted) {
+    active_browser_id_ = browser_id;
+    if (mobile_emulation_) {
+      // No reload: the overrides land before the first navigation commits.
+      ApplyEmulationToBrowser(browser, /*reload=*/false);
+    }
+  }
 }
 
 bool BroHandler::DoClose(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
+
+  int browser_id = browser->GetIdentifier();
+
+  // Individual tab close (tab X button, Cmd+W, window.close(), DevTools
+  // protocol): detach the tab's container view so CEF destroys the browser,
+  // without sending a close to the shared window (which would close every
+  // tab). The whole-window path is used when tearing everything down or for
+  // the last remaining browser.
+  if (!closing_all_ && browser_list_.size() > 1 && HasTabView(browser_id)) {
+    DetachTabView(browser_id);
+    return true;
+  }
 
   // Closing the main window requires special handling.
   if (browser_list_.size() == 1) {
@@ -221,12 +369,14 @@ void BroHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
     return;
   }
 
-  // Display a load error message using a data: URI.
+  // Display a load error message using a data: URI. Escape the URL and
+  // error text: both can carry attacker-controlled content.
   std::stringstream ss;
   ss << "<html><body bgcolor=\"white\">"
         "<h2>Failed to load URL "
-     << std::string(failedUrl) << " with error " << std::string(errorText)
-     << " (" << errorCode << ").</h2></body></html>";
+     << EscapeHTML(std::string(failedUrl)) << " with error "
+     << EscapeHTML(std::string(errorText)) << " (" << errorCode
+     << ").</h2></body></html>";
 
   frame->LoadURL(GetDataURI(ss.str(), "text/html"));
 }
@@ -355,6 +505,8 @@ void BroHandler::CloseAllBrowsers(bool force_close) {
   if (browser_list_.empty()) {
     return;
   }
+
+  closing_all_ = true;
 
   BrowserList::const_iterator it = browser_list_.begin();
   for (; it != browser_list_.end(); ++it) {
