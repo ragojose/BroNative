@@ -5,6 +5,7 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <cmath>
 #include <cstdlib>
 
 #include "include/cef_application_mac.h"
@@ -674,6 +675,113 @@ static NSView* CreateTabContainerView(void) {
   return browserContainer;
 }
 
+// Chrome's preset zoom stops. CEF zoom levels are logarithmic:
+// scale = 1.2^level, so level = log(scale) / log(1.2).
+static const double kZoomPercents[] = {25,  33,  50,  67,  75,  80,
+                                       90,  100, 110, 125, 150, 175,
+                                       200, 250, 300, 400, 500};
+static const int kZoomPercentCount =
+    sizeof(kZoomPercents) / sizeof(kZoomPercents[0]);
+
+static double ZoomLevelToPercent(double level) {
+  return pow(1.2, level) * 100.0;
+}
+
+static double PercentToZoomLevel(double percent) {
+  return log(percent / 100.0) / log(1.2);
+}
+
+// Next ladder stop above/below |currentPercent|. The 0.5 slack absorbs
+// floating-point drift from the level<->percent round trip.
+static double NextZoomPercent(double currentPercent, BOOL zoomingIn) {
+  if (zoomingIn) {
+    for (int i = 0; i < kZoomPercentCount; ++i) {
+      if (kZoomPercents[i] > currentPercent + 0.5) {
+        return kZoomPercents[i];
+      }
+    }
+    return kZoomPercents[kZoomPercentCount - 1];
+  }
+  for (int i = kZoomPercentCount - 1; i >= 0; --i) {
+    if (kZoomPercents[i] < currentPercent - 0.5) {
+      return kZoomPercents[i];
+    }
+  }
+  return kZoomPercents[0];
+}
+
+// Transient bubble showing the current zoom percentage.
+static NSView* g_zoom_hud = nil;
+static NSTextField* g_zoom_hud_label = nil;
+static NSTimer* g_zoom_hud_timer = nil;
+
+static void ShowZoomHUD(int percent) {
+  if (!g_main_window || !g_main_window.browserContainer) {
+    return;
+  }
+  NSView* container = g_main_window.browserContainer;
+
+  if (!g_zoom_hud) {
+    g_zoom_hud = [[NSView alloc] initWithFrame:NSZeroRect];
+    g_zoom_hud.wantsLayer = YES;
+    g_zoom_hud.layer.cornerRadius = 8.0;
+    g_zoom_hud.layer.backgroundColor =
+        [NSColor colorWithWhite:0.15 alpha:0.92].CGColor;
+
+    g_zoom_hud_label = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    g_zoom_hud_label.editable = NO;
+    g_zoom_hud_label.selectable = NO;
+    g_zoom_hud_label.bezeled = NO;
+    g_zoom_hud_label.bordered = NO;
+    g_zoom_hud_label.drawsBackground = NO;
+    g_zoom_hud_label.font = [NSFont boldSystemFontOfSize:14.0];
+    g_zoom_hud_label.textColor = [NSColor whiteColor];
+    g_zoom_hud_label.alignment = NSTextAlignmentCenter;
+    [g_zoom_hud addSubview:g_zoom_hud_label];
+  }
+  // (Re-)add last so the HUD composites above the native CEF browser view.
+  if (g_zoom_hud.superview != container) {
+    [g_zoom_hud removeFromSuperview];
+    [container addSubview:g_zoom_hud];
+  }
+
+  g_zoom_hud_label.stringValue = [NSString stringWithFormat:@"%d%%", percent];
+  [g_zoom_hud_label sizeToFit];
+  NSSize labelSize = g_zoom_hud_label.frame.size;
+  const CGFloat padX = 14.0;
+  const CGFloat padY = 8.0;
+  NSSize hudSize =
+      NSMakeSize(labelSize.width + padX * 2, labelSize.height + padY * 2);
+  NSRect bounds = container.bounds;
+  g_zoom_hud.frame = NSMakeRect(NSMaxX(bounds) - hudSize.width - 16.0,
+                                NSMaxY(bounds) - hudSize.height - 16.0,
+                                hudSize.width, hudSize.height);
+  g_zoom_hud_label.frame =
+      NSMakeRect(padX, padY, labelSize.width, labelSize.height);
+
+  g_zoom_hud.hidden = NO;
+  g_zoom_hud.alphaValue = 1.0;
+
+  [g_zoom_hud_timer invalidate];
+  g_zoom_hud_timer =
+      [NSTimer scheduledTimerWithTimeInterval:1.2
+                                      repeats:NO
+                                        block:^(NSTimer* timer) {
+        g_zoom_hud_timer = nil;
+        [NSAnimationContext
+            runAnimationGroup:^(NSAnimationContext* ctx) {
+              ctx.duration = 0.25;
+              g_zoom_hud.animator.alphaValue = 0.0;
+            }
+            completionHandler:^{
+              // Skip hiding if another press restarted the HUD mid-fade.
+              if (!g_zoom_hud_timer) {
+                g_zoom_hud.hidden = YES;
+              }
+            }];
+      }];
+}
+
 static void CreateNewBrowserTabWithURL(const std::string& url) {
   BroHandler* handler = BroHandler::GetInstance();
   if (!handler) {
@@ -807,8 +915,17 @@ static void CreateNewBrowserTab(void) {
   [viewMenu addItemWithTitle:@"Stop" action:@selector(stopLoading:) keyEquivalent:@"."];
   [viewMenu addItem:[NSMenuItem separatorItem]];
 
-  // Zoom controls
-  [viewMenu addItemWithTitle:@"Zoom In" action:@selector(zoomIn:) keyEquivalent:@"+"];
+  // Zoom controls. Cmd+"=" is the unshifted "+" key; a "+" key equivalent
+  // with a Command-only mask would never match because typing "+" requires
+  // Shift, which AppKit only auto-infers for uppercase letters.
+  [viewMenu addItemWithTitle:@"Zoom In" action:@selector(zoomIn:) keyEquivalent:@"="];
+  NSMenuItem* zoomInShifted = [[NSMenuItem alloc] initWithTitle:@"Zoom In"
+                                                         action:@selector(zoomIn:)
+                                                  keyEquivalent:@"+"];
+  zoomInShifted.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  zoomInShifted.hidden = YES;
+  [viewMenu addItem:zoomInShifted];
   [viewMenu addItemWithTitle:@"Zoom Out" action:@selector(zoomOut:) keyEquivalent:@"-"];
   [viewMenu addItemWithTitle:@"Actual Size" action:@selector(zoomReset:) keyEquivalent:@"0"];
   [viewMenu addItem:[NSMenuItem separatorItem]];
@@ -1020,26 +1137,26 @@ static void CreateNewBrowserTab(void) {
   }
 }
 
-- (void)zoomIn:(id)sender {
+- (void)stepZoom:(BOOL)zoomingIn {
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
-      double currentZoom = browser->GetHost()->GetZoomLevel();
-      browser->GetHost()->SetZoomLevel(currentZoom + 0.5);
+      double currentPercent =
+          ZoomLevelToPercent(browser->GetHost()->GetZoomLevel());
+      double targetPercent = NextZoomPercent(currentPercent, zoomingIn);
+      browser->GetHost()->SetZoomLevel(PercentToZoomLevel(targetPercent));
+      ShowZoomHUD((int)lround(targetPercent));
     }
   }
 }
 
+- (void)zoomIn:(id)sender {
+  [self stepZoom:YES];
+}
+
 - (void)zoomOut:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser) {
-      double currentZoom = browser->GetHost()->GetZoomLevel();
-      browser->GetHost()->SetZoomLevel(currentZoom - 0.5);
-    }
-  }
+  [self stepZoom:NO];
 }
 
 - (void)zoomReset:(id)sender {
@@ -1048,6 +1165,7 @@ static void CreateNewBrowserTab(void) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
       browser->GetHost()->SetZoomLevel(0.0);
+      ShowZoomHUD(100);
     }
   }
 }
