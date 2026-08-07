@@ -1265,6 +1265,29 @@ static NSDictionary* BroLayerTransitionActions(void) {
   }
 }
 
+// Middle-click closes the tab, like every other Chromium browser. It fires on
+// release and only inside the pill, so sliding off cancels the way the ✕
+// button already does. Going through handleClose: means a lone tab closes the
+// window, exactly as Cmd+W does.
+- (void)otherMouseDown:(NSEvent*)event {
+  // Claim the middle press so AppKit routes its release here too; anything
+  // else (mouse back/forward) keeps bubbling.
+  if (event.buttonNumber != 2) {
+    [super otherMouseDown:event];
+  }
+}
+
+- (void)otherMouseUp:(NSEvent*)event {
+  if (event.buttonNumber != 2) {
+    [super otherMouseUp:event];
+    return;
+  }
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  if (NSPointInRect(p, self.bounds)) {
+    [self handleClose:self];
+  }
+}
+
 - (void)mouseEntered:(NSEvent*)event {
   hovered_ = YES;
   [self updateAppearance];
@@ -3249,6 +3272,30 @@ static void CreateNewBrowserTab(void) {
       }
       return;
     }
+  }
+
+  // The thumb buttons on most mice navigate history, like every other browser.
+  // macOS numbers them 3 (back) and 4 (forward). Handled here for the same
+  // reason as Cmd+Left/Right above: CEF's windowed mac view never forwards
+  // them to the renderer, so no page can act on them.
+  if ((event.type == NSEventTypeOtherMouseDown ||
+       event.type == NSEventTypeOtherMouseUp) &&
+      (event.buttonNumber == 3 || event.buttonNumber == 4) &&
+      event.window == g_main_window) {
+    // Navigate on the press; the release is swallowed too so no view is left
+    // tracking a button-down it never saw finish.
+    if (event.type == NSEventTypeOtherMouseDown) {
+      BroHandler* handler = BroHandler::GetInstance();
+      CefRefPtr<CefBrowser> browser = handler ? handler->GetBrowser() : nullptr;
+      if (browser) {
+        if (event.buttonNumber == 3 && browser->CanGoBack()) {
+          browser->GoBack();
+        } else if (event.buttonNumber == 4 && browser->CanGoForward()) {
+          browser->GoForward();
+        }
+      }
+    }
+    return;
   }
 
   [super sendEvent:event];
