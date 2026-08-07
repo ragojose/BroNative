@@ -3,6 +3,10 @@ name: Build DMG
 on:
   push:
     branches: [main]
+  # Build PRs too, so a compile break is caught before it reaches main. The
+  # publish steps below are all gated on main, so PR runs stop after the build.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +26,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history: CFBundleVersion is the commit count, and a shallow
+          # clone would report 1 on every build, which stops Sparkle from ever
+          # seeing a newer version.
+          fetch-depth: 0
 
       - name: Cache CEF
         id: cef-cache
@@ -49,9 +58,33 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      - name: Resolve version
+        id: version
+        run: |
+          app="build/Bro Computer.app"
+          short=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          build=$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "tag=v$short-$build" >> "$GITHUB_OUTPUT"
+          echo "dmg=Bro-Computer-$short-$build.dmg" >> "$GITHUB_OUTPUT"
+          echo "Version $short (build $build)"
+
       - name: Codesign (ad-hoc)
         run: |
           app="build/Bro Computer.app"
+          sparkle="$app/Contents/Frameworks/Sparkle.framework"
+
+          # Sparkle signs from the inside out: its XPC services and helper
+          # binaries first, then the framework wrapping them. Signing the
+          # framework first would be invalidated by the nested signatures.
+          # Deliberately no --deep, which Sparkle's docs warn against.
+          codesign --force --sign - "$sparkle/Versions/B/XPCServices/Installer.xpc"
+          codesign --force --sign - "$sparkle/Versions/B/XPCServices/Downloader.xpc"
+          codesign --force --sign - "$sparkle/Versions/B/Autoupdate"
+          codesign --force --sign - "$sparkle/Versions/B/Updater.app"
+          codesign --force --sign - "$sparkle"
+
           codesign --force --sign - "$app/Contents/Frameworks/Chromium Embedded Framework.framework"
           for helper in "$app/Contents/Frameworks/"*.app; do
             codesign --force --sign - "$helper"
@@ -60,39 +93,85 @@ jobs:
           codesign --verify --deep --strict "$app"
 
       - name: Create DMG
-        id: dmg
         run: |
-          version=$(sed -n 's/.*VERSION_SHORT "\([^"]*\)".*/\1/p' CMakeLists.txt | head -n1)
-          dmg="Bro-Computer-${version:-1.0.0}-$(git rev-parse --short HEAD).dmg"
           staging=$(mktemp -d)
           ditto "build/Bro Computer.app" "$staging/Bro Computer.app"
           ln -s /Applications "$staging/Applications"
-          hdiutil create -volname "Bro Computer" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          hdiutil create -volname "Bro Computer" -srcfolder "$staging" \
+            -ov -format UDZO "${{ steps.version.outputs.dmg }}"
           rm -rf "$staging"
-          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.dmg.outputs.dmg }}
-          path: ${{ steps.dmg.outputs.dmg }}
+          name: ${{ steps.version.outputs.dmg }}
+          path: ${{ steps.version.outputs.dmg }}
           if-no-files-found: error
 
-      - name: Update latest release
+      # Immutable, one release per build. Sparkle's appcast points at these
+      # URLs, so they must keep working after the next build lands — which is
+      # why the old force-moved `latest` tag is gone. GitHub still resolves
+      # /releases/latest to the newest of these, so the README link holds.
+      - name: Publish release
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git tag -f latest
-          git push -f origin latest
-          if ! gh release view latest >/dev/null 2>&1; then
-            gh release create latest --prerelease --title "Latest build" \
-              --notes "Automated build from main. Ad-hoc signed: right-click > Open on first launch."
+          printf '%s\n\n%s\n' \
+            "Automated build from main (${{ github.sha }})." \
+            "Ad-hoc signed, not notarized: on first launch right-click the app and choose Open." \
+            > notes.md
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.short }} (build ${{ steps.version.outputs.build }})" \
+            --notes-file notes.md \
+            "${{ steps.version.outputs.dmg }}"
+
+      # Sign the DMG and republish the appcast Sparkle polls. Skipped with a
+      # warning when SPARKLE_PRIVATE_KEY is absent, so the build keeps shipping
+      # DMGs and updates switch on the moment the secret is added.
+      - name: Publish appcast
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "::warning::SPARKLE_PRIVATE_KEY is not set — skipping appcast. Automatic updates stay off until it is added."
+            exit 0
           fi
-          # Drop stale per-commit DMG assets before uploading the new one
-          gh release view latest --json assets -q '.assets[].name' | while read -r asset; do
-            case "$asset" in
-              Bro-*.dmg) gh release delete-asset latest "$asset" -y ;;
-            esac
-          done
-          gh release upload latest "${{ steps.dmg.outputs.dmg }}" --clobber
+
+          dmg="${{ steps.version.outputs.dmg }}"
+          url="https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/$dmg"
+
+          # sign_update prints ready-to-paste enclosure attributes:
+          #   sparkle:edSignature="..." length="..."
+          keyfile=$(mktemp)
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$keyfile"
+          attrs=$(build/_deps/sparkle-src/bin/sign_update "$dmg" --ed-key-file "$keyfile")
+          rm -f "$keyfile"
+
+          min_os=$(plutil -extract LSMinimumSystemVersion raw "build/Bro Computer.app/Contents/Info.plist")
+          cat > appcast.xml <<XML
+          <?xml version="1.0" standalone="yes"?>
+          <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+            <channel>
+              <title>Bro Computer</title>
+              <item>
+                <title>${{ steps.version.outputs.short }} (build ${{ steps.version.outputs.build }})</title>
+                <pubDate>$(date -u "+%a, %d %b %Y %H:%M:%S +0000")</pubDate>
+                <sparkle:version>${{ steps.version.outputs.build }}</sparkle:version>
+                <sparkle:shortVersionString>${{ steps.version.outputs.short }}</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>$min_os</sparkle:minimumSystemVersion>
+                <enclosure url="$url" type="application/octet-stream" $attrs />
+              </item>
+            </channel>
+          </rss>
+          XML
+
+          # One mutable release holds the feed. The URL must stay stable because
+          # it is baked into every shipped app's Info.plist as SUFeedURL.
+          if ! gh release view appcast >/dev/null 2>&1; then
+            gh release create appcast --prerelease --title "Appcast" \
+              --notes "Sparkle update feed. Managed by CI — do not delete, shipped apps poll this URL."
+          fi
+          gh release upload appcast appcast.xml --clobber

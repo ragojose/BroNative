@@ -13,6 +13,45 @@ Download the latest DMG from the [**latest release**](../../releases/latest) —
 
 Requires macOS 12.0+ on Apple Silicon.
 
+## Updates
+
+Bro Computer updates itself. It checks once a day while running, and you can ask
+it to look now with **Bro Computer → Check for Updates…**. Updates install in
+place, so you only download the DMG once.
+
+> The menu item is greyed out until the maintainer sets up signing keys — see
+> below. Builds without keys simply never check for updates.
+
+### Enabling updates (maintainer, one time)
+
+Updates are signed, and the signing key is deliberately not in this repo. To
+turn them on:
+
+1. Generate a key pair with the copy of Sparkle the build already downloads:
+
+   ```bash
+   ./build/_deps/sparkle-src/bin/generate_keys
+   ```
+
+   It stores the private key in your login Keychain and prints the public key.
+
+2. Paste the printed public key into `SUPublicEDKey` in `src/mac/Info.plist.in`,
+   replacing `REPLACE_WITH_SPARKLE_PUBLIC_KEY`.
+
+3. Export the private key and add it to the repository as a secret named
+   `SPARKLE_PRIVATE_KEY` (Settings → Secrets and variables → Actions):
+
+   ```bash
+   ./build/_deps/sparkle-src/bin/generate_keys -x sparkle-private-key.txt
+   ```
+
+   Delete that file once the secret is saved. Keep the key safe — Sparkle can
+   only rotate it with a Developer ID signed build, so losing it means shipped
+   apps can no longer be updated.
+
+Until step 3 is done the build still publishes DMGs; it just logs a warning and
+skips the update feed.
+
 ## Building from source
 
 ### Prerequisites

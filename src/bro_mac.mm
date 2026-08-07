@@ -16,6 +16,7 @@
 #include "include/wrapper/cef_library_loader.h"
 #include "bro_app.h"
 #include "bro_handler.h"
+#import "bro_updater.h"
 #import "radix_icons.h"
 
 // Forward declarations
@@ -3314,6 +3315,10 @@ static void CreateNewBrowserTab(void) {
   // The chrome is designed dark-only; force dark so system controls match.
   NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 
+  // Before the menu, so the "Check for Updates…" item can bind to a live
+  // updater rather than a nil target.
+  BroStartUpdater();
+
   // Create the main menu
   [self setupMainMenu];
 
@@ -3341,6 +3346,16 @@ static void CreateNewBrowserTab(void) {
   [appMenu addItemWithTitle:@"About Bro Computer"
                      action:@selector(orderFrontStandardAboutPanel:)
               keyEquivalent:@""];
+  [appMenu addItem:[NSMenuItem separatorItem]];
+
+  // Sparkle drives this item itself: it owns the target and keeps the item
+  // enabled or disabled depending on whether a check is allowed right now. On
+  // a build without update keys the target is nil, so the item stays greyed.
+  NSMenuItem* updateItem =
+      [appMenu addItemWithTitle:@"Check for Updates…"
+                         action:BroUpdaterMenuAction()
+                  keyEquivalent:@""];
+  updateItem.target = BroUpdaterMenuTarget();
   [appMenu addItem:[NSMenuItem separatorItem]];
   [appMenu addItemWithTitle:@"Quit Bro Computer"
                      action:@selector(terminate:)
