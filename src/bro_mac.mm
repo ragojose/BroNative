@@ -3274,6 +3274,30 @@ static void CreateNewBrowserTab(void) {
     }
   }
 
+  // The thumb buttons on most mice navigate history, like every other browser.
+  // macOS numbers them 3 (back) and 4 (forward). Handled here for the same
+  // reason as Cmd+Left/Right above: CEF's windowed mac view never forwards
+  // them to the renderer, so no page can act on them.
+  if ((event.type == NSEventTypeOtherMouseDown ||
+       event.type == NSEventTypeOtherMouseUp) &&
+      (event.buttonNumber == 3 || event.buttonNumber == 4) &&
+      event.window == g_main_window) {
+    // Navigate on the press; the release is swallowed too so no view is left
+    // tracking a button-down it never saw finish.
+    if (event.type == NSEventTypeOtherMouseDown) {
+      BroHandler* handler = BroHandler::GetInstance();
+      CefRefPtr<CefBrowser> browser = handler ? handler->GetBrowser() : nullptr;
+      if (browser) {
+        if (event.buttonNumber == 3 && browser->CanGoBack()) {
+          browser->GoBack();
+        } else if (event.buttonNumber == 4 && browser->CanGoForward()) {
+          browser->GoForward();
+        }
+      }
+    }
+    return;
+  }
+
   [super sendEvent:event];
 }
 
