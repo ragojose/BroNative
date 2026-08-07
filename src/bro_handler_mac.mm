@@ -23,6 +23,11 @@ void BroHandler::PlatformTitleChange(CefRefPtr<CefBrowser> browser,
   NSWindow* window = GetNSWindowForBrowser(browser);
   std::string titleStr(title);
   NSString* str = [NSString stringWithUTF8String:titleStr.c_str()];
+  // Blank pages report "about:blank" as their title; the window title still
+  // shows up in the Window menu and Mission Control, so name it like the tab.
+  if (str.length == 0 || [str isEqualToString:@"about:blank"]) {
+    str = @"New Tab";
+  }
   [window setTitle:str];
 }
 

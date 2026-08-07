@@ -1,83 +1,80 @@
 # Bro Browser
 
-A modern native macOS web browser built with CEF (Chromium Embedded Framework).
+A fast, modern, native macOS web browser built on [CEF](https://github.com/chromiumembedded/cef) (Chromium Embedded Framework) — real Chromium under the hood, with a lightweight native Cocoa UI on top.
+
+## Download
+
+Grab the latest DMG from the [**latest release**](../../releases/latest) — it's rebuilt automatically on every commit to `main`.
+
+> **First launch:** builds are ad-hoc signed (not notarized), so macOS will warn you.
+> Right-click `Bro.app` → **Open** → **Open** the first time. After that it opens normally.
+
+Requires macOS 12.0+ on Apple Silicon.
 
 ## Features
 
-- Native macOS UI with vibrancy effects
-- Tab support with loading indicators; popups (`window.open`/`target="_blank"`)
-  open as tabs with their navigation intact
-- Full navigation (back, forward, refresh)
-- Address bar with search support (http/https/file/about schemes only;
-  everything else is searched)
-- Keyboard shortcuts (Cmd+T, Cmd+W, Cmd+L, etc.)
-- DevTools support (Cmd+Option+I or F12)
-- WebGL and WebGPU support
-- Full WebAssembly support (SIMD, GC, tiering, streaming compilation — all
-  Chromium defaults) with persistent compiled-code caching; verify with
-  View → WebAssembly Benchmark
+- 🪟 Native macOS UI with vibrancy effects
+- 🗂 Tabs with loading indicators — popups (`window.open` / `target="_blank"`) open as tabs with navigation intact
+- 🧭 Full navigation: back, forward, refresh, and an address bar that searches anything that isn't a URL
+- ⌨️ Familiar keyboard shortcuts (⌘T, ⌘W, ⌘L, …)
+- 🛠 DevTools built in (⌘⌥I or F12)
+- 🎮 WebGL and WebGPU support
+- ⚡️ Full WebAssembly support (SIMD, GC, tiering, streaming compilation — all Chromium defaults) with persistent compiled-code caching — try it yourself via **View → WebAssembly Benchmark**
 
-## Requirements
+## Building from source
 
-- macOS 12.0+ (Apple Silicon)
-- CMake 3.21+
-- Xcode Command Line Tools (full Xcode not required)
-- Ninja (recommended) or Make
-- CEF Binary Distribution (see Setup)
+### Prerequisites
 
-## Setup
+- macOS 12.0+ on Apple Silicon
+- Xcode Command Line Tools (`xcode-select --install` — full Xcode not needed)
+- CMake 3.21+ and Ninja (`brew install cmake ninja`)
 
-1. Download the CEF binary distribution (the exact version pinned in
-   CMakeLists.txt):
-   ```bash
-   mkdir -p cef-project/third_party/cef
-   cd cef-project/third_party/cef
-   curl -L -o cef.tar.bz2 "https://cef-builds.spotifycdn.com/cef_binary_151.3.14%2Bg5d67476%2Bchromium-151.0.7922.72_macosarm64_minimal.tar.bz2"
-   tar xjf cef.tar.bz2 && rm cef.tar.bz2
-   ```
+### 1. Get CEF
 
-2. Build (Release with -O3/LTO is the default):
-   ```bash
-   cmake -G Ninja -B build
-   cmake --build build
-   ```
+Download the exact CEF binary distribution pinned in `CMakeLists.txt` (one-time, ~250 MB):
 
-3. Run:
-   ```bash
-   open build/Bro.app
-   ```
+```bash
+mkdir -p cef-project/third_party/cef
+cd cef-project/third_party/cef
+curl -L -o cef.tar.bz2 "https://cef-builds.spotifycdn.com/cef_binary_151.3.14%2Bg5d67476%2Bchromium-151.0.7922.72_macosarm64_minimal.tar.bz2"
+tar xjf cef.tar.bz2 && rm cef.tar.bz2
+cd ../../..
+```
 
-The build produces all five helper app variants required by Chromium on macOS
-(`Bro Helper.app`, plus the `(GPU)`, `(Renderer)`, `(Plugin)`, and `(Alerts)`
-variants) and copies them into the bundle automatically.
+### 2. Build and run
 
-## Performance notes
+```bash
+cmake -G Ninja -B build
+cmake --build build
+open build/Bro.app
+```
 
-- WebAssembly and JS performance comes from Chromium defaults: V8 tiering,
-  wasm code caching, and BackForwardCache are all enabled out of the box. No
-  feature-forcing command-line switches are used — an earlier round of
-  aggressive flags broke form submissions and navigation.
-- The browser cache (HTTP + compiled JS/WASM code caches) persists in
-  `~/Library/Application Support/Bro`.
-- WASM threads (`SharedArrayBuffer`) follow the web-standard gating: they are
-  available on pages served with COOP/COEP headers (`crossOriginIsolated`).
+That's it. Release mode (`-O3` + LTO) is the default, and the build automatically produces and bundles the five Chromium helper apps (`Bro Helper.app` plus the GPU, Renderer, Plugin, and Alerts variants).
 
-## Debugging
+## Tips & debugging
 
-- Debug builds listen for DevTools protocol clients on port 9222.
-- Release builds keep remote debugging off; opt in by launching with
-  `BRO_REMOTE_DEBUG_PORT=9222 open build/Bro.app`.
-- The Chromium sandbox is currently disabled: the minimal CEF distribution
-  does not ship the `cef_sandbox` library. Switch to the standard (non-minimal)
-  CEF distribution to enable it.
+- **Remote debugging:** Debug builds listen for DevTools protocol clients on port 9222. Release builds keep it off — opt in with:
+  ```bash
+  BRO_REMOTE_DEBUG_PORT=9222 open build/Bro.app
+  ```
+- **Caches:** The browser cache (HTTP + compiled JS/WASM code) lives in `~/Library/Application Support/Bro`.
+- **WASM threads** (`SharedArrayBuffer`) follow standard web gating: available on pages served with COOP/COEP headers (`crossOriginIsolated`).
+- **No feature flags:** performance comes from stock Chromium defaults (V8 tiering, wasm code caching, BackForwardCache). An earlier round of aggressive command-line switches broke form submissions and navigation, so we don't do that anymore.
+- **Sandbox:** the Chromium sandbox is currently disabled because the *minimal* CEF distribution doesn't ship `cef_sandbox`. Switching to the standard (non-minimal) distribution would enable it.
 
-## Architecture
+## Continuous builds
 
-- **bro_app.cc/h** - CEF application callbacks and GPU settings
-- **bro_handler.cc/h** - Browser event handling, tab lifecycle, popups
-- **bro_mac.mm** - Native macOS UI (window, toolbar, tabs) and entry point
-- **src/mac/wasm-bench.html** - Bundled self-contained WASM benchmark page
+Every push to `main` runs the [Build DMG workflow](.github/workflows/build-dmg.yml): it builds the app on an Apple Silicon runner, ad-hoc signs it, packages a DMG, uploads it as a workflow artifact, and refreshes the [latest release](../../releases/latest).
+
+## Code map
+
+| Path | What it is |
+| --- | --- |
+| `src/bro_app.cc/h` | CEF application callbacks and GPU settings |
+| `src/bro_handler.cc/h` | Browser event handling, tab lifecycle, popups |
+| `src/bro_mac.mm` | Native macOS UI (window, toolbar, tabs) and entry point |
+| `src/mac/wasm-bench.html` | Bundled self-contained WASM benchmark page |
 
 ## License
 
-BSD License (see LICENSE file)
+BSD License

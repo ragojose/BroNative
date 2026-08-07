@@ -55,6 +55,15 @@ set_source_files_properties(${BRO_RESOURCES} PROPERTIES
     MACOSX_PACKAGE_LOCATION "Resources"
 )
 
+# UI fonts, auto-registered via ATSApplicationFontsPath in Info.plist
+set(BRO_FONT_RESOURCES
+    src/mac/fonts/Geist-Regular.otf
+    src/mac/fonts/Geist-SemiBold.otf
+)
+set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
+    MACOSX_PACKAGE_LOCATION "Resources/Fonts"
+)
+
 # App bundle info
 set(PRODUCT_NAME "Bro")
 set(EXECUTABLE_NAME "Bro")
@@ -68,7 +77,8 @@ configure_file(
 )
 
 # Main executable
-add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS} ${BRO_RESOURCES})
+add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS} ${BRO_RESOURCES}
+               ${BRO_FONT_RESOURCES})
 
 # Include directories
 target_include_directories(${EXECUTABLE_NAME} PRIVATE

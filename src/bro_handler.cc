@@ -149,7 +149,22 @@ void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
 
   auto it = browser_map_.find(browser_id);
   if (it != browser_map_.end()) {
-    ApplyEmulationToBrowser(it->second, enabled, /*reload=*/true);
+    // No reload here: the caller reloads after the viewport animation so the
+    // page load doesn't compete with the window animation for the main thread.
+    ApplyEmulationToBrowser(it->second, enabled, /*reload=*/false);
+  }
+}
+
+void BroHandler::ReloadTab(int browser_id) {
+  if (!CefCurrentlyOn(TID_UI)) {
+    CefPostTask(TID_UI,
+                base::BindOnce(&BroHandler::ReloadTab, this, browser_id));
+    return;
+  }
+
+  auto it = browser_map_.find(browser_id);
+  if (it != browser_map_.end() && it->second) {
+    it->second->Reload();
   }
 }
 
@@ -249,7 +264,10 @@ void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
     CefRefPtr<CefDictionaryValue> metrics = CefDictionaryValue::Create();
     metrics->SetInt("width", 390);
     metrics->SetInt("height", 844);
-    metrics->SetDouble("deviceScaleFactor", 3.0);
+    // 0 = use the device's real scale factor. Emulating an iPhone's 3x on a
+    // 2x panel rasters ~2.25x the pixels actually displayed and makes mobile
+    // mode visibly sluggish.
+    metrics->SetDouble("deviceScaleFactor", 0.0);
     metrics->SetBool("mobile", true);
     host->ExecuteDevToolsMethod(0, "Emulation.setDeviceMetricsOverride",
                                 metrics);
