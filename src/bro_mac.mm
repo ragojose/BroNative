@@ -51,12 +51,12 @@ static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
 static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
 // Shell width while the window hugs the mobile viewport: the 390pt column
-// plus bezels wide enough that the chrome row (~460pt minimum) still fits.
-static const CGFloat kMobileShellWidth = 480.0;
+// plus bezels wide enough that the chrome row (~496pt minimum with the
+// downloads button) still fits.
+static const CGFloat kMobileShellWidth = 512.0;
 static const NSTimeInterval kViewportAnimDuration = 0.28;
-// Black-glass tuning: tint over the behind-window blur and the hairline frame
-// traced around the window edge.
-static const CGFloat kGlassTintAlpha = 0.5;
+// Window chrome: solid #000 backdrop with a #111 hairline frame. The hover
+// card keeps its own lighter border (kWindowBorderAlpha over its gray fill).
 static const CGFloat kWindowBorderAlpha = 0.12;
 static const CGFloat kWindowCornerRadiusFallback = 12.0;
 // Tab hover card: dwell time on a pill before the card appears (its width
@@ -65,6 +65,12 @@ static const CGFloat kWindowCornerRadiusFallback = 12.0;
 static const NSTimeInterval kHoverCardDelay = 1.0;
 static const NSTimeInterval kHoverCardHideGrace = 0.3;
 static const CGFloat kHoverCardButtonSize = 24.0;
+// Hover/press icon feedback: the whole button scales about its center,
+// animated by the shared 0.15s ease-out layer actions. Kept subtle so the
+// chrome stays calm; skipped entirely under Reduce Motion.
+static const CGFloat kIconHoverScale = 1.07;
+static const CGFloat kIconPressScale = 0.95;
+static const NSTimeInterval kCloseButtonFadeDuration = 0.15;
 
 // UI font: bundled Geist (registered via ATSApplicationFontsPath), falling
 // back to the system font if the resource is missing. SemiBold stands in for
@@ -80,9 +86,10 @@ static NSFont* BroUIFontBold(CGFloat size) {
 }
 
 // Every emphasized control border — selected pill, hover, keyboard focus,
-// address-editing ring, the "+" button — is the same 1pt #666666 hairline.
+// address-editing ring, the "+" button — and the window frame is the same
+// 1pt #111111 hairline.
 static NSColor* BroControlBorderColor(void) {
-  return [NSColor colorWithWhite:0x66 / 255.0 alpha:1.0];
+  return [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0];
 }
 
 // Global references
@@ -94,23 +101,59 @@ static BroTabBar* g_tab_bar = nil;
 static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
 
 // Tabs currently on a blank page (about:blank or no committed URL yet). Their
-// container stays hidden even while active so the glass window shows through
+// container stays hidden even while active so the black window shows through
 // as the new-tab state.
 static NSMutableSet<NSNumber*>* g_blank_tab_ids = nil;
 
-// Recently closed tabs' URLs, oldest first, for Reopen Closed Tab
-// (Cmd+Shift+T). Blank/new-tab pages are not recorded.
-static const NSUInteger kMaxClosedTabHistory = 10;
-static NSMutableArray<NSString*>* g_closed_tab_urls = nil;
+// Recently closed tabs, oldest first, for Reopen Closed Tab (Cmd+Shift+T)
+// and the tab search panel's "Recently Closed" section. Blank/new-tab pages
+// are not recorded.
+@interface BroClosedTabEntry : NSObject
+@property(nonatomic, copy) NSString* url;
+@property(nonatomic, copy) NSString* title;
+@property(nonatomic, copy) NSString* faviconURL;  // nil if never resolved
+@end
 
-// Black tint layered over the behind-window blur. Translucent (frosted glass)
-// while the active tab is blank; fully opaque once a real page is showing so
-// the desktop no longer glows through the chrome.
-static NSView* g_glass_tint_view = nil;
+@implementation BroClosedTabEntry
+@end
+
+static const NSUInteger kMaxClosedTabHistory = 10;
+static NSMutableArray<BroClosedTabEntry*>* g_closed_tabs = nil;
 
 // Containers created for incoming popup browsers, keyed by popup ID. Entries
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
+
+// Downloads: the recent list shown in the toolbar popover, newest first.
+// Completed entries (capped at kMaxRecentDownloads) persist across launches
+// via NSUserDefaults; in-progress entries are session-only.
+typedef NS_ENUM(NSInteger, BroDownloadState) {
+  BroDownloadStateInProgress,
+  BroDownloadStateComplete,
+  BroDownloadStateFailed,
+};
+
+@interface BroDownloadEntry : NSObject
+@property(nonatomic, assign) uint32_t downloadId;  // 0 for restored entries
+@property(nonatomic, copy) NSString* name;
+@property(nonatomic, copy) NSString* path;
+@property(nonatomic, assign) int64_t receivedBytes;
+@property(nonatomic, assign) int64_t totalBytes;  // <= 0 when unknown
+@property(nonatomic, assign) BroDownloadState state;
+@end
+
+@implementation BroDownloadEntry
+@end
+
+static const NSUInteger kMaxRecentDownloads = 10;
+static NSString* const kBroRecentDownloadsKey = @"BroRecentDownloads";
+static NSMutableArray<BroDownloadEntry*>* BroDownloadsList(void);
+static void BroSaveRecentDownloads(void);
+// Implemented with the popover/toolbar code; safe to call any time.
+static void BroRefreshDownloadsPopover(void);
+static void BroHideDownloadsPopover(void);
+static void BroToggleDownloadsPopover(void);
+static void BroPulseDownloadsButton(void);
 
 // Split screen: the tab shown beside the active one; -1 = no split. The
 // active tab is always the left pane and keeps the address bar and chrome
@@ -129,6 +172,11 @@ static NSUInteger BroTabStripIndex(int browser_id);
 // Forward declaration of tab creation functions (implemented after BroWindow)
 static void CreateNewBrowserTab(void);
 static void CreateNewBrowserTabWithURL(const std::string& url);
+
+// Tab search panel (⇧⌘A / the tab strip's chevron): toggle shows or hides the
+// dropdown; hide is safe to call any time. Implemented with the panel class.
+static void ToggleTabSearchPanel(void);
+static void HideTabSearchPanel(void);
 
 // The main window's browser container (overlay parent for the tab hover
 // card); nil before the window exists. Implemented after BroWindow.
@@ -177,8 +225,8 @@ static BOOL TabIsMobile(int browser_id) {
 static NSString* const kBroBlankTabTitle = @"New Tab";
 
 // Blank pages (and browsers with no committed URL yet) keep their opaque CEF
-// view hidden so the glass window shows through instead of a black rectangle,
-// and never show the raw "about:blank" in the chrome.
+// view hidden so the black window backdrop shows through as the new-tab
+// state, and never show the raw "about:blank" in the chrome.
 static BOOL BroURLIsBlank(NSString* url) {
   return url.length == 0 || [url isEqualToString:@"about:blank"];
 }
@@ -203,7 +251,8 @@ static NSString* BroDisplayHostForURL(NSString* urlString) {
 // default; installing explicit actions re-enables them for these keys.
 static NSDictionary* BroLayerTransitionActions(void) {
   NSMutableDictionary* actions = [NSMutableDictionary dictionary];
-  for (NSString* key in @[ @"borderColor", @"backgroundColor", @"borderWidth" ]) {
+  for (NSString* key in
+       @[ @"borderColor", @"backgroundColor", @"borderWidth", @"transform" ]) {
     CABasicAnimation* fade = [CABasicAnimation animationWithKeyPath:key];
     fade.duration = 0.15;
     fade.timingFunction =
@@ -211,6 +260,20 @@ static NSDictionary* BroLayerTransitionActions(void) {
     actions[key] = fade;
   }
   return actions;
+}
+
+// Scales about the view's center regardless of the layer's anchorPoint.
+// AppKit pins layer-backed views' anchorPoint to (0,0) and reasserts it on
+// layout, so the pivot is baked into the transform instead.
+static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
+  if (scale == 1.0) {
+    return CATransform3DIdentity;
+  }
+  CGFloat w = NSWidth(view.bounds);
+  CGFloat h = NSHeight(view.bounds);
+  CATransform3D t = CATransform3DMakeTranslation(w / 2.0, h / 2.0, 0);
+  t = CATransform3DScale(t, scale, scale, 1.0);
+  return CATransform3DTranslate(t, -w / 2.0, -h / 2.0, 0);
 }
 
 #pragma mark - BroFaviconLoader
@@ -414,6 +477,21 @@ static NSDictionary* BroLayerTransitionActions(void) {
                 : [NSColor clearColor].CGColor;
 }
 
+// Single funnel for the hover/press scale, mirroring refreshBackground.
+// Disabled buttons and Reduce Motion users get no motion.
+- (void)refreshTransform {
+  CGFloat scale = 1.0;
+  if (self.enabled &&
+      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
+    if (pressed_) {
+      scale = kIconPressScale;
+    } else if (hovered_) {
+      scale = kIconHoverScale;
+    }
+  }
+  self.layer.transform = BroCenteredScale(self, scale);
+}
+
 - (void)setSelectedState:(BOOL)selectedState {
   _selectedState = selectedState;
   self.accessibilityValue = @(selectedState);
@@ -423,8 +501,26 @@ static NSDictionary* BroLayerTransitionActions(void) {
 - (void)setEnabled:(BOOL)enabled {
   [super setEnabled:enabled];
   [self refreshBackground];
+  [self refreshTransform];
   // Disabled buttons show the plain arrow cursor, not the pointing hand.
   [self.window invalidateCursorRectsForView:self];
+}
+
+// The scale pivot is baked from bounds, so a resize while hovered must
+// recompute it or the scale drifts off-center.
+- (void)setFrameSize:(NSSize)newSize {
+  [super setFrameSize:newSize];
+  [self refreshTransform];
+}
+
+// A button hidden mid-hover (the tab ✕, mode switches) never gets
+// mouseExited:; reset so it reappears at rest.
+- (void)viewDidHide {
+  [super viewDidHide];
+  hovered_ = NO;
+  pressed_ = NO;
+  [self refreshBackground];
+  [self refreshTransform];
 }
 
 - (void)resetCursorRects {
@@ -436,12 +532,14 @@ static NSDictionary* BroLayerTransitionActions(void) {
 - (void)mouseEntered:(NSEvent*)event {
   hovered_ = YES;
   [self refreshBackground];
+  [self refreshTransform];
 }
 
 - (void)mouseExited:(NSEvent*)event {
   hovered_ = NO;
   pressed_ = NO;
   [self refreshBackground];
+  [self refreshTransform];
 }
 
 - (void)mouseDown:(NSEvent*)event {
@@ -450,10 +548,12 @@ static NSDictionary* BroLayerTransitionActions(void) {
   }
   pressed_ = YES;
   [self refreshBackground];
+  [self refreshTransform];
   // Runs the tracking loop synchronously; returns after mouse-up.
   [super mouseDown:event];
   pressed_ = NO;
   [self refreshBackground];
+  [self refreshTransform];
 }
 
 - (void)keyDown:(NSEvent*)event {
@@ -519,7 +619,9 @@ static NSDictionary* BroLayerTransitionActions(void) {
 @property (nonatomic, weak) id target;
 @property (nonatomic, assign) SEL selectAction;
 @property (nonatomic, assign) SEL closeAction;
-- (void)setFaviconURL:(NSString*)urlString;
+// Setting kicks off an async fetch into faviconView; the URL is retained so
+// a closing tab's favicon can follow it into the recently-closed list.
+@property (nonatomic, copy) NSString* faviconURL;
 - (void)setLoading:(BOOL)loading;
 - (void)setTabURL:(NSString*)url;
 - (void)attachAddressField:(NSTextField*)field;
@@ -532,6 +634,7 @@ static NSDictionary* BroLayerTransitionActions(void) {
 @property (nonatomic, strong) NSTextField* addressField;
 @property (nonatomic, strong) BroHoverButton* desktopButton;
 @property (nonatomic, strong) BroHoverButton* mobileButton;
+@property (nonatomic, strong) BroHoverButton* downloadsButton;
 @property (nonatomic, copy) NSString* fullURL;
 - (void)addressFieldDidFocus;
 - (void)setViewportMode:(BOOL)mobile;
@@ -640,6 +743,15 @@ static NSDictionary* BroLayerTransitionActions(void) {
     _desktopButton.autoresizingMask = NSViewMinXMargin;
     [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
     [self addSubview:_desktopButton];
+    // Downloads sits left of the viewport radio group, set off by a wider
+    // gap so it doesn't read as a third mode.
+    rightX -= kButtonSize + kButtonSpacing + 8.0;
+    _downloadsButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
+                                              icon:RadixIconDownload
+                                            action:@selector(toggleDownloads:)
+                                             label:@"Downloads"];
+    _downloadsButton.autoresizingMask = NSViewMinXMargin;
+    [self addSubview:_downloadsButton];
     // The selected toggle is disabled but must keep its bright tint, so don't
     // let AppKit dim the icon.
     ((NSButtonCell*)_mobileButton.cell).imageDimsWhenDisabled = NO;
@@ -745,6 +857,10 @@ static NSDictionary* BroLayerTransitionActions(void) {
 }
 
 #pragma mark - Toolbar Actions
+
+- (void)toggleDownloads:(id)sender {
+  BroToggleDownloadsPopover();
+}
 
 - (void)selectMobileMode:(id)sender {
   [self applyViewportMode:YES];
@@ -886,6 +1002,8 @@ static NSDictionary* BroLayerTransitionActions(void) {
 @interface BroTabBar : NSView
 @property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
 @property (nonatomic, strong) BroHoverButton* addTabButton;
+// Chevron pinned at the strip's right edge; opens the tab search panel.
+@property (nonatomic, strong) BroHoverButton* tabSearchButton;
 @property (nonatomic, assign) int activeTabId;
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title;
 - (void)removeTabWithBrowserId:(int)browserId;
@@ -932,6 +1050,9 @@ static NSDictionary* BroLayerTransitionActions(void) {
   BOOL hovered_;
   BOOL focused_;
   BOOL wasActiveAtMouseDown_;
+  // Target state of the ✕ fade; guards against the many updateAppearance
+  // callers restarting an in-flight fade.
+  BOOL closeButtonShown_;
   // Bumped on every setFaviconURL:; a fetch completion only applies its image
   // if the generation still matches, so a slow response for a previous page
   // can't overwrite the current page's favicon. Main-thread only.
@@ -1007,6 +1128,9 @@ static NSDictionary* BroLayerTransitionActions(void) {
     closeButton.accessibilityLabel = @"Close tab";
     closeButton.toolTip = @"Close tab (⌘W)";
     _closeButton = closeButton;
+    // Start hidden to match closeButtonShown_'s NO default, so the guard in
+    // setCloseButtonShown: can't leave a stale ✕ on a non-closable pill.
+    _closeButton.hidden = YES;
     [self addSubview:_closeButton];
 
     [self updateAppearance];
@@ -1024,6 +1148,7 @@ static NSDictionary* BroLayerTransitionActions(void) {
 
 - (void)setFaviconURL:(NSString*)urlString {
   if (!urlString || urlString.length == 0) return;
+  _faviconURL = [urlString copy];
 
   NSUInteger generation = ++faviconGeneration_;
   __weak BroTabView* weakSelf = self;
@@ -1121,24 +1246,26 @@ static NSDictionary* BroLayerTransitionActions(void) {
   }
 }
 
-// Selected (active) pills are brightest; hovered inactive pills sit between
-// the selected and resting looks. Selection, hover, keyboard focus, and the
-// address-editing state all share the same 1pt gray hairline; only resting
-// inactive pills are fainter.
+// Pills sit on pure #000; selection, split-pane, hover, keyboard focus, and
+// the address-editing state all share the same 1pt #111 hairline, and only a
+// hovered inactive pill lifts its fill off black. Resting inactive borders
+// are fainter still.
 - (void)updateAppearance {
   if (_isActive) {
-    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    self.layer.backgroundColor = [NSColor blackColor].CGColor;
     self.layer.borderColor = BroControlBorderColor().CGColor;
     _titleLabel.textColor = [NSColor labelColor];
   } else {
     // The split screen's right pane keeps the active pill's look while
     // inactive, so both on-screen halves read as selected.
-    CGFloat bg = _isSplitPane ? 0.08 : (hovered_ ? 0.06 : 0.03);
-    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:bg].CGColor;
+    CGFloat bg = (!_isSplitPane && hovered_) ? 0.05 : 0.0;
+    self.layer.backgroundColor =
+        bg > 0 ? [NSColor colorWithWhite:1.0 alpha:bg].CGColor
+               : [NSColor blackColor].CGColor;
     self.layer.borderColor =
         (_isSplitPane || hovered_ || focused_)
             ? BroControlBorderColor().CGColor
-            : [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
+            : [NSColor colorWithWhite:1.0 alpha:0.05].CGColor;
     _titleLabel.textColor = [NSColor secondaryLabelColor];
     // The address field only lives in the active pill, so the label comes
     // back — unless the pill is collapsed to its favicon.
@@ -1152,7 +1279,49 @@ static NSDictionary* BroLayerTransitionActions(void) {
   }
   // The active pill always shows ✕; inactive pills reveal it on hover or
   // keyboard focus.
-  _closeButton.hidden = !(_closable && (_isActive || hovered_ || focused_));
+  [self setCloseButtonShown:(_closable && (_isActive || hovered_ || focused_))];
+}
+
+// Fades the ✕ in/out instead of snapping, so its hover reveal matches the
+// rest of the chrome's transitions.
+- (void)setCloseButtonShown:(BOOL)shown {
+  if (shown == closeButtonShown_) {
+    return;
+  }
+  closeButtonShown_ = shown;
+  // Pills built off-window (init-time updateAppearance) must not fade in.
+  BOOL animate =
+      self.window != nil &&
+      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion;
+  if (!animate) {
+    _closeButton.hidden = !shown;
+    _closeButton.alphaValue = 1.0;
+    return;
+  }
+  if (shown) {
+    // May be mid fade-out; unhide and retarget from the current alpha.
+    _closeButton.hidden = NO;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = kCloseButtonFadeDuration;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseOut];
+      self->_closeButton.animator.alphaValue = 1.0;
+    }];
+  } else {
+    __weak BroTabView* weakSelf = self;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = kCloseButtonFadeDuration;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseOut];
+      self->_closeButton.animator.alphaValue = 0.0;
+    } completionHandler:^{
+      BroTabView* strongSelf = weakSelf;
+      // Only hide if a re-show hasn't retargeted the fade meanwhile.
+      if (strongSelf && !strongSelf->closeButtonShown_) {
+        strongSelf->_closeButton.hidden = YES;
+      }
+    }];
+  }
 }
 
 - (void)setClosable:(BOOL)closable {
@@ -1562,6 +1731,920 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 @end
 
+#pragma mark - BroDownloadsPopover
+
+// Floating panel under the toolbar's downloads button: recent downloads
+// newest-first (in-flight ones with a progress readout), a Clear action, and
+// a "View all downloads" footer that reveals ~/Downloads in Finder. Styled to
+// match BroTabHoverCard. Toggled by the button; dismissed by outside clicks
+// and Esc via the event monitors installed alongside the show call.
+static const CGFloat kDownloadsPopoverWidth = 300.0;
+static const CGFloat kDownloadsRowHeight = 44.0;
+static const CGFloat kDownloadsHeaderHeight = 28.0;
+static const CGFloat kDownloadsFooterHeight = 36.0;
+static const CGFloat kDownloadsEmptyHeight = 52.0;
+
+@interface BroDownloadsPopover : NSView
+// Rebuilds the rows from the downloads list and resizes self to fit, showing
+// at most as many rows as fit in |maxHeight| (newest kept, oldest dropped).
+- (void)reloadWithMaxHeight:(CGFloat)maxHeight;
+@end
+
+@implementation BroDownloadsPopover {
+  NSTextField* headerLabel_;
+  BroHoverButton* clearButton_;
+  BroHoverButton* viewAllButton_;
+  NSView* separator_;
+  NSTextField* emptyLabel_;
+  NSMutableArray<NSView*>* rowViews_;
+  // Entries backing the visible rows; magnifier buttons index into this.
+  NSMutableArray<BroDownloadEntry*>* rowEntries_;
+  CGFloat lastMaxHeight_;
+}
+
+static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
+                                                   NSFont* font,
+                                                   CGFloat whiteAlpha,
+                                                   NSTextAlignment alignment) {
+  NSMutableParagraphStyle* style = [[NSMutableParagraphStyle alloc] init];
+  style.alignment = alignment;
+  style.lineBreakMode = NSLineBreakByTruncatingTail;
+  return [[NSAttributedString alloc]
+      initWithString:text
+          attributes:@{
+            NSFontAttributeName : font,
+            NSForegroundColorAttributeName :
+                [NSColor colorWithWhite:1.0 alpha:whiteAlpha],
+            NSParagraphStyleAttributeName : style,
+          }];
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 8.0;
+    self.layer.backgroundColor =
+        [NSColor colorWithWhite:0.18 alpha:0.96].CGColor;
+    self.layer.borderWidth = 1.0;
+    self.layer.borderColor =
+        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+
+    headerLabel_ = BroHoverCardLabel(BroUIFontBold(10.0), 0.55);
+    headerLabel_.attributedStringValue = [[NSAttributedString alloc]
+        initWithString:@"RECENT DOWNLOADS"
+            attributes:@{
+              NSFontAttributeName : BroUIFontBold(10.0),
+              NSForegroundColorAttributeName :
+                  [NSColor colorWithWhite:1.0 alpha:0.55],
+              NSKernAttributeName : @0.5,
+            }];
+    [self addSubview:headerLabel_];
+
+    clearButton_ = [[BroHoverButton alloc]
+        initWithFrame:NSMakeRect(0, 0, 48.0, 20.0)];
+    clearButton_.bordered = NO;
+    clearButton_.attributedTitle = BroDownloadsButtonTitle(
+        @"Clear", BroUIFont(11.0), 0.55, NSTextAlignmentCenter);
+    clearButton_.target = self;
+    clearButton_.action = @selector(clearDownloads:);
+    clearButton_.accessibilityLabel = @"Clear recent downloads";
+    [self addSubview:clearButton_];
+
+    emptyLabel_ = BroHoverCardLabel(BroUIFont(12.0), 0.4);
+    emptyLabel_.stringValue = @"No recent downloads";
+    emptyLabel_.alignment = NSTextAlignmentCenter;
+    [self addSubview:emptyLabel_];
+
+    separator_ = [[NSView alloc] initWithFrame:NSZeroRect];
+    separator_.wantsLayer = YES;
+    separator_.layer.backgroundColor =
+        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+    [self addSubview:separator_];
+
+    viewAllButton_ = [[BroHoverButton alloc] initWithFrame:NSZeroRect];
+    viewAllButton_.bordered = NO;
+    viewAllButton_.alignment = NSTextAlignmentLeft;
+    viewAllButton_.attributedTitle = BroDownloadsButtonTitle(
+        @"View all downloads", BroUIFont(12.0), 0.85, NSTextAlignmentLeft);
+    viewAllButton_.target = self;
+    viewAllButton_.action = @selector(viewAllDownloads:);
+    viewAllButton_.accessibilityLabel = @"View all downloads";
+    [self addSubview:viewAllButton_];
+
+    rowViews_ = [NSMutableArray array];
+    rowEntries_ = [NSMutableArray array];
+    lastMaxHeight_ = CGFLOAT_MAX;
+  }
+  return self;
+}
+
+// Swallow clicks so they never fall through to whatever is behind the panel.
+- (void)mouseDown:(NSEvent*)event {
+}
+
+- (void)reloadWithMaxHeight:(CGFloat)maxHeight {
+  lastMaxHeight_ = maxHeight;
+  for (NSView* row in rowViews_) {
+    [row removeFromSuperview];
+  }
+  [rowViews_ removeAllObjects];
+  [rowEntries_ removeAllObjects];
+
+  NSArray<BroDownloadEntry*>* entries = BroDownloadsList();
+  const CGFloat padTop = 8.0;
+  const CGFloat padBottom = 6.0;
+  const CGFloat chromeHeight = padTop + kDownloadsHeaderHeight + 1.0 +
+                               kDownloadsFooterHeight + padBottom;
+  NSUInteger maxRows = 0;
+  if (maxHeight > chromeHeight + kDownloadsRowHeight) {
+    maxRows = (NSUInteger)((maxHeight - chromeHeight) / kDownloadsRowHeight);
+  }
+  NSUInteger rowCount = MIN(entries.count, maxRows);
+  for (NSUInteger i = 0; i < rowCount; i++) {
+    [rowEntries_ addObject:entries[i]];
+  }
+
+  const CGFloat width = kDownloadsPopoverWidth;
+  CGFloat listHeight = rowCount > 0 ? rowCount * kDownloadsRowHeight
+                                    : kDownloadsEmptyHeight;
+  CGFloat height = chromeHeight + listHeight;
+
+  // Bottom-up (unflipped coords): footer, separator, rows oldest-first, then
+  // the header at the top.
+  viewAllButton_.frame = NSMakeRect(4.0, padBottom, width - 8.0,
+                                    kDownloadsFooterHeight);
+  separator_.frame = NSMakeRect(0, padBottom + kDownloadsFooterHeight,
+                                width, 1.0);
+
+  CGFloat listBottom = padBottom + kDownloadsFooterHeight + 1.0;
+  emptyLabel_.hidden = rowCount > 0;
+  if (rowCount == 0) {
+    CGFloat labelHeight =
+        ceil([emptyLabel_.cell cellSizeForBounds:NSMakeRect(0, 0, CGFLOAT_MAX,
+                                                            CGFLOAT_MAX)]
+                 .height);
+    emptyLabel_.frame = NSMakeRect(
+        12.0, listBottom + (kDownloadsEmptyHeight - labelHeight) / 2.0,
+        width - 24.0, labelHeight);
+  }
+
+  for (NSUInteger i = 0; i < rowCount; i++) {
+    BroDownloadEntry* entry = rowEntries_[i];
+    // Row i is the i-th newest; stack from the top of the list area down.
+    CGFloat rowY = listBottom + (rowCount - 1 - i) * kDownloadsRowHeight;
+    NSView* row = [self makeRowForEntry:entry index:i];
+    row.frame = NSMakeRect(0, rowY, width, kDownloadsRowHeight);
+    [self addSubview:row];
+    [rowViews_ addObject:row];
+  }
+
+  CGFloat headerY = listBottom + listHeight;
+  headerLabel_.frame = NSMakeRect(12.0, headerY + 7.0, width - 80.0, 14.0);
+  clearButton_.frame = NSMakeRect(width - 12.0 - 48.0, headerY + 4.0,
+                                  48.0, 20.0);
+  BOOL anySettled = NO;
+  for (BroDownloadEntry* entry in entries) {
+    if (entry.state != BroDownloadStateInProgress) {
+      anySettled = YES;
+      break;
+    }
+  }
+  clearButton_.hidden = !anySettled;
+
+  [self setFrameSize:NSMakeSize(width, height)];
+}
+
+- (NSView*)makeRowForEntry:(BroDownloadEntry*)entry index:(NSUInteger)index {
+  NSView* row = [[NSView alloc] initWithFrame:NSZeroRect];
+
+  BOOL fileExists = entry.path.length > 0 &&
+      [[NSFileManager defaultManager] fileExistsAtPath:entry.path];
+
+  NSImageView* icon = [[NSImageView alloc]
+      initWithFrame:NSMakeRect(12.0, 8.0, 28.0, 28.0)];
+  if (entry.state == BroDownloadStateComplete && fileExists) {
+    icon.image = [[NSWorkspace sharedWorkspace] iconForFile:entry.path];
+  } else {
+    icon.image = RadixIconImage(RadixIconDownload, 15.0);
+    icon.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+  }
+  [row addSubview:icon];
+
+  BOOL showsMagnifier = entry.state == BroDownloadStateComplete && fileExists;
+  const CGFloat textX = 48.0;
+  CGFloat textRight = showsMagnifier ? kDownloadsPopoverWidth - 12.0 - 24.0 - 6.0
+                                     : kDownloadsPopoverWidth - 12.0;
+
+  NSTextField* name = BroHoverCardLabel(BroUIFontBold(12.0), 1.0);
+  name.stringValue = entry.name ?: @"";
+  name.frame = NSMakeRect(textX, 22.0, textRight - textX, 15.0);
+  [row addSubview:name];
+
+  NSTextField* subtitle = BroHoverCardLabel(BroUIFont(11.0), 0.55);
+  subtitle.stringValue = [self subtitleForEntry:entry fileExists:fileExists];
+  subtitle.frame = NSMakeRect(textX, 7.0, textRight - textX, 13.0);
+  [row addSubview:subtitle];
+
+  if (entry.state == BroDownloadStateInProgress) {
+    CGFloat barWidth = textRight - textX;
+    NSView* track = [[NSView alloc]
+        initWithFrame:NSMakeRect(textX, 4.0, barWidth, 2.0)];
+    track.wantsLayer = YES;
+    track.layer.cornerRadius = 1.0;
+    track.layer.backgroundColor =
+        [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+    [row addSubview:track];
+    if (entry.totalBytes > 0) {
+      double fraction = MIN(
+          1.0, (double)entry.receivedBytes / (double)entry.totalBytes);
+      NSView* fill = [[NSView alloc]
+          initWithFrame:NSMakeRect(textX, 4.0, barWidth * fraction, 2.0)];
+      fill.wantsLayer = YES;
+      fill.layer.cornerRadius = 1.0;
+      fill.layer.backgroundColor =
+          [NSColor colorWithWhite:1.0 alpha:0.85].CGColor;
+      [row addSubview:fill];
+    }
+  }
+
+  if (showsMagnifier) {
+    BroHoverButton* reveal = [[BroHoverButton alloc]
+        initWithFrame:NSMakeRect(kDownloadsPopoverWidth - 12.0 - 24.0, 10.0,
+                                 24.0, 24.0)];
+    reveal.bordered = NO;
+    reveal.title = @"";
+    reveal.imagePosition = NSImageOnly;
+    reveal.image = RadixIconImage(RadixIconMagnifyingGlass, 15.0);
+    reveal.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    reveal.toolTip = @"Show in Finder";
+    reveal.accessibilityLabel =
+        [NSString stringWithFormat:@"Show %@ in Finder", entry.name];
+    reveal.tag = (NSInteger)index;
+    reveal.target = self;
+    reveal.action = @selector(revealEntry:);
+    [row addSubview:reveal];
+  }
+
+  return row;
+}
+
+- (NSString*)subtitleForEntry:(BroDownloadEntry*)entry
+                   fileExists:(BOOL)fileExists {
+  switch (entry.state) {
+    case BroDownloadStateInProgress: {
+      NSString* received = [NSByteCountFormatter
+          stringFromByteCount:entry.receivedBytes
+                   countStyle:NSByteCountFormatterCountStyleFile];
+      if (entry.totalBytes > 0) {
+        NSString* total = [NSByteCountFormatter
+            stringFromByteCount:entry.totalBytes
+                     countStyle:NSByteCountFormatterCountStyleFile];
+        return [NSString stringWithFormat:@"%@ of %@", received, total];
+      }
+      return received;
+    }
+    case BroDownloadStateFailed:
+      return @"Failed";
+    case BroDownloadStateComplete: {
+      if (!fileExists) {
+        return @"Deleted";
+      }
+      NSURL* url = [NSURL fileURLWithPath:entry.path];
+      NSString* kind = nil;
+      [url getResourceValue:&kind
+                     forKey:NSURLLocalizedTypeDescriptionKey
+                      error:nil];
+      if (kind.length > 0) {
+        return kind;
+      }
+      NSString* ext = entry.name.pathExtension;
+      return ext.length > 0
+                 ? [NSString stringWithFormat:@"%@ file", ext.lowercaseString]
+                 : @"File";
+    }
+  }
+  return @"";
+}
+
+- (void)revealEntry:(NSButton*)sender {
+  NSUInteger index = (NSUInteger)sender.tag;
+  if (index >= rowEntries_.count) {
+    return;
+  }
+  BroDownloadEntry* entry = rowEntries_[index];
+  if (entry.path.length > 0) {
+    [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[
+      [NSURL fileURLWithPath:entry.path]
+    ]];
+  }
+}
+
+- (void)clearDownloads:(id)sender {
+  // Drop settled entries only; active downloads stay until they finish.
+  NSMutableArray<BroDownloadEntry*>* list = BroDownloadsList();
+  for (NSUInteger i = 0; i < list.count;) {
+    if (list[i].state == BroDownloadStateInProgress) {
+      i++;
+    } else {
+      [list removeObjectAtIndex:i];
+    }
+  }
+  BroSaveRecentDownloads();
+  [self reloadWithMaxHeight:lastMaxHeight_];
+}
+
+- (void)viewAllDownloads:(id)sender {
+  NSString* dir = NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory,
+                                                      NSUserDomainMask, YES)
+                      .firstObject;
+  if (dir.length > 0) {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir
+                                                      isDirectory:YES]];
+  }
+  BroHideDownloadsPopover();
+}
+
+@end
+
+#pragma mark - BroTabSearchPanel
+
+static const CGFloat kTabSearchPanelWidth = 340.0;
+static const CGFloat kTabSearchRowHeight = 32.0;
+static const CGFloat kTabSearchHeaderHeight = 24.0;
+// The list scrolls past this; the search row above never scrolls away.
+static const CGFloat kTabSearchListMaxHeight = 352.0;
+static const CGFloat kTabSearchFieldRowHeight = 44.0;
+static const CGFloat kTabSearchPadX = 8.0;
+
+// One row in the tab search panel: favicon + title, hover highlight, and a
+// selection highlight driven by the panel's ↑/↓ navigation. A plain view
+// rather than BroHoverButton: the hover scale reads wrong on a wide list row.
+@interface BroTabSearchRow : NSView
+// Open-tab rows carry the browser to activate; closed rows carry the entry
+// to reopen. Exactly one is set.
+@property (nonatomic, assign) int browserId;
+@property (nonatomic, strong) BroClosedTabEntry* closedEntry;
+@property (nonatomic, assign) BOOL selected;
+@property (nonatomic, weak) id target;
+@property (nonatomic, assign) SEL action;
+- (void)setTitle:(NSString*)title;
+// Copies the pill's already-resolved favicon (image + placeholder tint).
+- (void)adoptFaviconFrom:(NSImageView*)source;
+// Async fetch for closed rows; shows the globe placeholder meanwhile.
+- (void)setFaviconURLString:(NSString*)urlString;
+@end
+
+@implementation BroTabSearchRow {
+  NSImageView* faviconView_;
+  NSTextField* titleLabel_;
+  BOOL hovered_;
+  // Same guard as BroTabView: a stale fetch must not overwrite the favicon
+  // this row was last configured with. Main-thread only.
+  NSUInteger faviconGeneration_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    _browserId = -1;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 6.0;
+    self.layer.actions = BroLayerTransitionActions();
+
+    faviconView_ = [[NSImageView alloc]
+        initWithFrame:NSMakeRect(10, (frame.size.height - 15) / 2.0, 15, 15)];
+    faviconView_.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [self addSubview:faviconView_];
+    [self showPlaceholderFavicon];
+
+    titleLabel_ = BroHoverCardLabel(BroUIFont(12.0), 0.9);
+    titleLabel_.frame = NSMakeRect(34, (frame.size.height - 16) / 2.0,
+                                   frame.size.width - 34 - 10, 16);
+    titleLabel_.autoresizingMask = NSViewWidthSizable;
+    [self addSubview:titleLabel_];
+
+    self.accessibilityElement = YES;
+    self.accessibilityRole = NSAccessibilityButtonRole;
+
+    NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:trackingArea];
+  }
+  return self;
+}
+
+- (void)setTitle:(NSString*)title {
+  titleLabel_.stringValue = title ?: @"";
+  self.accessibilityLabel = titleLabel_.stringValue;
+}
+
+- (void)showPlaceholderFavicon {
+  faviconView_.image = RadixIconImage(RadixIconGlobe, 15);
+  faviconView_.contentTintColor =
+      [NSColor colorWithWhite:0x33 / 255.0 alpha:1.0];
+}
+
+- (void)adoptFaviconFrom:(NSImageView*)source {
+  faviconGeneration_++;
+  if (source.image) {
+    faviconView_.image = source.image;
+    faviconView_.contentTintColor = source.contentTintColor;
+  } else {
+    [self showPlaceholderFavicon];
+  }
+}
+
+- (void)setFaviconURLString:(NSString*)urlString {
+  NSUInteger generation = ++faviconGeneration_;
+  [self showPlaceholderFavicon];
+  if (urlString.length == 0) {
+    return;
+  }
+  __weak BroTabSearchRow* weakSelf = self;
+  [[BroFaviconLoader sharedLoader]
+      fetchFavicon:urlString
+        completion:^(NSImage* image) {
+          BroTabSearchRow* strongSelf = weakSelf;
+          if (!strongSelf || !image ||
+              strongSelf->faviconGeneration_ != generation) {
+            return;
+          }
+          strongSelf->faviconView_.image = image;
+          strongSelf->faviconView_.contentTintColor = nil;
+        }];
+}
+
+- (void)refreshBackground {
+  CGFloat alpha = _selected ? 0.14 : (hovered_ ? 0.07 : 0.0);
+  self.layer.backgroundColor =
+      alpha > 0 ? [NSColor colorWithWhite:1.0 alpha:alpha].CGColor
+                : [NSColor clearColor].CGColor;
+}
+
+- (void)setSelected:(BOOL)selected {
+  _selected = selected;
+  [self refreshBackground];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+  hovered_ = YES;
+  [self refreshBackground];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  hovered_ = NO;
+  [self refreshBackground];
+}
+
+- (void)resetCursorRects {
+  [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  // Claim the click; activation fires on mouse-up inside, like a button.
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+  if (NSPointInRect(point, self.bounds)) {
+    [NSApp sendAction:_action to:_target from:self];
+  }
+}
+
+@end
+
+// Flipped host for the row list so rows stack top-down in the scroll view.
+@interface BroTabSearchListView : NSView
+@end
+
+@implementation BroTabSearchListView
+- (BOOL)isFlipped {
+  return YES;
+}
+@end
+
+// The ⇧⌘A dropdown: a search field over a scrollable list of open tabs and
+// recently closed entries. Typing filters both sections; ↑/↓/Return navigate
+// and activate; Escape or an outside click dismisses. Same overlay recipe as
+// the hover card: hand-rolled, re-added last to the browser container on
+// every show, retained and hidden rather than destroyed.
+@interface BroTabSearchPanel : NSView <NSTextFieldDelegate>
+// Clears the query, rebuilds the list, and positions the panel; the caller
+// unhides it and focuses the field.
+- (void)prepareForDisplay;
+- (void)focusSearchField;
+// Hands keyboard focus back if the search field's editor still holds it.
+- (void)restoreFocusIfNeeded;
+@end
+
+@implementation BroTabSearchPanel {
+  NSTextField* searchField_;
+  NSImageView* searchIcon_;
+  NSTextField* shortcutHint_;
+  NSView* separator_;
+  NSScrollView* scrollView_;
+  BroTabSearchListView* listView_;
+  NSMutableArray<BroTabSearchRow*>* rows_;
+  NSInteger selectedIndex_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    rows_ = [NSMutableArray array];
+    selectedIndex_ = -1;
+
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 8.0;
+    self.layer.backgroundColor =
+        [NSColor colorWithWhite:0.18 alpha:0.96].CGColor;
+    self.layer.borderWidth = 1.0;
+    self.layer.borderColor =
+        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+
+    searchIcon_ = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    searchIcon_.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
+    searchIcon_.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    [self addSubview:searchIcon_];
+
+    searchField_ = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    searchField_.font = BroUIFont(13.0);
+    searchField_.textColor = [NSColor whiteColor];
+    searchField_.bordered = NO;
+    searchField_.bezeled = NO;
+    searchField_.drawsBackground = NO;
+    searchField_.focusRingType = NSFocusRingTypeNone;
+    searchField_.cell.usesSingleLineMode = YES;
+    searchField_.cell.scrollable = YES;
+    searchField_.placeholderAttributedString = [[NSAttributedString alloc]
+        initWithString:@"Search tabs"
+            attributes:@{
+              NSFontAttributeName : BroUIFont(13.0),
+              NSForegroundColorAttributeName :
+                  [NSColor colorWithWhite:1.0 alpha:0.35],
+            }];
+    searchField_.delegate = self;
+    searchField_.accessibilityLabel = @"Search tabs";
+    [self addSubview:searchField_];
+
+    shortcutHint_ = BroHoverCardLabel(BroUIFont(11.0), 0.35);
+    shortcutHint_.stringValue = @"⇧⌘A";
+    [shortcutHint_ sizeToFit];
+    [self addSubview:shortcutHint_];
+
+    separator_ = [[NSView alloc] initWithFrame:NSZeroRect];
+    separator_.wantsLayer = YES;
+    separator_.layer.backgroundColor =
+        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+    [self addSubview:separator_];
+
+    listView_ = [[BroTabSearchListView alloc] initWithFrame:NSZeroRect];
+    scrollView_ = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    scrollView_.drawsBackground = NO;
+    scrollView_.borderType = NSNoBorder;
+    scrollView_.hasVerticalScroller = YES;
+    scrollView_.hasHorizontalScroller = NO;
+    scrollView_.scrollerStyle = NSScrollerStyleOverlay;
+    scrollView_.automaticallyAdjustsContentInsets = NO;
+    scrollView_.documentView = listView_;
+    [self addSubview:scrollView_];
+  }
+  return self;
+}
+
+- (void)prepareForDisplay {
+  searchField_.stringValue = @"";
+  [self reloadWithFilter:@""];
+}
+
+- (void)focusSearchField {
+  [self.window makeFirstResponder:searchField_];
+}
+
+- (void)restoreFocusIfNeeded {
+  NSWindow* window = self.window;
+  NSResponder* responder = window.firstResponder;
+  if ([responder isKindOfClass:[NSText class]] &&
+      ((NSText*)responder).delegate == (id)searchField_) {
+    [window makeFirstResponder:nil];
+  }
+}
+
+- (NSString*)displayTitleForTab:(BroTabView*)tab {
+  if (tab.pageTitle.length > 0) {
+    return tab.pageTitle;
+  }
+  if (!BroURLIsBlank(tab.tabURL)) {
+    return BroDisplayHostForURL(tab.tabURL);
+  }
+  return kBroBlankTabTitle;
+}
+
+// Rebuilds the row list from the live tab strip and the closed-tab history.
+// The list is small (tabs + ≤10 closed), so a full rebuild per keystroke is
+// simpler than diffing and imperceptible.
+- (void)reloadWithFilter:(NSString*)query {
+  for (NSView* subview in [listView_.subviews copy]) {
+    [subview removeFromSuperview];
+  }
+  [rows_ removeAllObjects];
+  selectedIndex_ = -1;
+
+  NSString* needle =
+      [query stringByTrimmingCharactersInSet:
+                 [NSCharacterSet whitespaceCharacterSet]].lowercaseString
+          ?: @"";
+  BOOL (^matches)(NSString*, NSString*) = ^BOOL(NSString* title, NSString* url) {
+    if (needle.length == 0) {
+      return YES;
+    }
+    return (title.length > 0 &&
+            [title.lowercaseString containsString:needle]) ||
+           (url.length > 0 && [url.lowercaseString containsString:needle]);
+  };
+
+  NSMutableArray<BroTabView*>* openTabs = [NSMutableArray array];
+  for (BroTabView* tab in g_tab_bar.tabs) {
+    if (matches([self displayTitleForTab:tab], tab.tabURL)) {
+      [openTabs addObject:tab];
+    }
+  }
+  NSMutableArray<BroClosedTabEntry*>* closedTabs = [NSMutableArray array];
+  for (BroClosedTabEntry* entry in [g_closed_tabs reverseObjectEnumerator]) {
+    if (matches(entry.title, entry.url)) {
+      [closedTabs addObject:entry];
+    }
+  }
+
+  const CGFloat rowWidth = kTabSearchPanelWidth - kTabSearchPadX * 2;
+  CGFloat y = 4.0;  // flipped list: grows downward
+
+  NSTextField* (^addHeader)(NSString*, CGFloat) =
+      ^NSTextField*(NSString* title, CGFloat headerY) {
+        NSTextField* header = BroHoverCardLabel(BroUIFontBold(11.0), 0.4);
+        header.stringValue = title;
+        header.frame = NSMakeRect(kTabSearchPadX + 6.0, headerY + 7.0,
+                                  rowWidth - 12.0, 14.0);
+        [listView_ addSubview:header];
+        return header;
+      };
+
+  if (openTabs.count > 0) {
+    addHeader(@"Open Tabs", y);
+    y += kTabSearchHeaderHeight;
+    for (BroTabView* tab in openTabs) {
+      BroTabSearchRow* row = [[BroTabSearchRow alloc]
+          initWithFrame:NSMakeRect(kTabSearchPadX, y, rowWidth,
+                                   kTabSearchRowHeight)];
+      row.browserId = tab.browserId;
+      [row setTitle:[self displayTitleForTab:tab]];
+      [row adoptFaviconFrom:tab.faviconView];
+      row.target = self;
+      row.action = @selector(rowClicked:);
+      [listView_ addSubview:row];
+      [rows_ addObject:row];
+      y += kTabSearchRowHeight + 2.0;
+    }
+  }
+
+  if (closedTabs.count > 0) {
+    if (openTabs.count > 0) {
+      y += 6.0;  // gap between sections
+    }
+    addHeader(@"Recently Closed", y);
+    y += kTabSearchHeaderHeight;
+    for (BroClosedTabEntry* entry in closedTabs) {
+      BroTabSearchRow* row = [[BroTabSearchRow alloc]
+          initWithFrame:NSMakeRect(kTabSearchPadX, y, rowWidth,
+                                   kTabSearchRowHeight)];
+      row.closedEntry = entry;
+      [row setTitle:entry.title.length > 0
+                        ? entry.title
+                        : BroDisplayHostForURL(entry.url)];
+      [row setFaviconURLString:entry.faviconURL];
+      row.target = self;
+      row.action = @selector(rowClicked:);
+      [listView_ addSubview:row];
+      [rows_ addObject:row];
+      y += kTabSearchRowHeight + 2.0;
+    }
+  }
+
+  if (rows_.count == 0) {
+    NSTextField* empty = BroHoverCardLabel(BroUIFont(12.0), 0.45);
+    empty.stringValue = @"No matching tabs";
+    empty.alignment = NSTextAlignmentCenter;
+    empty.frame = NSMakeRect(kTabSearchPadX, y + 10.0, rowWidth, 16.0);
+    [listView_ addSubview:empty];
+    y += 36.0;
+  }
+  y += 4.0;  // bottom padding inside the list
+
+  CGFloat listHeight = MIN(y, kTabSearchListMaxHeight);
+  listView_.frame = NSMakeRect(0, 0, kTabSearchPanelWidth, y);
+
+  // Panel layout, bottom-up (unflipped): list, separator, search row.
+  CGFloat height = listHeight + 1.0 + kTabSearchFieldRowHeight;
+  [self setFrameSize:NSMakeSize(kTabSearchPanelWidth, height)];
+  scrollView_.frame = NSMakeRect(0, 0, kTabSearchPanelWidth, listHeight);
+  separator_.frame = NSMakeRect(0, listHeight, kTabSearchPanelWidth, 1.0);
+
+  CGFloat fieldRowY = listHeight + 1.0;
+  searchIcon_.frame =
+      NSMakeRect(14, fieldRowY + (kTabSearchFieldRowHeight - 15) / 2.0, 15, 15);
+  NSSize hintSize = shortcutHint_.frame.size;
+  shortcutHint_.frame =
+      NSMakeRect(kTabSearchPanelWidth - hintSize.width - 14,
+                 fieldRowY + (kTabSearchFieldRowHeight - hintSize.height) / 2.0,
+                 hintSize.width, hintSize.height);
+  searchField_.frame = NSMakeRect(
+      38, fieldRowY + (kTabSearchFieldRowHeight - 18) / 2.0,
+      kTabSearchPanelWidth - 38 - hintSize.width - 22, 18.0);
+
+  [listView_ scrollPoint:NSZeroPoint];
+  if (rows_.count > 0) {
+    [self selectRowAtIndex:0];
+  }
+  [self repositionInContainer];
+}
+
+// Anchored under the tab strip's chevron (falling back to the container's
+// right edge), hanging from the top like the hover card. Re-run after every
+// reload: filtering changes the height.
+- (void)repositionInContainer {
+  NSView* container = self.superview;
+  if (!container) {
+    return;
+  }
+  NSSize size = self.frame.size;
+  CGFloat x = NSMaxX(container.bounds) - size.width - 8.0;
+  BroHoverButton* chevron = g_tab_bar.tabSearchButton;
+  if (chevron && chevron.window == self.window) {
+    NSRect chevronRect =
+        [container convertRect:chevron.bounds fromView:chevron];
+    x = NSMaxX(chevronRect) - size.width;
+  }
+  x = MAX(8.0, MIN(x, NSMaxX(container.bounds) - size.width - 8.0));
+  CGFloat panelY = NSMaxY(container.bounds) - size.height - 6.0;
+  self.frame = NSMakeRect(x, panelY, size.width, size.height);
+}
+
+- (void)selectRowAtIndex:(NSInteger)index {
+  if (selectedIndex_ >= 0 && selectedIndex_ < (NSInteger)rows_.count) {
+    rows_[selectedIndex_].selected = NO;
+  }
+  selectedIndex_ = index;
+  BroTabSearchRow* row = rows_[index];
+  row.selected = YES;
+  [listView_ scrollRectToVisible:NSInsetRect(row.frame, 0, -4.0)];
+}
+
+- (void)moveSelectionBy:(NSInteger)delta {
+  NSInteger count = (NSInteger)rows_.count;
+  if (count == 0) {
+    return;
+  }
+  NSInteger next =
+      selectedIndex_ < 0 ? 0 : (selectedIndex_ + delta + count) % count;
+  [self selectRowAtIndex:next];
+}
+
+- (void)rowClicked:(BroTabSearchRow*)row {
+  [self activateRow:row];
+}
+
+- (void)activateRow:(BroTabSearchRow*)row {
+  if (row.closedEntry) {
+    BroClosedTabEntry* entry = row.closedEntry;
+    // Reopening consumes the history entry, mirroring ⇧⌘T.
+    [g_closed_tabs removeObject:entry];
+    if (entry.url.length > 0) {
+      CreateNewBrowserTabWithURL(std::string([entry.url UTF8String]));
+    }
+  } else {
+    BroHandler* handler = BroHandler::GetInstance();
+    if (handler) {
+      handler->SetActiveBrowser(row.browserId);
+    }
+  }
+  // Explicit hide: activating the already-active tab fires no tab-change
+  // callback, so nothing else would dismiss the panel.
+  HideTabSearchPanel();
+}
+
+- (void)controlTextDidChange:(NSNotification*)notification {
+  [self reloadWithFilter:searchField_.stringValue];
+}
+
+- (BOOL)control:(NSControl*)control
+               textView:(NSTextView*)textView
+    doCommandBySelector:(SEL)commandSelector {
+  if (commandSelector == @selector(moveUp:)) {
+    [self moveSelectionBy:-1];
+    return YES;
+  }
+  if (commandSelector == @selector(moveDown:)) {
+    [self moveSelectionBy:1];
+    return YES;
+  }
+  if (commandSelector == @selector(insertNewline:)) {
+    if (selectedIndex_ >= 0 && selectedIndex_ < (NSInteger)rows_.count) {
+      [self activateRow:rows_[selectedIndex_]];
+    }
+    return YES;
+  }
+  if (commandSelector == @selector(cancelOperation:)) {
+    HideTabSearchPanel();
+    return YES;
+  }
+  return NO;
+}
+
+@end
+
+static BroTabSearchPanel* g_tab_search_panel = nil;
+// Local mouse-down monitor while the panel shows; sees clicks headed for the
+// native CEF views (which never bubble through the AppKit responder chain)
+// so an outside click anywhere in the window dismisses.
+static id g_tab_search_click_monitor = nil;
+
+static BOOL TabSearchPanelVisible(void) {
+  return g_tab_search_panel && g_tab_search_panel.superview &&
+         !g_tab_search_panel.hidden;
+}
+
+static void HideTabSearchPanel(void) {
+  if (g_tab_search_click_monitor) {
+    [NSEvent removeMonitor:g_tab_search_click_monitor];
+    g_tab_search_click_monitor = nil;
+  }
+  if (!TabSearchPanelVisible()) {
+    return;
+  }
+  [g_tab_search_panel restoreFocusIfNeeded];
+  g_tab_search_panel.hidden = YES;
+}
+
+static void ShowTabSearchPanel(void) {
+  NSView* container = BroBrowserContainerView();
+  if (!container) {
+    return;
+  }
+  if (!g_tab_search_panel) {
+    g_tab_search_panel = [[BroTabSearchPanel alloc] initWithFrame:NSZeroRect];
+  }
+  // Re-add last on every show so it composites above the CEF views (see
+  // showHoverCardForTab:).
+  [g_tab_search_panel removeFromSuperview];
+  [container addSubview:g_tab_search_panel];
+  [g_tab_search_panel prepareForDisplay];
+  g_tab_search_panel.hidden = NO;
+  [g_tab_search_panel focusSearchField];
+
+  if (!g_tab_search_click_monitor) {
+    g_tab_search_click_monitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown |
+                                             NSEventMaskRightMouseDown
+                                     handler:^NSEvent*(NSEvent* event) {
+          if (!TabSearchPanelVisible() ||
+              event.window != g_tab_search_panel.window) {
+            return event;
+          }
+          NSPoint inPanel =
+              [g_tab_search_panel convertPoint:event.locationInWindow
+                                      fromView:nil];
+          if (NSPointInRect(inPanel, g_tab_search_panel.bounds)) {
+            return event;
+          }
+          // Let the chevron's own click through: its action toggles, and
+          // hiding here first would make the toggle immediately reopen.
+          BroHoverButton* chevron = g_tab_bar.tabSearchButton;
+          if (chevron && !chevron.hiddenOrHasHiddenAncestor) {
+            NSPoint inChevron = [chevron convertPoint:event.locationInWindow
+                                             fromView:nil];
+            if (NSPointInRect(inChevron, chevron.bounds)) {
+              return event;
+            }
+          }
+          HideTabSearchPanel();
+          return event;
+        }];
+  }
+}
+
+static void ToggleTabSearchPanel(void) {
+  if (TabSearchPanelVisible()) {
+    HideTabSearchPanel();
+  } else {
+    ShowTabSearchPanel();
+  }
+}
+
 #pragma mark - BroTabBar
 
 @implementation BroTabBar {
@@ -1613,6 +2696,25 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _addTabButton.accessibilityLabel = @"New tab";
     _addTabButton.toolTip = @"New tab (⌘N)";
     [self addSubview:_addTabButton];
+
+    // Tab search chevron, pinned at the strip's right edge (the "+" button
+    // trails the last pill; this one never moves).
+    _tabSearchButton = [[BroHoverButton alloc]
+        initWithFrame:NSMakeRect(frame.size.width - kAddTabButtonSize, addY,
+                                 kAddTabButtonSize, kAddTabButtonSize)];
+    _tabSearchButton.bordered = NO;
+    _tabSearchButton.title = @"";
+    _tabSearchButton.image = RadixIconImage(RadixIconChevronDown, 10);
+    _tabSearchButton.imagePosition = NSImageOnly;
+    _tabSearchButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    _tabSearchButton.layer.cornerRadius = 4.0;
+    _tabSearchButton.baseBorderWidth = 1.0;
+    _tabSearchButton.baseBorderColor = BroControlBorderColor();
+    _tabSearchButton.target = self;
+    _tabSearchButton.action = @selector(toggleTabSearch:);
+    _tabSearchButton.accessibilityLabel = @"Search tabs";
+    _tabSearchButton.toolTip = @"Search tabs (⇧⌘A)";
+    [self addSubview:_tabSearchButton];
   }
   return self;
 }
@@ -1633,6 +2735,10 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 - (void)createNewTab:(id)sender {
   CreateNewBrowserTab();
+}
+
+- (void)toggleTabSearch:(id)sender {
+  ToggleTabSearchPanel();
 }
 
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title {
@@ -1964,7 +3070,9 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 }
 
 - (CGFloat)availableStripWidth {
-  return self.frame.size.width - (kAddTabButtonSize + 8.0);
+  // The right edge reserves the trailing "+" button and the pinned tab
+  // search chevron.
+  return self.frame.size.width - 2.0 * (kAddTabButtonSize + 8.0);
 }
 
 // Pinned pills are kept as a strict prefix of _tabs; every layout and drag
@@ -2093,6 +3201,12 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   } else {
     _addTabButton.frame = addTarget;
   }
+
+  // The chevron never trails the pills; it stays pinned at the right edge.
+  _tabSearchButton.frame =
+      NSMakeRect(self.frame.size.width - kAddTabButtonSize,
+                 (self.frame.size.height - kAddTabButtonSize) / 2.0,
+                 kAddTabButtonSize, kAddTabButtonSize);
 }
 
 - (void)layoutTabs {
@@ -2104,6 +3218,8 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   [self layoutTabs];
   // A resize invalidates the card's position; hiding beats tracking it.
   [self hideHoverCard];
+  // Same for the tab search panel, which anchors to the chevron.
+  HideTabSearchPanel();
 }
 
 - (void)tabSelected:(BroTabView*)tab {
@@ -2457,8 +3573,8 @@ static NSView* BroBrowserContainerView(void) {
                             backing:NSBackingStoreBuffered
                               defer:NO];
   if (self) {
-    // Glassy near-black chrome: a behind-window blur tinted dark, so the
-    // desktop shows through the chrome as frosted glass. The transparent
+    // Solid #000 chrome. The window itself stays non-opaque with a clear
+    // background only so the rounded corners composite cleanly; the transparent
     // titlebar keeps the traffic lights floating inline with the toolbar row.
     self.titlebarAppearsTransparent = YES;
     self.titleVisibility = NSWindowTitleHidden;
@@ -2480,15 +3596,13 @@ static NSView* BroBrowserContainerView(void) {
     content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.contentView = content;
 
-    // Black tint over the blur: dark enough to read as black glass, light
-    // enough that the desktop clearly glows through the whole window.
+    // Opaque black backdrop: every surface — chrome and browser area alike —
+    // sits on pure #000.
     NSView* tint = [[NSView alloc] initWithFrame:frame];
     tint.wantsLayer = YES;
-    tint.layer.backgroundColor =
-        [[NSColor blackColor] colorWithAlphaComponent:kGlassTintAlpha].CGColor;
+    tint.layer.backgroundColor = [NSColor blackColor].CGColor;
     tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:tint];
-    g_glass_tint_view = tint;
 
     // Single chrome row at the very top; its content is inset past the
     // traffic lights.
@@ -2501,7 +3615,7 @@ static NSView* BroBrowserContainerView(void) {
     // right-aligned viewport toggles.
     CGFloat stripX = kTrafficLightInset + 3 * (kButtonSize + kButtonSpacing) + 8.0;
     CGFloat stripRight = frame.size.width - 12.0 - kButtonSize - kButtonSpacing -
-                         kButtonSize - 16.0;
+                         kButtonSize - kButtonSpacing - 8.0 - kButtonSize - 16.0;
     _tabBar = [[BroTabBar alloc]
         initWithFrame:NSMakeRect(stripX, 0, stripRight - stripX, kToolbarHeight)];
     [_navToolbar addSubview:_tabBar];
@@ -2517,8 +3631,7 @@ static NSView* BroBrowserContainerView(void) {
     BroWindowBorderView* border = [[BroWindowBorderView alloc] initWithFrame:frame];
     border.wantsLayer = YES;
     border.layer.borderWidth = 1.0;
-    border.layer.borderColor =
-        [[NSColor whiteColor] colorWithAlphaComponent:kWindowBorderAlpha].CGColor;
+    border.layer.borderColor = BroControlBorderColor().CGColor;
     border.layer.cornerRadius = BroWindowCornerRadius(self);
     border.layer.cornerCurve = kCACornerCurveContinuous;
     border.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -2528,7 +3641,7 @@ static NSView* BroBrowserContainerView(void) {
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
     g_blank_tab_ids = [NSMutableSet set];
-    g_closed_tab_urls = [NSMutableArray array];
+    g_closed_tabs = [NSMutableArray array];
 
     // Keep the Tab-key loop current as pills and buttons come and go.
     self.autorecalculatesKeyViewLoop = YES;
@@ -2802,9 +3915,8 @@ static NSView* CreateTabContainerView(void) {
 static BOOL g_window_occluded = NO;
 
 // Central visibility rule: only the active tab's container is visible, and
-// not even that one while the tab is blank (glass new-tab state). The window
-// tint follows the same rule: frosted glass on blank tabs, opaque black chrome
-// once the active tab shows a real page. Hiding the container NSView is not
+// not even that one while the tab is blank (the black window backdrop is the
+// new-tab state). Hiding the container NSView is not
 // enough for Chromium's occlusion tracking in windowed CEF (measured:
 // background tabs kept rendering rAF at ~45fps and timers at ~4.5Hz), so
 // hidden containers are detached from the window entirely —
@@ -2843,12 +3955,6 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
       handler->SetBrowserHidden(key.intValue, detached);
     }
   }
-  BOOL glass = g_browser_views[@(active_browser_id)] == nil ||
-               [g_blank_tab_ids containsObject:@(active_browser_id)];
-  g_glass_tint_view.layer.backgroundColor =
-      [[NSColor blackColor]
-          colorWithAlphaComponent:glass ? kGlassTintAlpha : 1.0]
-          .CGColor;
   UpdateSplitDivider();
 }
 
@@ -3161,6 +4267,152 @@ static void ShowZoomHUD(int percent) {
               }
             }];
       }];
+}
+
+#pragma mark - Downloads popover wiring
+
+static BroDownloadsPopover* g_downloads_popover = nil;
+// Installed while the popover is visible; both are removed on hide (a leaked
+// monitor would keep re-hiding on every later click).
+static id g_downloads_click_monitor = nil;
+static id g_downloads_key_monitor = nil;
+
+static BOOL BroDownloadsPopoverVisible(void) {
+  return g_downloads_popover && !g_downloads_popover.hidden &&
+         g_downloads_popover.superview != nil;
+}
+
+static void BroPositionDownloadsPopover(void) {
+  NSView* container = BroBrowserContainerView();
+  if (!container || !g_downloads_popover) {
+    return;
+  }
+  NSRect bounds = container.bounds;
+  CGFloat w = NSWidth(g_downloads_popover.frame);
+  CGFloat h = NSHeight(g_downloads_popover.frame);
+  // Right edge under the downloads button, clamped inside the container.
+  CGFloat x = NSMaxX(bounds) - w - 8.0;
+  NSView* anchor = g_toolbar.downloadsButton;
+  if (anchor) {
+    NSRect a = [container convertRect:anchor.bounds fromView:anchor];
+    x = MAX(8.0, MIN(NSMaxX(a) - w, NSMaxX(bounds) - w - 8.0));
+  }
+  g_downloads_popover.frame =
+      NSMakeRect(x, NSMaxY(bounds) - h - 6.0, w, h);
+}
+
+static void BroRemoveDownloadsMonitors(void) {
+  if (g_downloads_click_monitor) {
+    [NSEvent removeMonitor:g_downloads_click_monitor];
+    g_downloads_click_monitor = nil;
+  }
+  if (g_downloads_key_monitor) {
+    [NSEvent removeMonitor:g_downloads_key_monitor];
+    g_downloads_key_monitor = nil;
+  }
+}
+
+static void BroHideDownloadsPopover(void) {
+  BroRemoveDownloadsMonitors();
+  g_downloads_popover.hidden = YES;
+}
+
+static void BroShowDownloadsPopover(void) {
+  NSView* container = BroBrowserContainerView();
+  if (!container) {
+    return;
+  }
+  if (!g_downloads_popover) {
+    g_downloads_popover =
+        [[BroDownloadsPopover alloc] initWithFrame:NSZeroRect];
+    // Tracks the top-right corner across window resizes.
+    g_downloads_popover.autoresizingMask =
+        NSViewMinXMargin | NSViewMinYMargin;
+  }
+  // (Re-)add last so the panel composites above the native CEF browser view.
+  [g_downloads_popover removeFromSuperview];
+  [container addSubview:g_downloads_popover];
+  [g_downloads_popover reloadWithMaxHeight:NSHeight(container.bounds) - 12.0];
+  BroPositionDownloadsPopover();
+  g_downloads_popover.hidden = NO;
+
+  if (!g_downloads_click_monitor) {
+    g_downloads_click_monitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown |
+                                              NSEventMaskRightMouseDown |
+                                              NSEventMaskOtherMouseDown)
+                                     handler:^NSEvent*(NSEvent* event) {
+      if (event.window != g_downloads_popover.window) {
+        BroHideDownloadsPopover();
+        return event;
+      }
+      NSPoint inPopover = [g_downloads_popover convertPoint:event.locationInWindow
+                                                   fromView:nil];
+      if (NSPointInRect(inPopover, g_downloads_popover.bounds)) {
+        return event;
+      }
+      // Let the downloads button's own action do the toggle-off, otherwise
+      // hide-then-toggle would re-show the panel on the same click.
+      BroHoverButton* button = g_toolbar.downloadsButton;
+      if (button && !button.hidden) {
+        NSPoint inButton = [button convertPoint:event.locationInWindow
+                                       fromView:nil];
+        if (NSPointInRect(inButton, button.bounds)) {
+          return event;
+        }
+      }
+      BroHideDownloadsPopover();
+      return event;  // The click still lands wherever it was aimed.
+    }];
+  }
+  if (!g_downloads_key_monitor) {
+    g_downloads_key_monitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                     handler:^NSEvent*(NSEvent* event) {
+      if (event.keyCode == 53) {  // Esc
+        BroHideDownloadsPopover();
+        return nil;
+      }
+      return event;
+    }];
+  }
+}
+
+static void BroToggleDownloadsPopover(void) {
+  if (BroDownloadsPopoverVisible()) {
+    BroHideDownloadsPopover();
+  } else {
+    BroShowDownloadsPopover();
+  }
+}
+
+static void BroRefreshDownloadsPopover(void) {
+  if (!BroDownloadsPopoverVisible()) {
+    return;
+  }
+  NSView* container = BroBrowserContainerView();
+  CGFloat maxHeight =
+      container ? NSHeight(container.bounds) - 12.0 : CGFLOAT_MAX;
+  [g_downloads_popover reloadWithMaxHeight:maxHeight];
+  BroPositionDownloadsPopover();
+}
+
+// Brief dip-and-restore of the button's opacity when a download starts or
+// finishes; enough of a nudge without stealing the pointer like an auto-shown
+// panel would.
+static void BroPulseDownloadsButton(void) {
+  BroHoverButton* button = g_toolbar.downloadsButton;
+  if (!button) {
+    return;
+  }
+  if ([NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
+    return;
+  }
+  button.alphaValue = 0.25;
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = 0.5;
+    button.animator.alphaValue = 1.0;
+  }];
 }
 
 static void CreateNewBrowserTabWithURL(const std::string& url) {
@@ -3519,6 +4771,11 @@ static void CreateNewBrowserTab(void) {
   [windowMenu addItemWithTitle:@"Split Screen"
                         action:@selector(toggleSplitScreen:)
                  keyEquivalent:@""];
+  NSMenuItem* tabSearchItem = [windowMenu addItemWithTitle:@"Search Tabs…"
+                                                    action:@selector(showTabSearch:)
+                                             keyEquivalent:@"a"];
+  tabSearchItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
 
   // Cmd+1..8 jump to that tab; Cmd+9 jumps to the last tab (tag -1).
   [windowMenu addItem:[NSMenuItem separatorItem]];
@@ -3663,12 +4920,12 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)reopenClosedTab:(id)sender {
-  NSString* url = g_closed_tab_urls.lastObject;
-  if (!url) {
+  BroClosedTabEntry* entry = g_closed_tabs.lastObject;
+  if (!entry || entry.url.length == 0) {
     return;
   }
-  [g_closed_tab_urls removeLastObject];
-  CreateNewBrowserTabWithURL(std::string([url UTF8String]));
+  [g_closed_tabs removeLastObject];
+  CreateNewBrowserTabWithURL(std::string([entry.url UTF8String]));
 }
 
 // Menu item tag is the tab index (0-based); tag -1 means the last tab.
@@ -3713,6 +4970,10 @@ static void CreateNewBrowserTab(void) {
   [g_tab_bar splitActiveTabWithNextTab];
 }
 
+- (void)showTabSearch:(id)sender {
+  ToggleTabSearchPanel();
+}
+
 // The delegate is the responder-chain target for every no-target menu item,
 // so the default branch must stay YES to keep the rest auto-enabled.
 - (BOOL)validateMenuItem:(NSMenuItem*)menuItem {
@@ -3737,7 +4998,7 @@ static void CreateNewBrowserTab(void) {
     return g_tab_bar && g_tab_bar.tabs.count > 1;
   }
   if (action == @selector(reopenClosedTab:)) {
-    return g_closed_tab_urls.count > 0;
+    return g_closed_tabs.count > 0;
   }
   if (action == @selector(togglePinActiveTab:)) {
     BroTabView* active = nil;
@@ -3841,6 +5102,11 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)windowWillClose:(NSNotification*)notification {
+  HideTabSearchPanel();
+  // The retained panel belongs to the dying window's view tree; rebuild it
+  // fresh for any future window.
+  [g_tab_search_panel removeFromSuperview];
+  g_tab_search_panel = nil;
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
@@ -3849,7 +5115,7 @@ static void CreateNewBrowserTab(void) {
   g_split_divider = nil;
   [g_browser_views removeAllObjects];
   [g_blank_tab_ids removeAllObjects];
-  [g_closed_tab_urls removeAllObjects];
+  [g_closed_tabs removeAllObjects];
 }
 
 // Miniaturized or fully covered windows report as non-visible; treat every
@@ -3935,6 +5201,197 @@ void SetLoading(bool loading) {
   (void)loading;
 }
 
+#pragma mark - Downloads model
+
+static NSMutableArray<BroDownloadEntry*>* BroDownloadsList(void) {
+  static NSMutableArray<BroDownloadEntry*>* list = nil;
+  if (!list) {
+    list = [NSMutableArray array];
+    NSArray* saved = [[NSUserDefaults standardUserDefaults]
+        arrayForKey:kBroRecentDownloadsKey];
+    for (NSDictionary* dict in saved) {
+      if (![dict isKindOfClass:[NSDictionary class]]) {
+        continue;
+      }
+      NSString* name = dict[@"name"];
+      NSString* path = dict[@"path"];
+      if (![name isKindOfClass:[NSString class]] || name.length == 0 ||
+          ![path isKindOfClass:[NSString class]]) {
+        continue;
+      }
+      BroDownloadEntry* entry = [[BroDownloadEntry alloc] init];
+      entry.name = name;
+      entry.path = path;
+      entry.state = BroDownloadStateComplete;
+      [list addObject:entry];
+      if (list.count >= kMaxRecentDownloads) {
+        break;
+      }
+    }
+  }
+  return list;
+}
+
+// Persists completed entries only: in-progress rows would be stale after a
+// relaunch and failed ones aren't worth keeping.
+static void BroSaveRecentDownloads(void) {
+  NSMutableArray<NSDictionary*>* saved = [NSMutableArray array];
+  for (BroDownloadEntry* entry in BroDownloadsList()) {
+    if (entry.state != BroDownloadStateComplete) {
+      continue;
+    }
+    [saved addObject:@{@"name" : entry.name ?: @"", @"path" : entry.path ?: @""}];
+    if (saved.count >= kMaxRecentDownloads) {
+      break;
+    }
+  }
+  [[NSUserDefaults standardUserDefaults] setObject:saved
+                                            forKey:kBroRecentDownloadsKey];
+}
+
+static BroDownloadEntry* BroDownloadEntryForId(uint32_t download_id) {
+  if (download_id == 0) {
+    return nil;
+  }
+  for (BroDownloadEntry* entry in BroDownloadsList()) {
+    if (entry.downloadId == download_id) {
+      return entry;
+    }
+  }
+  return nil;
+}
+
+// Caps settled (complete/failed) entries at kMaxRecentDownloads, oldest out;
+// in-progress entries are never dropped.
+static void BroTrimDownloadsList(void) {
+  NSMutableArray<BroDownloadEntry*>* list = BroDownloadsList();
+  NSUInteger settled = 0;
+  for (NSUInteger i = 0; i < list.count;) {
+    if (list[i].state == BroDownloadStateInProgress) {
+      i++;
+      continue;
+    }
+    if (++settled > kMaxRecentDownloads) {
+      [list removeObjectAtIndex:i];
+    } else {
+      i++;
+    }
+  }
+}
+
+std::string ResolveDownloadTargetPath(const std::string& suggested_name) {
+  // Called on the main thread from OnBeforeDownload, so the list is safe to
+  // read. lastPathComponent defends against separators in a server-supplied
+  // filename.
+  NSString* suggested =
+      [NSString stringWithUTF8String:suggested_name.c_str()] ?: @"download";
+  NSString* name = suggested.lastPathComponent;
+  if (name.length == 0 || [name isEqualToString:@"/"]) {
+    name = @"download";
+  }
+  NSString* dir = NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory,
+                                                      NSUserDomainMask, YES)
+                      .firstObject
+      ?: NSTemporaryDirectory();
+  NSString* base = name.stringByDeletingPathExtension;
+  NSString* ext = name.pathExtension;
+  NSFileManager* fm = [NSFileManager defaultManager];
+  for (NSUInteger n = 0;; n++) {
+    NSString* candidateName;
+    if (n == 0) {
+      candidateName = name;
+    } else if (ext.length > 0) {
+      candidateName =
+          [NSString stringWithFormat:@"%@ (%lu).%@", base, (unsigned long)n, ext];
+    } else {
+      candidateName = [NSString stringWithFormat:@"%@ (%lu)", base, (unsigned long)n];
+    }
+    NSString* candidate = [dir stringByAppendingPathComponent:candidateName];
+    BOOL taken = [fm fileExistsAtPath:candidate];
+    if (!taken) {
+      // Two simultaneous downloads of the same name: the first file may not
+      // exist on disk yet, but its target is already claimed.
+      for (BroDownloadEntry* entry in BroDownloadsList()) {
+        if (entry.state == BroDownloadStateInProgress &&
+            [entry.path isEqualToString:candidate]) {
+          taken = YES;
+          break;
+        }
+      }
+    }
+    if (!taken) {
+      return std::string(candidate.UTF8String);
+    }
+  }
+}
+
+void OnDownloadStarted(uint32_t download_id,
+                       const std::string& file_name,
+                       const std::string& full_path) {
+  NSString* name = [NSString stringWithUTF8String:file_name.c_str()] ?: @"download";
+  NSString* path = [NSString stringWithUTF8String:full_path.c_str()] ?: @"";
+  BroRunOnMain(^{
+    BroDownloadEntry* entry = BroDownloadEntryForId(download_id);
+    if (!entry) {
+      entry = [[BroDownloadEntry alloc] init];
+      entry.downloadId = download_id;
+      [BroDownloadsList() insertObject:entry atIndex:0];
+    }
+    entry.name = name;
+    entry.path = path;
+    entry.receivedBytes = 0;
+    entry.totalBytes = -1;
+    entry.state = BroDownloadStateInProgress;
+    BroTrimDownloadsList();
+    BroRefreshDownloadsPopover();
+    BroPulseDownloadsButton();
+  });
+}
+
+void OnDownloadProgress(uint32_t download_id,
+                        int64_t received_bytes,
+                        int64_t total_bytes) {
+  BroRunOnMain(^{
+    BroDownloadEntry* entry = BroDownloadEntryForId(download_id);
+    if (!entry || entry.state != BroDownloadStateInProgress) {
+      return;
+    }
+    entry.receivedBytes = received_bytes;
+    entry.totalBytes = total_bytes;
+    // OnDownloadUpdated can fire many times per second; the model stays
+    // current above but the popover repaints at most ~10 Hz.
+    static CFTimeInterval lastRender = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastRender < 0.1) {
+      return;
+    }
+    lastRender = now;
+    BroRefreshDownloadsPopover();
+  });
+}
+
+void OnDownloadFinished(uint32_t download_id,
+                        const std::string& full_path,
+                        bool success) {
+  NSString* path = [NSString stringWithUTF8String:full_path.c_str()] ?: @"";
+  BroRunOnMain(^{
+    BroDownloadEntry* entry = BroDownloadEntryForId(download_id);
+    if (!entry) {
+      return;
+    }
+    entry.state = success ? BroDownloadStateComplete : BroDownloadStateFailed;
+    if (path.length > 0) {
+      // Canonical final path: Chromium downloads via .crdownload and renames.
+      entry.path = path;
+      entry.name = path.lastPathComponent;
+    }
+    BroTrimDownloadsList();
+    BroSaveRecentDownloads();
+    BroRefreshDownloadsPopover();
+    BroPulseDownloadsButton();
+  });
+}
+
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   // Called on the CEF UI thread, which is the main thread here, so AppKit
   // access and synchronous adoption are safe (a deferred handoff through a
@@ -3961,7 +5418,7 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   }
 
   // New browsers usually arrive before their first commit (empty URL), so
-  // they start as glass and unhide when a real URL commits.
+  // they start blank and unhide when a real URL commits.
   NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
   if (BroURLIsBlank(urlStr)) {
     [g_blank_tab_ids addObject:@(browser_id)];
@@ -3995,6 +5452,14 @@ void DetachTabView(int browser_id) {
     }
     NSView* containerView = g_browser_views[@(browser_id)];
     if (containerView) {
+      // Blank and background tabs are already detached (render throttling),
+      // so removing them again is a no-op and CEF never sees the
+      // window-detach transition this close is waiting on. Cycle through an
+      // attached state to generate it.
+      if (!containerView.superview && g_main_window.browserContainer) {
+        containerView.hidden = YES;
+        [g_main_window.browserContainer addSubview:containerView];
+      }
       [containerView removeFromSuperview];
       [g_browser_views removeObjectForKey:@(browser_id)];
     }
@@ -4055,7 +5520,8 @@ void OnTabURLChanged(int browser_id, const std::string& url) {
     }
 
     // Commit-time blank/loaded transition: unhide the CEF view for real
-    // pages, return to glass when the tab navigates back to about:blank.
+    // pages, return to the blank state when the tab navigates back to
+    // about:blank.
     if (BroURLIsBlank(urlStr)) {
       [g_blank_tab_ids addObject:@(browser_id)];
     } else {
@@ -4088,16 +5554,25 @@ void OnTabLoadingChanged(int browser_id, bool is_loading) {
 
 void OnTabClosed(int browser_id) {
   dispatch_async(dispatch_get_main_queue(), ^{
+    // The panel's open-tab rows are now stale; it also self-hides after
+    // reopening a closed tab (which lands here for the departing tab's id
+    // only on real closes, not reopens — either way hiding is safe).
+    HideTabSearchPanel();
     // Remove from tab bar
     if (g_tab_bar) {
-      // Record the URL for Reopen Closed Tab while the pill still exists.
-      // Blank/new-tab pages aren't worth reopening.
+      // Record the tab for Reopen Closed Tab and the tab search panel's
+      // "Recently Closed" section while the pill still exists. Blank/new-tab
+      // pages aren't worth reopening.
       for (BroTabView* tab in g_tab_bar.tabs) {
         if (tab.browserId == browser_id) {
           if (tab.tabURL.length > 0 && !BroURLIsBlank(tab.tabURL)) {
-            [g_closed_tab_urls addObject:tab.tabURL];
-            if (g_closed_tab_urls.count > kMaxClosedTabHistory) {
-              [g_closed_tab_urls removeObjectAtIndex:0];
+            BroClosedTabEntry* entry = [[BroClosedTabEntry alloc] init];
+            entry.url = tab.tabURL;
+            entry.title = tab.pageTitle;
+            entry.faviconURL = tab.faviconURL;
+            [g_closed_tabs addObject:entry];
+            if (g_closed_tabs.count > kMaxClosedTabHistory) {
+              [g_closed_tabs removeObjectAtIndex:0];
             }
           }
           break;
@@ -4129,6 +5604,10 @@ void OnTabClosed(int browser_id) {
 
 void OnActiveTabChanged(int browser_id) {
   BroRunOnMain(^{
+    // Any tab switch dismisses the panel: switches from inside it hide
+    // explicitly too (idempotent), and outside ones (⌘1-9, Ctrl+Tab) would
+    // otherwise leave it floating over the new page.
+    HideTabSearchPanel();
     // Selecting the right pane swaps panes instead of ending the split: the
     // outgoing active tab takes the right slot and the clicked tab becomes
     // the active/left one, so the address bar and shortcuts follow it.
@@ -4240,7 +5719,8 @@ int main(int argc, char* argv[]) {
     settings.persist_session_cookies = true;
 
     // Pure black pre-load background (matches the per-browser settings) so
-    // popups and navigations never flash a lighter rectangle over the glass.
+    // popups and navigations never flash a lighter rectangle over the black
+    // chrome.
     settings.background_color = CefColorSetARGB(255, 0, 0, 0);
 
     // BroApp implements application-level callbacks for the browser process.
