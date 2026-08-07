@@ -6,6 +6,8 @@
 #define BRO_HANDLER_H_
 
 #include "include/cef_client.h"
+#include "include/cef_devtools_message_observer.h"
+#include "include/cef_registration.h"
 
 #include <list>
 #include <map>
@@ -20,6 +22,9 @@ void SetLoading(bool loading);
 // Returns false for browsers hosted elsewhere (e.g. DevTools).
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view);
 void OnTabTitleChanged(int browser_id, const std::string& title);
+// Delivers the page's <meta name=description> content (possibly empty) in
+// response to FetchTabDescription.
+void OnTabDescriptionAvailable(int browser_id, const std::string& description);
 void OnTabURLChanged(int browser_id, const std::string& url);
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url);
 void OnTabClosed(int browser_id);
@@ -41,7 +46,8 @@ class BroHandler : public CefClient,
                    public CefDisplayHandler,
                    public CefLifeSpanHandler,
                    public CefLoadHandler,
-                   public CefContextMenuHandler {
+                   public CefContextMenuHandler,
+                   public CefDevToolsMessageObserver {
  public:
   explicit BroHandler(bool is_alloy_style);
   ~BroHandler();
@@ -76,6 +82,12 @@ class BroHandler : public CefClient,
     return mobile_tab_ids_.count(browser_id) > 0;
   }
 
+  // Asynchronously fetches the tab's <meta name=description> via the DevTools
+  // protocol; the result arrives through OnTabDescriptionAvailable.
+  // Best-effort: silently does nothing if the browser is gone, and never
+  // assumes the DevTools result callback fires.
+  void FetchTabDescription(int browser_id);
+
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
@@ -90,6 +102,13 @@ class BroHandler : public CefClient,
                        const CefString& url) override;
   void OnFaviconURLChange(CefRefPtr<CefBrowser> browser,
                           const std::vector<CefString>& icon_urls) override;
+
+  // CefDevToolsMessageObserver methods:
+  void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
+                              int message_id,
+                              bool success,
+                              const void* result,
+                              size_t result_size) override;
 
   // CefLifeSpanHandler methods:
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
@@ -159,6 +178,12 @@ class BroHandler : public CefClient,
 
   // Tabs with mobile device emulation active.
   std::set<int> mobile_tab_ids_;
+
+  // Per-browser DevTools observer registrations (alive until the browser
+  // closes) and the message id of each browser's in-flight meta-description
+  // request.
+  std::map<int, CefRefPtr<CefRegistration>> devtools_registrations_;
+  std::map<int, int> pending_description_requests_;
 
   // List of existing browser windows.
   typedef std::list<CefRefPtr<CefBrowser>> BrowserList;
