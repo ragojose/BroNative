@@ -6,7 +6,7 @@ Bro Computer strips browsing down to what matters: the page. One quiet row of ch
 
 ## Download
 
-Download the latest DMG from the [**latest release**](../../releases/latest) — it is rebuilt automatically on every commit to `main`.
+Download the latest DMG from the [**latest release**](../../releases/latest) — it is rebuilt automatically on every commit to `main`. That page always leads with the current build; the older DMGs listed alongside it are kept so the updater can patch from them.
 
 > **First launch:** builds are ad-hoc signed (not notarized), so macOS will warn you.
 > Right-click `Bro Computer.app` → **Open** → **Open** the first time. After that it opens normally.
@@ -17,7 +17,8 @@ Requires macOS 12.0+ on Apple Silicon.
 
 Bro Computer updates itself. It checks once a day while running, and you can ask
 it to look now with **Bro Computer → Check for Updates…**. Updates install in
-place, so you only download the DMG once.
+place, so you only download the full DMG once — after that you get a patch
+against the build you already have, not another 158 MB.
 
 > The menu item is greyed out until the maintainer sets up signing keys — see
 > [Enabling updates](#enabling-updates-maintainer-one-time) at the end. Builds

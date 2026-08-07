@@ -41,8 +41,10 @@
 	     Sparkle's generate_keys, paste the printed public key here, and add the
 	     private key as the SPARKLE_PRIVATE_KEY repository secret. Until then the
 	     app skips the updater entirely (see BroStartUpdater). -->
+	<!-- The `updates` release hosts the feed, every DMG, and every delta. This
+	     URL is baked into shipped apps and can never change. -->
 	<key>SUFeedURL</key>
-	<string>https://github.com/ragojose/BroNative/releases/download/appcast/appcast.xml</string>
+	<string>https://github.com/ragojose/BroNative/releases/download/updates/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>REPLACE_WITH_SPARKLE_PUBLIC_KEY</string>
 	<key>SUEnableAutomaticChecks</key>

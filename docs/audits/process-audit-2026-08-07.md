@@ -10,8 +10,7 @@ Walks were run in throwaway clones under a scratch dir. Nothing ran against the 
 
 ## Resolution status
 
-Eight of nine fixed on this branch (commits `81c7be3`, `b085a3e`, `32d103f`), each
-verified by re-running the walk that found it.
+All nine fixed on this branch, each verified by re-running the walk that found it.
 
 | ID | State | Verified by |
 |----|-------|-------------|
@@ -19,20 +18,30 @@ verified by re-running the walk that found it.
 | P2 | Fixed | `cmake_minimum_required` now 3.24; README matches |
 | P3 | Fixed | Placeholder+no-secret → warn/exit 0; real key+no-secret → error/exit 1; both reproduced |
 | P4 | Fixed | Assert tested at build 31/30/1 against published 30 → pass/pass/fail |
-| P5 | **Open** | Needs a decision — see below |
+| P5 | Fixed | Deltas via `generate_appcast` on one additive channel release; publish step exercised against a stateful fake release |
 | P6 | Fixed | Section moved after the build steps, ordering made explicit |
 | P7 | Fixed | `DOWNLOAD_EXTRACT_TIMESTAMP FALSE` |
 | P8 | Fixed | Version block isolated and run outside a checkout → warning fires, build 0 |
 | P9 | Fixed | `cancel-in-progress` now false on main only |
 
-**P5 remains open by design.** Fixing it changes the release architecture, and the
-blocker is concrete: `generate_appcast` emits a single `--download-url-prefix` for
-every full archive *and* every delta, which cannot address assets spread across
-per-version releases. Deltas therefore require either (a) hosting all DMGs and
-deltas on one additive release, giving up per-version release pages, or (b) keeping
-per-version releases and post-processing the generated XML to rewrite full-archive
-URLs — string surgery on generated output. Both are real changes to how releases
-are laid out, so this is the maintainer's call, not a cleanup.
+**P5 was resolved by changing the release layout** (maintainer chose option (a)).
+`generate_appcast` emits one `--download-url-prefix` covering full archives and
+deltas alike, so they must share a host — per-version releases could not work.
+Releases are now a single additive `updates` release holding every DMG, every
+delta, and the appcast. Assets are added or replaced, never renamed, so a URL
+Sparkle published stays valid. A bounded window of 4 DMGs is retained (enough to
+source 2 deltas); older ones are pruned along with their deltas.
+
+Two bugs were caught while building this, both by the harness rather than by
+reading: under `set -euo pipefail`, a `grep` that legitimately matched nothing
+(empty channel on first run, no stale deltas during pruning) aborted the whole
+step. The asset-listing pipeline was duplicated, which is why the same landmine
+was written twice; it is now one `list_dmgs` helper.
+
+**Still unverified end-to-end:** delta *generation* itself. The publish step's
+orchestration is tested against a stubbed `generate_appcast`; producing and
+applying a real delta needs the signing key, which does not exist yet. First real
+build after the key lands should be checked for `.delta` assets on the release.
 
 ---
 
