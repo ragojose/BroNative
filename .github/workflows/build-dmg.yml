@@ -14,7 +14,10 @@ permissions:
 
 concurrency:
   group: build-dmg-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR builds are worth cancelling. Main builds are not: cancelling
+  # one mid-publish can leave a release created but never referenced by the
+  # appcast, and the next run cannot clean it up.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CEF_VERSION: cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal
@@ -70,6 +73,28 @@ jobs:
           echo "dmg=Bro-Computer-$short-$build.dmg" >> "$GITHUB_OUTPUT"
           echo "Version $short (build $build)"
 
+      # A shallow clone counts 1 commit, and a rewritten history can count
+      # fewer than before. Either publishes a version below what users already
+      # have, which silently stops updates. Equal is allowed — that is a re-run
+      # of an already-published commit, handled by Publish release below.
+      - name: Assert version moves forward
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          highest=$(gh release list --limit 200 --json tagName -q '.[].tagName' \
+            | grep -Eo -- '-[0-9]+$' | tr -d - | sort -n | tail -1)
+          if [ -z "$highest" ]; then
+            echo "No published builds yet; nothing to compare against."
+            exit 0
+          fi
+          build="${{ steps.version.outputs.build }}"
+          echo "this build: $build, highest published: $highest"
+          if [ "$build" -lt "$highest" ]; then
+            echo "::error::Build number $build is lower than the published $highest. A shallow checkout or rewritten history would do this; publishing would stop updates for everyone already on $highest."
+            exit 1
+          fi
+
       - name: Codesign (ad-hoc)
         run: |
           app="build/Bro Computer.app"
@@ -117,14 +142,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          printf '%s\n\n%s\n' \
-            "Automated build from main (${{ github.sha }})." \
-            "Ad-hoc signed, not notarized: on first launch right-click the app and choose Open." \
-            > notes.md
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --title "${{ steps.version.outputs.short }} (build ${{ steps.version.outputs.build }})" \
-            --notes-file notes.md \
-            "${{ steps.version.outputs.dmg }}"
+          tag="${{ steps.version.outputs.tag }}"
+          dmg="${{ steps.version.outputs.dmg }}"
+          # Idempotent: re-running an already-published commit (a retry after a
+          # later step failed) must replace the asset rather than fail on an
+          # existing tag. gh release create has no --clobber; upload does.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists — replacing its asset."
+            gh release upload "$tag" "$dmg" --clobber
+          else
+            printf '%s\n\n%s\n' \
+              "Automated build from main (${{ github.sha }})." \
+              "Ad-hoc signed, not notarized: on first launch right-click the app and choose Open." \
+              > notes.md
+            gh release create "$tag" \
+              --title "${{ steps.version.outputs.short }} (build ${{ steps.version.outputs.build }})" \
+              --notes-file notes.md \
+              "$dmg"
+          fi
 
       # Sign the DMG and republish the appcast Sparkle polls. Skipped with a
       # warning when SPARKLE_PRIVATE_KEY is absent, so the build keeps shipping
@@ -135,9 +170,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
+          pubkey=$(plutil -extract SUPublicEDKey raw "build/Bro Computer.app/Contents/Info.plist")
           if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
-            echo "::warning::SPARKLE_PRIVATE_KEY is not set — skipping appcast. Automatic updates stay off until it is added."
-            exit 0
+            if [ "$pubkey" = "REPLACE_WITH_SPARKLE_PUBLIC_KEY" ]; then
+              echo "::warning::SPARKLE_PRIVATE_KEY is not set — skipping appcast. Automatic updates stay off until it is added."
+              exit 0
+            fi
+            # Real public key but no private key: the app WILL start Sparkle and
+            # poll a feed this job never publishes. Fail here, where whoever
+            # committed the key can see it, rather than on users' machines.
+            echo "::error::SUPublicEDKey is set but SPARKLE_PRIVATE_KEY is missing. Shipped apps would poll an appcast that does not exist. Add the secret, or revert SUPublicEDKey to the placeholder."
+            exit 1
           fi
 
           dmg="${{ steps.version.outputs.dmg }}"
