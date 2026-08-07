@@ -29,6 +29,20 @@ find_package(CEF REQUIRED)
 # Add CEF library target
 add_subdirectory(${CEF_ROOT}/libcef_dll libcef_dll_wrapper)
 
+# Sparkle, for over-the-air updates. Fetched as the upstream prebuilt binary
+# rather than built from source: the tarball is ~15 MB and ships the signed
+# XPC services and Autoupdate helper that Sparkle needs at runtime. The hash is
+# pinned so a swapped upstream artifact fails the build instead of shipping.
+include(FetchContent)
+set(SPARKLE_VERSION "2.9.5")
+FetchContent_Declare(sparkle
+    URL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+    URL_HASH SHA256=015336b601493e05c237964954bff6191370003d94edefe663724c88840d73cc
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(sparkle)
+set(SPARKLE_FRAMEWORK "${sparkle_SOURCE_DIR}/Sparkle.framework")
+
 # Source files
 set(BRO_SRCS
     src/bro_app.cc
@@ -37,6 +51,8 @@ set(BRO_SRCS
     src/bro_handler.h
     src/bro_handler_mac.mm
     src/bro_mac.mm
+    src/bro_updater.h
+    src/bro_updater.mm
     src/radix_icons.h
     src/radix_icons.mm
 )
@@ -69,7 +85,29 @@ set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
 # space-free because it doubles as the CMake target name.
 set(PRODUCT_NAME "Bro Computer")
 set(EXECUTABLE_NAME "Bro")
+# Marketing version, shown to people. Bump by hand for a real release.
 set(VERSION_SHORT "1.0.0")
+
+# Build number, shown to nobody but compared by Sparkle. This MUST increase on
+# every published build or the updater will never offer an update, so it is
+# derived from the commit count rather than hand-maintained. Requires full
+# history: a shallow clone always counts 1, which is why CI checks out with
+# fetch-depth 0.
+set(VERSION_BUILD "0")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+      COMMAND "${GIT_EXECUTABLE}" rev-list --count HEAD
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE VERSION_BUILD
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+  )
+endif()
+if(NOT VERSION_BUILD MATCHES "^[0-9]+$")
+  set(VERSION_BUILD "0")
+endif()
+message(STATUS "Bro version ${VERSION_SHORT} (build ${VERSION_BUILD})")
 
 # Configure Info.plist
 configure_file(
@@ -88,17 +126,22 @@ target_include_directories(${EXECUTABLE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# Link libraries
+# Link libraries. Sparkle is found via -F at link time and via the @executable_path
+# rpath below at runtime, once it has been copied into Contents/Frameworks.
 target_link_libraries(${EXECUTABLE_NAME}
     libcef_dll_wrapper
     ${CEF_STANDARD_LIBS}
     "-framework QuartzCore"
+    "-F${sparkle_SOURCE_DIR}"
+    "-framework Sparkle"
 )
 
-# Compile flags
+# Compile flags. The -F lets `#import <Sparkle/Sparkle.h>` resolve; linking
+# needs its own copy of the same flag above.
 target_compile_options(${EXECUTABLE_NAME} PRIVATE
     ${CEF_CXX_COMPILER_FLAGS}
     -fobjc-arc
+    "-F${sparkle_SOURCE_DIR}"
 )
 
 # Set bundle properties
@@ -107,9 +150,11 @@ set_target_properties(${EXECUTABLE_NAME} PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.bro.browser"
     MACOSX_BUNDLE_BUNDLE_NAME "${PRODUCT_NAME}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "${VERSION_SHORT}"
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${VERSION_BUILD}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${VERSION_SHORT}"
     OUTPUT_NAME "${PRODUCT_NAME}"
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "@executable_path/../Frameworks"
 )
 
 # Helper apps. Chromium on macOS launches subprocesses from helper bundles with
@@ -174,5 +219,17 @@ add_custom_command(TARGET ${EXECUTABLE_NAME} POST_BUILD
         "${CEF_ROOT}/Release/Chromium Embedded Framework.framework"
         "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks/Chromium Embedded Framework.framework"
     COMMENT "Copying CEF framework to app bundle"
+    VERBATIM
+)
+
+# Copy Sparkle into the app bundle. Uses ditto rather than `cmake -E
+# copy_directory` on purpose: Sparkle is a versioned framework (Versions/B plus
+# Current/Resources/Headers symlinks) and copy_directory dereferences symlinks,
+# which both bloats the bundle and produces a layout codesign rejects.
+add_custom_command(TARGET ${EXECUTABLE_NAME} POST_BUILD
+    COMMAND ditto
+        "${SPARKLE_FRAMEWORK}"
+        "$<TARGET_BUNDLE_DIR:${EXECUTABLE_NAME}>/Contents/Frameworks/Sparkle.framework"
+    COMMENT "Copying Sparkle framework to app bundle"
     VERBATIM
 )
