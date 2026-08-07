@@ -16,6 +16,7 @@
 #include "include/wrapper/cef_library_loader.h"
 #include "bro_app.h"
 #include "bro_handler.h"
+#import "bro_updater.h"
 #import "radix_icons.h"
 
 // Forward declarations
@@ -1431,6 +1432,29 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
   }
   if (!dragged && wasActiveAtMouseDown_) {
     [self performSelect];
+  }
+}
+
+// Middle-click closes the tab, like every other Chromium browser. It fires on
+// release and only inside the pill, so sliding off cancels the way the ✕
+// button already does. Going through handleClose: means a lone tab closes the
+// window, exactly as Cmd+W does.
+- (void)otherMouseDown:(NSEvent*)event {
+  // Claim the middle press so AppKit routes its release here too; anything
+  // else (mouse back/forward) keeps bubbling.
+  if (event.buttonNumber != 2) {
+    [super otherMouseDown:event];
+  }
+}
+
+- (void)otherMouseUp:(NSEvent*)event {
+  if (event.buttonNumber != 2) {
+    [super otherMouseUp:event];
+    return;
+  }
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  if (NSPointInRect(p, self.bounds)) {
+    [self handleClose:self];
   }
 }
 
@@ -4503,6 +4527,30 @@ static void CreateNewBrowserTab(void) {
     }
   }
 
+  // The thumb buttons on most mice navigate history, like every other browser.
+  // macOS numbers them 3 (back) and 4 (forward). Handled here for the same
+  // reason as Cmd+Left/Right above: CEF's windowed mac view never forwards
+  // them to the renderer, so no page can act on them.
+  if ((event.type == NSEventTypeOtherMouseDown ||
+       event.type == NSEventTypeOtherMouseUp) &&
+      (event.buttonNumber == 3 || event.buttonNumber == 4) &&
+      event.window == g_main_window) {
+    // Navigate on the press; the release is swallowed too so no view is left
+    // tracking a button-down it never saw finish.
+    if (event.type == NSEventTypeOtherMouseDown) {
+      BroHandler* handler = BroHandler::GetInstance();
+      CefRefPtr<CefBrowser> browser = handler ? handler->GetBrowser() : nullptr;
+      if (browser) {
+        if (event.buttonNumber == 3 && browser->CanGoBack()) {
+          browser->GoBack();
+        } else if (event.buttonNumber == 4 && browser->CanGoForward()) {
+          browser->GoForward();
+        }
+      }
+    }
+    return;
+  }
+
   [super sendEvent:event];
 }
 
@@ -4518,6 +4566,10 @@ static void CreateNewBrowserTab(void) {
 - (void)createApplication:(id)object {
   // The chrome is designed dark-only; force dark so system controls match.
   NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+
+  // Before the menu, so the "Check for Updates…" item can bind to a live
+  // updater rather than a nil target.
+  BroStartUpdater();
 
   // Create the main menu
   [self setupMainMenu];
@@ -4546,6 +4598,16 @@ static void CreateNewBrowserTab(void) {
   [appMenu addItemWithTitle:@"About Bro Computer"
                      action:@selector(orderFrontStandardAboutPanel:)
               keyEquivalent:@""];
+  [appMenu addItem:[NSMenuItem separatorItem]];
+
+  // Sparkle drives this item itself: it owns the target and keeps the item
+  // enabled or disabled depending on whether a check is allowed right now. On
+  // a build without update keys the target is nil, so the item stays greyed.
+  NSMenuItem* updateItem =
+      [appMenu addItemWithTitle:@"Check for Updates…"
+                         action:BroUpdaterMenuAction()
+                  keyEquivalent:@""];
+  updateItem.target = BroUpdaterMenuTarget();
   [appMenu addItem:[NSMenuItem separatorItem]];
   [appMenu addItemWithTitle:@"Quit Bro Computer"
                      action:@selector(terminate:)

@@ -3,6 +3,10 @@ name: Build DMG
 on:
   push:
     branches: [main]
+  # Build PRs too, so a compile break is caught before it reaches main. The
+  # publish steps below are all gated on main, so PR runs stop after the build.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -10,10 +14,24 @@ permissions:
 
 concurrency:
   group: build-dmg-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR builds are worth cancelling. Main builds are not: cancelling
+  # one mid-publish can leave a release created but never referenced by the
+  # appcast, and the next run cannot clean it up.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CEF_VERSION: cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal
+  # Every DMG, every delta, and the appcast live on this one release. Sparkle's
+  # generate_appcast emits a single download-url-prefix for full archives and
+  # deltas alike, so they have to share a host; per-version releases cannot.
+  # Assets are only ever added or replaced, never renamed, so a URL Sparkle
+  # published stays valid.
+  CHANNEL_TAG: updates
+  # Deltas generated per build. Also how many previous DMGs get pulled down,
+  # since building a delta needs both sides — keep it small, they are ~158 MB.
+  MAX_DELTAS: "2"
+  # DMGs retained on the release. Must exceed MAX_DELTAS so delta sources survive.
+  KEEP_ARCHIVES: "4"
 
 jobs:
   build:
@@ -22,6 +40,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history: CFBundleVersion is the commit count, and a shallow
+          # clone would report 1 on every build, which stops Sparkle from ever
+          # seeing a newer version.
+          fetch-depth: 0
 
       - name: Cache CEF
         id: cef-cache
@@ -49,9 +72,55 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      - name: Resolve version
+        id: version
+        run: |
+          app="build/Bro Computer.app"
+          short=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          build=$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "dmg=Bro-Computer-$short-$build.dmg" >> "$GITHUB_OUTPUT"
+          echo "Version $short (build $build)"
+
+      # A shallow clone counts 1 commit, and a rewritten history can count fewer
+      # than before. Either publishes a version below what users already have,
+      # which silently stops updates. Equal is allowed — that is a re-run of an
+      # already-published commit, which the publish step handles by clobbering.
+      - name: Assert version moves forward
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL_TAG: ${{ env.CHANNEL_TAG }}
+        run: |
+          highest=$(gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+            | sed -n 's/^Bro-Computer-.*-\([0-9][0-9]*\)\.dmg$/\1/p' | sort -n | tail -1)
+          if [ -z "$highest" ]; then
+            echo "No published builds yet; nothing to compare against."
+            exit 0
+          fi
+          build="${{ steps.version.outputs.build }}"
+          echo "this build: $build, highest published: $highest"
+          if [ "$build" -lt "$highest" ]; then
+            echo "::error::Build number $build is lower than the published $highest. A shallow checkout or rewritten history would do this; publishing would stop updates for everyone already on $highest."
+            exit 1
+          fi
+
       - name: Codesign (ad-hoc)
         run: |
           app="build/Bro Computer.app"
+          sparkle="$app/Contents/Frameworks/Sparkle.framework"
+
+          # Sparkle signs from the inside out: its XPC services and helper
+          # binaries first, then the framework wrapping them. Signing the
+          # framework first would be invalidated by the nested signatures.
+          # Deliberately no --deep, which Sparkle's docs warn against.
+          codesign --force --sign - "$sparkle/Versions/B/XPCServices/Installer.xpc"
+          codesign --force --sign - "$sparkle/Versions/B/XPCServices/Downloader.xpc"
+          codesign --force --sign - "$sparkle/Versions/B/Autoupdate"
+          codesign --force --sign - "$sparkle/Versions/B/Updater.app"
+          codesign --force --sign - "$sparkle"
+
           codesign --force --sign - "$app/Contents/Frameworks/Chromium Embedded Framework.framework"
           for helper in "$app/Contents/Frameworks/"*.app; do
             codesign --force --sign - "$helper"
@@ -60,39 +129,114 @@ jobs:
           codesign --verify --deep --strict "$app"
 
       - name: Create DMG
-        id: dmg
         run: |
-          version=$(sed -n 's/.*VERSION_SHORT "\([^"]*\)".*/\1/p' CMakeLists.txt | head -n1)
-          dmg="Bro-Computer-${version:-1.0.0}-$(git rev-parse --short HEAD).dmg"
           staging=$(mktemp -d)
           ditto "build/Bro Computer.app" "$staging/Bro Computer.app"
           ln -s /Applications "$staging/Applications"
-          hdiutil create -volname "Bro Computer" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          hdiutil create -volname "Bro Computer" -srcfolder "$staging" \
+            -ov -format UDZO "${{ steps.version.outputs.dmg }}"
           rm -rf "$staging"
-          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.dmg.outputs.dmg }}
-          path: ${{ steps.dmg.outputs.dmg }}
+          name: ${{ steps.version.outputs.dmg }}
+          path: ${{ steps.version.outputs.dmg }}
           if-no-files-found: error
 
-      - name: Update latest release
+      # One additive release is the whole distribution channel: every DMG,
+      # every delta, and the appcast. generate_appcast emits a single
+      # download-url-prefix covering full archives AND deltas, so they must
+      # share a host — which is why per-version releases are gone.
+      - name: Publish update channel
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          git tag -f latest
-          git push -f origin latest
-          if ! gh release view latest >/dev/null 2>&1; then
-            gh release create latest --prerelease --title "Latest build" \
-              --notes "Automated build from main. Ad-hoc signed: right-click > Open on first launch."
+          set -euo pipefail
+          dmg="${{ steps.version.outputs.dmg }}"
+          short="${{ steps.version.outputs.short }}"
+          build="${{ steps.version.outputs.build }}"
+          prefix="https://github.com/${{ github.repository }}/releases/download/$CHANNEL_TAG/"
+
+          pubkey=$(plutil -extract SUPublicEDKey raw "build/Bro Computer.app/Contents/Info.plist")
+          if [ -z "${SPARKLE_PRIVATE_KEY:-}" ] && [ "$pubkey" != "REPLACE_WITH_SPARKLE_PUBLIC_KEY" ]; then
+            # Real public key, no private key: shipped apps would start Sparkle
+            # and poll a feed this job never writes. Fail where the person who
+            # committed the key can see it, not on users' machines.
+            echo "::error::SUPublicEDKey is set but SPARKLE_PRIVATE_KEY is missing. Shipped apps would poll an appcast that does not exist. Add the secret, or revert SUPublicEDKey to the placeholder."
+            exit 1
           fi
-          # Drop stale per-commit DMG assets before uploading the new one
-          gh release view latest --json assets -q '.assets[].name' | while read -r asset; do
-            case "$asset" in
-              Bro-*.dmg) gh release delete-asset latest "$asset" -y ;;
-            esac
-          done
-          gh release upload latest "${{ steps.dmg.outputs.dmg }}" --clobber
+
+          if ! gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+            gh release create "$CHANNEL_TAG" --title "Bro Computer $short (build $build)" \
+              --notes "Automated builds from main. Managed by CI."
+          fi
+
+          # Published DMGs, oldest first by build number. The trailing `|| true`
+          # matters: under pipefail a grep that legitimately matches nothing (an
+          # empty channel, no deltas yet) would otherwise abort the whole step.
+          list_dmgs() {
+            gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+              | grep -E '^Bro-Computer-.+-[0-9]+\.dmg$' \
+              | sed -E 's/^(.*)-([0-9]+)\.dmg$/\2 \1-\2.dmg/' \
+              | sort -n | awk '{print $2}' || true
+          }
+
+          list_dmgs > published.txt
+          mkdir -p archives
+          # Deltas need both sides, so pull down the most recent few. Bounded by
+          # MAX_DELTAS because each of these is a ~158 MB download.
+          tail -n "$MAX_DELTAS" published.txt | grep -vxF "$dmg" > fetch.txt || true
+          while read -r a; do
+            [ -n "$a" ] || continue
+            echo "fetching $a for delta generation"
+            gh release download "$CHANNEL_TAG" -p "$a" -D archives --clobber || true
+          done < fetch.txt
+          cp "$dmg" archives/
+
+          if [ -z "${SPARKLE_PRIVATE_KEY:-}" ]; then
+            echo "::warning::SPARKLE_PRIVATE_KEY is not set — publishing the DMG but no appcast. Automatic updates stay off until the secret is added."
+            gh release upload "$CHANNEL_TAG" "archives/$dmg" --clobber
+          else
+            # Key over stdin so it never lands on disk. generate_appcast writes
+            # appcast.xml and any *.delta into the archives directory.
+            printf '%s' "$SPARKLE_PRIVATE_KEY" | build/_deps/sparkle-src/bin/generate_appcast archives/ \
+              --download-url-prefix "$prefix" \
+              --maximum-deltas "$MAX_DELTAS" \
+              --ed-key-file -
+            ls -la archives/
+            gh release upload "$CHANNEL_TAG" "archives/$dmg" archives/appcast.xml --clobber
+            for d in archives/*.delta; do
+              [ -e "$d" ] || continue
+              gh release upload "$CHANNEL_TAG" "$d" --clobber
+            done
+          fi
+
+          printf '%s\n\n%s\n\n%s\n' \
+            "**[Download Bro Computer $short (build $build)]($prefix$dmg)**" \
+            "Built automatically from main (${{ github.sha }}). Older builds below are kept so the updater can patch from them." \
+            "Ad-hoc signed, not notarized: on first launch right-click the app and choose Open." > notes.md
+          gh release edit "$CHANNEL_TAG" --title "Bro Computer $short (build $build)" --notes-file notes.md
+
+          # Retain a bounded window. Anything older is unreachable from the
+          # appcast anyway; Sparkle offers the newest full DMG to old versions.
+          list_dmgs > current.txt
+          total=$(wc -l < current.txt | tr -d ' ')
+          drop=$((total - KEEP_ARCHIVES))
+          if [ "$drop" -gt 0 ]; then
+            head -n "$drop" current.txt > prune.txt
+            while read -r old; do
+              [ -n "$old" ] || continue
+              oldbuild=$(echo "$old" | sed -E 's/^.*-([0-9]+)\.dmg$/\1/')
+              echo "pruning $old and its deltas"
+              gh release delete-asset "$CHANNEL_TAG" "$old" -y || true
+              gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+                | grep -E '\.delta$' | grep -F -- "-$oldbuild" > staledeltas.txt || true
+              while read -r dl; do
+                [ -n "$dl" ] || continue
+                gh release delete-asset "$CHANNEL_TAG" "$dl" -y || true
+              done < staledeltas.txt
+            done < prune.txt
+          fi
