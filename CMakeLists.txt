@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.21)
+# 3.24 for FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP, used by the Sparkle fetch
+# below. On 3.21-3.23 that keyword is unknown and configuring fails outright.
+cmake_minimum_required(VERSION 3.24)
 project(Bro)
 
 # Default to Release build if not specified
@@ -38,7 +40,10 @@ set(SPARKLE_VERSION "2.9.5")
 FetchContent_Declare(sparkle
     URL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
     URL_HASH SHA256=015336b601493e05c237964954bff6191370003d94edefe663724c88840d73cc
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    # FALSE per CMake's own guidance: extracted files get their extraction time
+    # rather than the archive's, so dependency checking can't skip work it
+    # should redo. Setting it either way silences the CMP0135 warning.
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
 FetchContent_MakeAvailable(sparkle)
 set(SPARKLE_FRAMEWORK "${sparkle_SOURCE_DIR}/Sparkle.framework")
@@ -106,6 +111,14 @@ if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
 endif()
 if(NOT VERSION_BUILD MATCHES "^[0-9]+$")
   set(VERSION_BUILD "0")
+endif()
+if(VERSION_BUILD STREQUAL "0")
+  # Building from a source archive rather than a checkout. Harmless locally, but
+  # such a build reports version 0 and must never be published: Sparkle would
+  # read it as older than everything already released.
+  message(WARNING
+      "No git history found — CFBundleVersion is 0. Fine for a local build; "
+      "do not distribute it. Build from a full clone to get a real version.")
 endif()
 message(STATUS "Bro version ${VERSION_SHORT} (build ${VERSION_BUILD})")
 

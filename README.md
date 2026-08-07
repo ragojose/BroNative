@@ -6,7 +6,7 @@ Bro Computer strips browsing down to what matters: the page. One quiet row of ch
 
 ## Download
 
-Download the latest DMG from the [**latest release**](../../releases/latest) — it is rebuilt automatically on every commit to `main`.
+Download the latest DMG from the [**latest release**](../../releases/latest) — it is rebuilt automatically on every commit to `main`. That page always leads with the current build; the older DMGs listed alongside it are kept so the updater can patch from them.
 
 > **First launch:** builds are ad-hoc signed (not notarized), so macOS will warn you.
 > Right-click `Bro Computer.app` → **Open** → **Open** the first time. After that it opens normally.
@@ -17,40 +17,12 @@ Requires macOS 12.0+ on Apple Silicon.
 
 Bro Computer updates itself. It checks once a day while running, and you can ask
 it to look now with **Bro Computer → Check for Updates…**. Updates install in
-place, so you only download the DMG once.
+place, so you only download the full DMG once — after that you get a patch
+against the build you already have, not another 158 MB.
 
 > The menu item is greyed out until the maintainer sets up signing keys — see
-> below. Builds without keys simply never check for updates.
-
-### Enabling updates (maintainer, one time)
-
-Updates are signed, and the signing key is deliberately not in this repo. To
-turn them on:
-
-1. Generate a key pair with the copy of Sparkle the build already downloads:
-
-   ```bash
-   ./build/_deps/sparkle-src/bin/generate_keys
-   ```
-
-   It stores the private key in your login Keychain and prints the public key.
-
-2. Paste the printed public key into `SUPublicEDKey` in `src/mac/Info.plist.in`,
-   replacing `REPLACE_WITH_SPARKLE_PUBLIC_KEY`.
-
-3. Export the private key and add it to the repository as a secret named
-   `SPARKLE_PRIVATE_KEY` (Settings → Secrets and variables → Actions):
-
-   ```bash
-   ./build/_deps/sparkle-src/bin/generate_keys -x sparkle-private-key.txt
-   ```
-
-   Delete that file once the secret is saved. Keep the key safe — Sparkle can
-   only rotate it with a Developer ID signed build, so losing it means shipped
-   apps can no longer be updated.
-
-Until step 3 is done the build still publishes DMGs; it just logs a warning and
-skips the update feed.
+> [Enabling updates](#enabling-updates-maintainer-one-time) at the end. Builds
+> without keys simply never check for updates.
 
 ## Building from source
 
@@ -58,7 +30,8 @@ skips the update feed.
 
 - macOS 12.0+ on Apple Silicon
 - Xcode Command Line Tools (`xcode-select --install` — full Xcode not needed)
-- CMake 3.21+ and Ninja (`brew install cmake ninja`)
+- CMake 3.24+ and Ninja (`brew install cmake ninja`)
+- A network connection for the first configure — CMake downloads Sparkle (~15 MB)
 
 ### 1. Get CEF
 
@@ -79,3 +52,37 @@ cmake -G Ninja -B build
 cmake --build build
 open "build/Bro Computer.app"
 ```
+
+## Enabling updates (maintainer, one time)
+
+Updates are signed, and the signing key is deliberately not in this repo. These
+steps need a completed build above — the Sparkle tools come from it.
+
+1. Generate a key pair with the copy of Sparkle the build already downloaded:
+
+   ```bash
+   ./build/_deps/sparkle-src/bin/generate_keys
+   ```
+
+   It stores the private key in your login Keychain and prints the public key.
+
+2. Export the private key and add it to the repository as a secret named
+   `SPARKLE_PRIVATE_KEY` (Settings → Secrets and variables → Actions):
+
+   ```bash
+   ./build/_deps/sparkle-src/bin/generate_keys -x sparkle-private-key.txt
+   ```
+
+   Delete that file once the secret is saved.
+
+3. Only now, paste the printed public key into `SUPublicEDKey` in
+   `src/mac/Info.plist.in`, replacing `REPLACE_WITH_SPARKLE_PUBLIC_KEY`, and
+   commit it.
+
+**Do steps 2 and 3 in that order.** A build carrying a real public key starts
+checking for updates, so if the secret isn't there yet those apps poll a feed
+that was never published. CI fails the build if it sees that combination rather
+than shipping it, but the ordering avoids the failure entirely.
+
+Keep the key safe — Sparkle can only rotate it with a Developer ID signed build,
+so losing it means shipped apps can no longer be updated.
