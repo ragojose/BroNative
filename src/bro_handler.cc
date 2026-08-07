@@ -140,6 +140,87 @@ void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
   }
 }
 
+void BroHandler::FetchTabDescription(int browser_id) {
+  if (!CefCurrentlyOn(TID_UI)) {
+    CefPostTask(TID_UI, base::BindOnce(&BroHandler::FetchTabDescription, this,
+                                       browser_id));
+    return;
+  }
+
+  auto it = browser_map_.find(browser_id);
+  if (it == browser_map_.end() || !it->second) {
+    return;
+  }
+  CefRefPtr<CefBrowserHost> host = it->second->GetHost();
+  if (!host) {
+    return;
+  }
+
+  // Register the observer for this browser once; the registration stays
+  // alive until the browser closes (OnBeforeClose erases it).
+  if (devtools_registrations_.find(browser_id) ==
+      devtools_registrations_.end()) {
+    CefRefPtr<CefRegistration> registration =
+        host->AddDevToolsMessageObserver(this);
+    if (!registration) {
+      return;
+    }
+    devtools_registrations_[browser_id] = registration;
+  }
+
+  CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+  params->SetString(
+      "expression",
+      "(document.querySelector('meta[name=\"description\" i]') || {})"
+      ".content || ''");
+  params->SetBool("returnByValue", true);
+  int message_id = host->ExecuteDevToolsMethod(0, "Runtime.evaluate", params);
+  if (message_id != 0) {
+    // Only the latest request per browser is tracked; a superseded in-flight
+    // result is simply ignored in OnDevToolsMethodResult.
+    pending_description_requests_[browser_id] = message_id;
+  }
+}
+
+void BroHandler::OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
+                                        int message_id,
+                                        bool success,
+                                        const void* result,
+                                        size_t result_size) {
+  CEF_REQUIRE_UI_THREAD();
+  if (!browser) {
+    return;
+  }
+  int browser_id = browser->GetIdentifier();
+  auto it = pending_description_requests_.find(browser_id);
+  if (it == pending_description_requests_.end() || it->second != message_id) {
+    // Not ours (e.g. an emulation call's result routed to the same observer).
+    return;
+  }
+  pending_description_requests_.erase(it);
+
+  std::string description;
+  if (success && result && result_size > 0) {
+    // result is the CDP response's "result" payload:
+    // {"result": {"type": "string", "value": "..."}}
+    CefRefPtr<CefValue> parsed =
+        CefParseJSON(result, result_size, JSON_PARSER_RFC);
+    if (parsed && parsed->GetType() == VTYPE_DICTIONARY) {
+      CefRefPtr<CefDictionaryValue> outer = parsed->GetDictionary();
+      if (outer->HasKey("result") &&
+          outer->GetType("result") == VTYPE_DICTIONARY) {
+        CefRefPtr<CefDictionaryValue> inner = outer->GetDictionary("result");
+        if (inner->HasKey("value") && inner->GetType("value") == VTYPE_STRING) {
+          description = inner->GetString("value").ToString();
+        }
+      }
+    }
+  }
+  // Deliver even when empty so the UI caches "no description" and doesn't
+  // refetch on every hover.
+  OnTabDescriptionAvailable(browser_id, description);
+}
+
 void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
                                          bool mobile,
                                          bool reload) {
@@ -326,6 +407,10 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
   }
   browser_map_.erase(browser_id);
   mobile_tab_ids_.erase(browser_id);
+  // Dropping the registration unregisters the DevTools observer, so no
+  // description results arrive for a dead browser.
+  devtools_registrations_.erase(browser_id);
+  pending_description_requests_.erase(browser_id);
 
   // Notify UI about tab closure
   OnTabClosed(browser_id);
