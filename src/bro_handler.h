@@ -7,6 +7,7 @@
 
 #include "include/cef_client.h"
 #include "include/cef_devtools_message_observer.h"
+#include "include/cef_download_handler.h"
 #include "include/cef_registration.h"
 
 #include <list>
@@ -41,12 +42,28 @@ bool HasTabView(int browser_id);
 void* CreatePopupTabContainer(int popup_id, int* width, int* height);
 // Removes a popup container that never received its browser (popup aborted).
 void RemovePopupTabContainer(int popup_id);
+// Downloads. |download_id| is CefDownloadItem::GetId().
+void OnDownloadStarted(uint32_t download_id,
+                       const std::string& file_name,
+                       const std::string& full_path);
+void OnDownloadProgress(uint32_t download_id,
+                        int64_t received_bytes,
+                        int64_t total_bytes);
+// |success| is false for canceled or interrupted downloads. |full_path| is
+// the final on-disk path reported by CEF.
+void OnDownloadFinished(uint32_t download_id,
+                        const std::string& full_path,
+                        bool success);
+// Returns a unique, not-yet-existing target path in ~/Downloads for
+// |suggested_name| ("name (2).ext" style).
+std::string ResolveDownloadTargetPath(const std::string& suggested_name);
 
 class BroHandler : public CefClient,
                    public CefDisplayHandler,
                    public CefLifeSpanHandler,
                    public CefLoadHandler,
                    public CefContextMenuHandler,
+                   public CefDownloadHandler,
                    public CefDevToolsMessageObserver {
  public:
   explicit BroHandler(bool is_alloy_style);
@@ -98,6 +115,7 @@ class BroHandler : public CefClient,
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
+  CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
 
   // CefDisplayHandler methods:
   void OnTitleChange(CefRefPtr<CefBrowser> browser,
@@ -146,6 +164,18 @@ class BroHandler : public CefClient,
                    const CefString& errorText,
                    const CefString& failedUrl) override;
 
+  // CefDownloadHandler methods:
+  bool CanDownload(CefRefPtr<CefBrowser> browser,
+                   const CefString& url,
+                   const CefString& request_method) override;
+  bool OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefDownloadItem> download_item,
+                        const CefString& suggested_name,
+                        CefRefPtr<CefBeforeDownloadCallback> callback) override;
+  void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
+                         CefRefPtr<CefDownloadItem> download_item,
+                         CefRefPtr<CefDownloadItemCallback> callback) override;
+
   // CefContextMenuHandler methods:
   void OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
                            CefRefPtr<CefFrame> frame,
@@ -183,6 +213,10 @@ class BroHandler : public CefClient,
 
   // Tabs with mobile device emulation active.
   std::set<int> mobile_tab_ids_;
+
+  // Downloads that passed OnBeforeDownload and are not yet in a terminal
+  // state. Gates OnDownloadUpdated, which also fires before OnBeforeDownload.
+  std::set<uint32_t> active_download_ids_;
 
   // Per-browser DevTools observer registrations (alive until the browser
   // closes) and the message id of each browser's in-flight meta-description

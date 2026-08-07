@@ -500,6 +500,56 @@ void BroHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
   frame->LoadURL(GetDataURI(ss.str(), "text/html"));
 }
 
+bool BroHandler::CanDownload(CefRefPtr<CefBrowser> browser,
+                             const CefString& url,
+                             const CefString& request_method) {
+  CEF_REQUIRE_UI_THREAD();
+  return true;
+}
+
+bool BroHandler::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                                  CefRefPtr<CefDownloadItem> download_item,
+                                  const CefString& suggested_name,
+                                  CefRefPtr<CefBeforeDownloadCallback> callback) {
+  CEF_REQUIRE_UI_THREAD();
+
+  std::string name = suggested_name.ToString();
+  if (name.empty()) {
+    name = "download";
+  }
+  // An empty path would send the file to the default temp directory, so
+  // always resolve an explicit target in ~/Downloads.
+  const std::string path = ResolveDownloadTargetPath(name);
+  active_download_ids_.insert(download_item->GetId());
+  OnDownloadStarted(download_item->GetId(), name, path);
+  callback->Continue(path, /*show_dialog=*/false);
+  return true;
+}
+
+void BroHandler::OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
+                                   CefRefPtr<CefDownloadItem> download_item,
+                                   CefRefPtr<CefDownloadItemCallback> callback) {
+  CEF_REQUIRE_UI_THREAD();
+
+  if (!download_item->IsValid()) {
+    return;
+  }
+  const uint32_t id = download_item->GetId();
+  if (active_download_ids_.count(id) == 0) {
+    return;  // Fires before OnBeforeDownload too, and after terminal states.
+  }
+  if (download_item->IsComplete()) {
+    active_download_ids_.erase(id);
+    OnDownloadFinished(id, download_item->GetFullPath().ToString(), true);
+  } else if (download_item->IsCanceled() || download_item->IsInterrupted()) {
+    active_download_ids_.erase(id);
+    OnDownloadFinished(id, download_item->GetFullPath().ToString(), false);
+  } else {
+    OnDownloadProgress(id, download_item->GetReceivedBytes(),
+                       download_item->GetTotalBytes());
+  }
+}
+
 // Custom menu command IDs
 enum ContextMenuIds {
   MENU_ID_OPEN_LINK_NEW_TAB = MENU_ID_USER_FIRST,
