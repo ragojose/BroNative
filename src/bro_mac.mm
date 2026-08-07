@@ -58,10 +58,25 @@ static const NSTimeInterval kViewportAnimDuration = 0.28;
 static const CGFloat kGlassTintAlpha = 0.5;
 static const CGFloat kWindowBorderAlpha = 0.12;
 static const CGFloat kWindowCornerRadiusFallback = 12.0;
-// Tab hover card: dwell time on a pill before the card appears, and its
-// preferred width (shrinks in narrow windows).
+// Tab hover card: dwell time on a pill before the card appears (its width
+// tracks the hovered pill's). The grace period keeps the card up after the
+// mouse leaves the pill so it can travel onto the card's action buttons.
 static const NSTimeInterval kHoverCardDelay = 1.0;
-static const CGFloat kHoverCardWidth = 320.0;
+static const NSTimeInterval kHoverCardHideGrace = 0.3;
+static const CGFloat kHoverCardButtonSize = 24.0;
+
+// UI font: bundled Geist (registered via ATSApplicationFontsPath), falling
+// back to the system font if the resource is missing. SemiBold stands in for
+// bold — Geist Bold reads too heavy at chrome sizes (11–14pt).
+static NSFont* BroUIFont(CGFloat size) {
+  return [NSFont fontWithName:@"Geist-Regular" size:size]
+             ?: [NSFont systemFontOfSize:size];
+}
+
+static NSFont* BroUIFontBold(CGFloat size) {
+  return [NSFont fontWithName:@"Geist-SemiBold" size:size]
+             ?: [NSFont boldSystemFontOfSize:size];
+}
 
 // Every emphasized control border — selected pill, hover, keyboard focus,
 // address-editing ring, the "+" button — is the same 1pt #666666 hairline.
@@ -96,6 +111,20 @@ static NSView* g_glass_tint_view = nil;
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
 
+// Split screen: the tab shown beside the active one; -1 = no split. The
+// active tab is always the left pane and keeps the address bar and chrome
+// shortcuts; selecting the right pane's pill swaps it into the active slot.
+// Helpers are implemented with the container layout code.
+static int g_split_browser_id = -1;
+// Fraction of the browser area the left pane owns; the divider drags it.
+static CGFloat g_split_ratio = 0.5;
+static BOOL SplitActive(void);
+static void ToggleSplitForTab(int browser_id);
+static void RefreshSplitPaneStyling(void);
+static void ClearSplit(void);
+static void JoinTabsInSplit(int dragged_id, int target_id);
+static NSUInteger BroTabStripIndex(int browser_id);
+
 // Forward declaration of tab creation functions (implemented after BroWindow)
 static void CreateNewBrowserTab(void);
 static void CreateNewBrowserTabWithURL(const std::string& url);
@@ -115,6 +144,10 @@ static void UpdateChromeLayout(void);
 // Animates the window between its desktop frame and a shell that hugs the
 // mobile viewport, tracking the active tab's viewport mode.
 static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate);
+// Variant that runs |completion| once the layout change has settled (every
+// path, including early returns, invokes it exactly once).
+static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
+                                        void (^completion)(void));
 
 // Desktop frame to restore when leaving mobile layout; NSZeroRect = none
 // saved. Saved only when empty and cleared only when a desktop restore
@@ -125,11 +158,28 @@ static NSRect g_saved_desktop_frame = NSZeroRect;
 static BOOL g_window_in_mobile_layout = NO;
 // Stale-completion guard: a superseded animation must not restore masks.
 static int g_viewport_anim_token = 0;
+// True while the viewport toggle animation is in flight. Visibility updates
+// arriving mid-animation (e.g. from the toggle's own deferred reload) are
+// parked in g_visibility_update_pending and flushed by the completion so
+// they can't snap the animating frames.
+static BOOL g_viewport_animating = NO;
+static BOOL g_visibility_update_pending = NO;
 
 // True if the given tab has mobile emulation active.
 static BOOL TabIsMobile(int browser_id) {
   BroHandler* handler = BroHandler::GetInstance();
   return handler && handler->IsTabMobile(browser_id);
+}
+
+// What a blank tab is called everywhere it surfaces: pill label, hover card,
+// accessibility label, and the window title AppKit shows in the Window menu.
+static NSString* const kBroBlankTabTitle = @"New Tab";
+
+// Blank pages (and browsers with no committed URL yet) keep their opaque CEF
+// view hidden so the glass window shows through instead of a black rectangle,
+// and never show the raw "about:blank" in the chrome.
+static BOOL BroURLIsBlank(NSString* url) {
+  return url.length == 0 || [url isEqualToString:@"about:blank"];
 }
 
 // Display-only host for a URL: the host with any leading "www." removed.
@@ -442,6 +492,20 @@ static NSDictionary* BroLayerTransitionActions(void) {
 @property (nonatomic, assign) BOOL editingAddress;
 // YES once the pill is too narrow for text: favicon only, centered.
 @property (nonatomic, assign) BOOL iconOnly;
+// Pinned pills sit as favicon-only squares at the left edge of the strip and
+// hide their ✕ (Cmd+W still closes them). The active pinned pill expands so
+// the hosted address field stays usable.
+@property (nonatomic, assign) BOOL pinned;
+// YES while this tab is the split screen's right pane; inactive pills get the
+// active-ish border so both halves read as "on screen".
+@property (nonatomic, assign) BOOL isSplitPane;
+// While split, the two pane pills sit adjacent and read as one joined control
+// (mirroring the panes below): 1 = left half of the pair (right corners
+// squared), 2 = right half (left corners squared), 0 = normal lone pill.
+@property (nonatomic, assign) NSInteger joinedSide;
+// YES while a dragged pill hovers this one (drop would split the two tabs);
+// the pill lights up as the drop target.
+@property (nonatomic, assign) BOOL dropTarget;
 @property (nonatomic, copy) NSString* tabURL;
 // Page title for the hover card and accessibility. Not a native toolTip:
 // the glass hover card replaces the system tooltip, and setting both would
@@ -541,7 +605,7 @@ static NSDictionary* BroLayerTransitionActions(void) {
     // The editable address field lives inside the ACTIVE tab pill (the tab
     // strip re-parents it on tab switches); created here without a superview.
     _addressField = [[BroAddressField alloc] initWithFrame:NSMakeRect(0, 0, 100, 18)];
-    _addressField.font = [NSFont systemFontOfSize:12.0];
+    _addressField.font = BroUIFont(12.0);
     _addressField.bezeled = NO;
     _addressField.bordered = NO;
     _addressField.drawsBackground = NO;
@@ -699,9 +763,18 @@ static NSDictionary* BroLayerTransitionActions(void) {
   if (activeId < 0 || handler->IsTabMobile(activeId) == (bool)mobile) {
     return;
   }
-  handler->SetTabMobileEmulation(activeId, mobile);
+  handler->SetTabMobileEmulation(activeId, mobile);  // CDP overrides only
   [self setViewportMode:mobile];
-  UpdateWindowForViewportMode(mobile, YES);
+  // Reload (needed for the user agent override to take effect) only after the
+  // animation settles, so the page load doesn't stutter the transition. A
+  // superseded animation drops its completion, coalescing rapid toggles into
+  // a single reload with the final state.
+  UpdateWindowForViewportMode(mobile, YES, ^{
+    BroHandler* h = BroHandler::GetInstance();
+    if (h) {
+      h->ReloadTab(activeId);
+    }
+  });
 }
 
 - (void)setViewportMode:(BOOL)mobile {
@@ -785,7 +858,7 @@ static NSDictionary* BroLayerTransitionActions(void) {
 
 - (void)updateURL:(NSString*)url {
   // Blank pages keep the field empty rather than showing "about:blank".
-  if ([url isEqualToString:@"about:blank"]) {
+  if (BroURLIsBlank(url)) {
     url = @"";
   }
   self.fullURL = url ?: @"";
@@ -833,11 +906,25 @@ static NSDictionary* BroLayerTransitionActions(void) {
 - (void)dragTab:(BroTabView*)tab withEvent:(NSEvent*)event;
 - (BOOL)endDragForTab:(BroTabView*)tab;
 // Hover card: pills report enter/leave; the bar debounces the dwell, shows
-// the card, and hides it on click/drag/close/switch/resize.
+// the card, and hides it on click/drag/close/switch/resize. Leaving the pill
+// only schedules the hide (kHoverCardHideGrace) so the mouse can travel onto
+// the card's buttons; the card reports its own hover to cancel/re-arm it.
 - (void)tabHoverBegan:(BroTabView*)tab;
 - (void)tabHoverEnded:(BroTabView*)tab;
+- (void)cardHoverBegan;
+- (void)cardHoverEnded;
 - (void)hideHoverCard;
 - (void)updateTabDescription:(int)browserId description:(NSString*)desc;
+// Toggles the tab's pinned state, moving it across the pinned/unpinned
+// boundary (pinned pills are a strict prefix of the strip).
+- (void)togglePinForTab:(BroTabView*)tab;
+// Splits the active tab with the next tab in strip order (wrapping); no-op
+// on a lone tab. Shared by the active tab's hover-card split button and the
+// Window menu item.
+- (void)splitActiveTabWithNextTab;
+// Moves the split pair's pills next to each other so they can render as one
+// joined control; refreshes the joined styling either way.
+- (void)ensureSplitPairAdjacent;
 @end
 
 @implementation BroTabView {
@@ -886,8 +973,8 @@ static NSDictionary* BroLayerTransitionActions(void) {
     _titleLabel = [[NSTextField alloc]
         initWithFrame:NSMakeRect(32, (kTabPillHeight - 18) / 2.0,
                                  frame.size.width - 32 - 26, 18)];
-    _titleLabel.stringValue = @"";
-    _titleLabel.font = [NSFont systemFontOfSize:12.0];
+    _titleLabel.stringValue = kBroBlankTabTitle;
+    _titleLabel.font = BroUIFont(12.0);
     _titleLabel.textColor = [NSColor secondaryLabelColor];
     _titleLabel.bordered = NO;
     _titleLabel.editable = NO;
@@ -959,7 +1046,9 @@ static NSDictionary* BroLayerTransitionActions(void) {
     _pageDescription = nil;
   }
   _tabURL = newURL;
-  _titleLabel.stringValue = BroDisplayHostForURL(_tabURL);
+  _titleLabel.stringValue = BroURLIsBlank(_tabURL)
+      ? kBroBlankTabTitle
+      : BroDisplayHostForURL(_tabURL);
 }
 
 // Hosts the toolbar's shared address field (this pill is the active tab).
@@ -1041,16 +1130,24 @@ static NSDictionary* BroLayerTransitionActions(void) {
     self.layer.borderColor = BroControlBorderColor().CGColor;
     _titleLabel.textColor = [NSColor labelColor];
   } else {
-    CGFloat bg = hovered_ ? 0.06 : 0.03;
+    // The split screen's right pane keeps the active pill's look while
+    // inactive, so both on-screen halves read as selected.
+    CGFloat bg = _isSplitPane ? 0.08 : (hovered_ ? 0.06 : 0.03);
     self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:bg].CGColor;
     self.layer.borderColor =
-        (hovered_ || focused_)
+        (_isSplitPane || hovered_ || focused_)
             ? BroControlBorderColor().CGColor
             : [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
     _titleLabel.textColor = [NSColor secondaryLabelColor];
     // The address field only lives in the active pill, so the label comes
     // back — unless the pill is collapsed to its favicon.
     _titleLabel.hidden = _iconOnly;
+  }
+  // A dragged pill hovering this one (drop = split the two tabs) outshines
+  // every other state so the target is unmistakable.
+  if (_dropTarget) {
+    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.6].CGColor;
   }
   // The active pill always shows ✕; inactive pills reveal it on hover or
   // keyboard focus.
@@ -1073,6 +1170,29 @@ static NSDictionary* BroLayerTransitionActions(void) {
 - (void)setEditingAddress:(BOOL)editingAddress {
   _editingAddress = editingAddress;
   [self updateAppearance];
+}
+
+- (void)setDropTarget:(BOOL)dropTarget {
+  _dropTarget = dropTarget;
+  [self updateAppearance];
+}
+
+- (void)setIsSplitPane:(BOOL)isSplitPane {
+  _isSplitPane = isSplitPane;
+  [self updateAppearance];
+}
+
+- (void)setJoinedSide:(NSInteger)joinedSide {
+  _joinedSide = joinedSide;
+  if (joinedSide == 1) {
+    self.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner;
+  } else if (joinedSide == 2) {
+    self.layer.maskedCorners = kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
+  } else {
+    self.layer.maskedCorners =
+        kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner |
+        kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
+  }
 }
 
 - (void)performSelect {
@@ -1229,10 +1349,10 @@ static NSDictionary* BroLayerTransitionActions(void) {
 
 - (NSString*)accessibilityLabel {
   NSString* host = _titleLabel.stringValue;
-  if (host.length > 0) {
-    return host;
-  }
-  return self.pageTitle.length > 0 ? self.pageTitle : @"New Tab";
+  NSString* label = host.length > 0
+      ? host
+      : (self.pageTitle.length > 0 ? self.pageTitle : kBroBlankTabTitle);
+  return _pinned ? [label stringByAppendingString:@", pinned"] : label;
 }
 
 - (id)accessibilityValue {
@@ -1257,10 +1377,17 @@ static NSDictionary* BroLayerTransitionActions(void) {
 
 #pragma mark - BroTabHoverCard
 
-// Floating glass card shown after dwelling on a tab pill: page title, full
-// URL, and (when available) the page's meta description. Click-through — it
-// overlaps the browser view and must never intercept the mouse.
+// Floating glass card shown after dwelling on a tab pill: page title, display
+// host, (when available) the page's meta description, and a row of tab
+// actions (pin, split screen). Interactive — the tab bar keeps it alive for a
+// grace period after the mouse leaves the pill so the buttons can be reached.
 @interface BroTabHoverCard : NSView
+// Tab actions; the tab bar sets target/action/icon/state on every show.
+@property (nonatomic, strong) BroHoverButton* pinButton;
+@property (nonatomic, strong) BroHoverButton* splitButton;
+// The tab bar owning the hover lifecycle; told when the mouse enters/leaves
+// the card so the grace-period hide can be canceled and re-armed.
+@property (nonatomic, weak) BroTabBar* hoverDelegate;
 // Populates the labels and resizes self to fit; caller positions the frame.
 - (void)setTitle:(NSString*)title
              url:(NSString*)url
@@ -1301,20 +1428,49 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     self.layer.borderColor =
         [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
 
-    titleLabel_ = BroHoverCardLabel([NSFont boldSystemFontOfSize:12.0], 1.0);
-    urlLabel_ = BroHoverCardLabel([NSFont systemFontOfSize:11.0], 0.55);
-    descriptionLabel_ = BroHoverCardLabel([NSFont systemFontOfSize:11.0], 0.75);
+    titleLabel_ = BroHoverCardLabel(BroUIFontBold(12.0), 1.0);
+    urlLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.55);
+    descriptionLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.75);
     descriptionLabel_.lineBreakMode = NSLineBreakByWordWrapping;
     descriptionLabel_.cell.wraps = YES;
     [self addSubview:titleLabel_];
     [self addSubview:urlLabel_];
     [self addSubview:descriptionLabel_];
+
+    _pinButton = [self makeActionButton];
+    _splitButton = [self makeActionButton];
+
+    // The buttons carry their own tracking areas, but they lie inside this
+    // rect, so moving onto them never reads as leaving the card.
+    NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:trackingArea];
   }
   return self;
 }
 
-- (NSView*)hitTest:(NSPoint)point {
-  return nil;
+- (BroHoverButton*)makeActionButton {
+  BroHoverButton* button = [[BroHoverButton alloc]
+      initWithFrame:NSMakeRect(0, 0, kHoverCardButtonSize,
+                               kHoverCardButtonSize)];
+  button.bordered = NO;
+  button.title = @"";
+  button.imagePosition = NSImageOnly;
+  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+  [self addSubview:button];
+  return button;
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+  [_hoverDelegate cardHoverBegan];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  [_hoverDelegate cardHoverEnded];
 }
 
 - (void)setTitle:(NSString*)title
@@ -1347,13 +1503,26 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     descriptionHeight = MIN(descriptionHeight, lineHeight * 3);
   }
 
-  CGFloat height = padY * 2 + titleHeight + rowGap + urlHeight;
+  // Space between the text block and the action-button row beneath it.
+  const CGFloat buttonRowGap = 8.0;
+
+  CGFloat height = padY * 2 + titleHeight + rowGap + urlHeight +
+                   buttonRowGap + kHoverCardButtonSize;
   if (descriptionHeight > 0) {
     height += rowGap + descriptionHeight;
   }
 
-  // Flipped-less (default) coords: title on top.
-  CGFloat y = padY;
+  // Flipped-less (default) coords: title on top, buttons at the bottom. The
+  // buttons overhang padX slightly so their icons (not their hover
+  // backgrounds) align with the text.
+  CGFloat buttonX = padX - (kHoverCardButtonSize - 12.0) / 2.0;
+  _pinButton.frame = NSMakeRect(buttonX, padY, kHoverCardButtonSize,
+                                kHoverCardButtonSize);
+  _splitButton.frame =
+      NSMakeRect(buttonX + kHoverCardButtonSize + 8.0, padY,
+                 kHoverCardButtonSize, kHoverCardButtonSize);
+
+  CGFloat y = padY + kHoverCardButtonSize + buttonRowGap;
   if (descriptionHeight > 0) {
     descriptionLabel_.frame = NSMakeRect(padX, y, textWidth, descriptionHeight);
     y += descriptionHeight + rowGap;
@@ -1376,8 +1545,14 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   BOOL dragging_;
   CGFloat dragStartX_;
   CGFloat dragOffsetX_;
+  // Pill the dragged one is hovering over; releasing there splits the two
+  // tabs instead of reordering.
+  BroTabView* joinTargetTab_;
   BroTabHoverCard* hoverCard_;
   NSTimer* hoverCardTimer_;
+  // Pending grace-period hide, armed when the mouse leaves the pill or the
+  // card; canceled when it enters either.
+  NSTimer* hoverCardHideTimer_;
   // Tab the visible card belongs to; -1 when hidden.
   int hoverCardTabId_;
 }
@@ -1441,7 +1616,7 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   BroTabView* tab = [[BroTabView alloc]
       initWithFrame:NSMakeRect(0, pillY, kTabPillMaxWidth, kTabPillHeight)
           browserId:browserId];
-  tab.pageTitle = title ?: @"New Tab";
+  tab.pageTitle = BroURLIsBlank(title) ? kBroBlankTabTitle : title;
   tab.target = self;
   tab.selectAction = @selector(tabSelected:);
   tab.closeAction = @selector(tabClosed:);
@@ -1500,28 +1675,58 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
   // The carried pill keeps whatever width it already has (collapsed, it is the
   // expanded active one), while the slots it moves between are sized by the
-  // pills it passes.
+  // pills it passes. Reordering never crosses the pinned/unpinned boundary:
+  // the pill travels only its own group's slot range.
   CGFloat tabWidth = tab.frame.size.width;
-  CGFloat slotWidth = [self dragSlotWidth];
-  CGFloat maxX = ((CGFloat)_tabs.count - 1) * slotWidth;
-  CGFloat newX = MIN(MAX(p.x - dragOffsetX_, 0.0), maxX);
+  CGFloat slotWidth = [self dragSlotWidthForTab:tab];
+  NSUInteger pinnedCount = [self pinnedCount];
+  NSInteger groupStart = tab.pinned ? 0 : (NSInteger)pinnedCount;
+  NSInteger groupEnd =
+      tab.pinned ? (NSInteger)pinnedCount - 1 : (NSInteger)_tabs.count - 1;
+  // Where the unpinned group starts, x-wise: past every pinned pill's slot.
+  CGFloat groupOriginX = 0.0;
+  if (!tab.pinned) {
+    NSArray<NSNumber*>* widths = [self tabWidths];
+    for (NSUInteger i = 0; i < pinnedCount; i++) {
+      groupOriginX += widths[i].doubleValue + 8.0;
+    }
+  }
+  CGFloat maxX = groupOriginX + (CGFloat)(groupEnd - groupStart) * slotWidth;
+  CGFloat newX = MIN(MAX(p.x - dragOffsetX_, groupOriginX), maxX);
   tab.frame = NSMakeRect(newX, pillY, tabWidth, kTabPillHeight);
 
-  // When the pill is carried past a neighbor's slot, the array reorders and
-  // everyone else slides to their new home (the dragged pill keeps following
-  // the mouse; applyTabLayout skips it while a drag is live).
+  // Carrying the pill over a neighbor first offers a JOIN (drop there →
+  // split the two tabs; the neighbor lights up); pushing on toward the far
+  // edge of the neighbor's slot reorders as before. `delta` is how far the
+  // pill has traveled from its own slot, in slots: past 0.5 it overlaps the
+  // neighbor (join zone), past 0.9 it has all but displaced it (reorder).
   NSInteger current = [_tabs indexOfObject:tab];
-  NSInteger target = lround(newX / slotWidth);
-  target = MIN(MAX(target, (NSInteger)0), (NSInteger)_tabs.count - 1);
-  if (target != current) {
-    [_tabs removeObjectAtIndex:current];
-    [_tabs insertObject:tab atIndex:target];
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-      ctx.duration = 0.15;
-      ctx.timingFunction = [CAMediaTimingFunction
-          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-      [self applyTabLayout:YES];
-    } completionHandler:nil];
+  CGFloat delta = (newX - groupOriginX) / slotWidth -
+                  (CGFloat)(current - groupStart);
+  NSInteger hoverIndex = current + (NSInteger)lround(delta);
+  hoverIndex = MIN(MAX(hoverIndex, groupStart), groupEnd);
+  BroTabView* joinTarget = nil;
+  if (hoverIndex != current) {
+    BOOL adjacent = labs(hoverIndex - current) == 1;
+    CGFloat depth =
+        fabs(delta) - (fabs((CGFloat)(hoverIndex - current)) - 0.5);
+    if (adjacent && depth < 0.4) {
+      joinTarget = _tabs[(NSUInteger)hoverIndex];
+    } else {
+      [_tabs removeObjectAtIndex:current];
+      [_tabs insertObject:tab atIndex:hoverIndex];
+      [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = 0.15;
+        ctx.timingFunction = [CAMediaTimingFunction
+            functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [self applyTabLayout:YES];
+      } completionHandler:nil];
+    }
+  }
+  if (joinTargetTab_ != joinTarget) {
+    joinTargetTab_.dropTarget = NO;
+    joinTarget.dropTarget = YES;
+    joinTargetTab_ = joinTarget;
   }
 }
 
@@ -1532,6 +1737,9 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   BOOL didDrag = dragging_;
   draggingTab_ = nil;
   dragging_ = NO;
+  BroTabView* joinTarget = joinTargetTab_;
+  joinTargetTab_ = nil;
+  joinTarget.dropTarget = NO;
   if (didDrag) {
     // Balances the push/disable from the first drag event.
     [NSCursor pop];
@@ -1547,6 +1755,14 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
       tab.layer.zPosition = 0.0;
     }];
     [self.window recalculateKeyViewLoop];
+    if (joinTarget) {
+      // Dropped onto another pill: split the two tabs.
+      JoinTabsInSplit(tab.browserId, joinTarget.browserId);
+    } else if (SplitActive()) {
+      // A drag can pull the split pair apart; snap it back together so the
+      // joined pills keep mirroring the panes below.
+      [self ensureSplitPairAdjacent];
+    }
   }
   return didDrag;
 }
@@ -1580,6 +1796,27 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (handler) {
     handler->SetActiveBrowser(_tabs[next].browserId);
   }
+}
+
+- (void)togglePinForTab:(BroTabView*)tab {
+  if (dragging_ || [_tabs indexOfObject:tab] == NSNotFound) {
+    return;
+  }
+  BOOL pinning = !tab.pinned;
+  [_tabs removeObject:tab];
+  // After the removal, pinnedCount is both the end of the pinned group (where
+  // a newly pinned pill lands) and the front of the unpinned group (where an
+  // unpinned one returns).
+  NSUInteger destination = [self pinnedCount];
+  tab.pinned = pinning;
+  [_tabs insertObject:tab atIndex:destination];
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = 0.18;
+    ctx.timingFunction = [CAMediaTimingFunction
+        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [self applyTabLayout:YES];
+  } completionHandler:nil];
+  [self.window recalculateKeyViewLoop];
 }
 
 - (void)removeTabWithBrowserId:(int)browserId {
@@ -1649,10 +1886,11 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   }
 
   // In a collapsed strip the newly active pill grows out of its square so its
-  // URL can be read and typed, and the one it replaced shrinks back. Animate
-  // that swap; when the strip is roomy every pill is already the same width
-  // and there is nothing to move.
-  if ([self isCollapsed] && !dragging_) {
+  // URL can be read and typed, and the one it replaced shrinks back. The same
+  // swap happens around a pinned pill in a roomy strip (square inactive,
+  // expanded active). Animate it; with no pins and room for everyone, every
+  // pill is already the same width and there is nothing to move.
+  if (([self isCollapsed] || [self pinnedCount] > 0) && !dragging_) {
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
       ctx.duration = 0.18;
       ctx.timingFunction = [CAMediaTimingFunction
@@ -1666,7 +1904,9 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   for (BroTabView* tab in _tabs) {
     if (tab.browserId == browserId) {
       // Pills display the host; the page title shows in the hover card.
-      tab.pageTitle = title ?: @"New Tab";
+      // CEF reports "about:blank" as the title of a blank page — never let
+      // that reach the chrome.
+      tab.pageTitle = BroURLIsBlank(title) ? kBroBlankTabTitle : title;
       break;
     }
   }
@@ -1703,38 +1943,78 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   return self.frame.size.width - (kAddTabButtonSize + 8.0);
 }
 
-// Fits pills to the available strip width (minus the "+" button), capped at
-// the mockup's pill width. Only meaningful while the strip is roomy — once
-// pills would go narrower than kTabPillTextMinWidth the layout switches to
-// squares and this stops describing every pill (see -tabWidths).
+// Pinned pills are kept as a strict prefix of _tabs; every layout and drag
+// computation leans on that invariant.
+- (NSUInteger)pinnedCount {
+  NSUInteger count = 0;
+  for (BroTabView* tab in _tabs) {
+    if (!tab.pinned) {
+      break;
+    }
+    count++;
+  }
+  return count;
+}
+
+// Pinned pills that render as squares: all of them except an active one,
+// which expands so the hosted address field stays usable.
+- (NSUInteger)squarePinnedCount {
+  NSUInteger count = 0;
+  for (BroTabView* tab in _tabs) {
+    if (!tab.pinned) {
+      break;
+    }
+    if (!tab.isActive) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// Strip width left for expandable pills once the pinned squares took theirs.
+- (CGFloat)expandableStripWidth {
+  return [self availableStripWidth] -
+         (CGFloat)[self squarePinnedCount] * (kTabPillSquareWidth + 8.0);
+}
+
+// Fits expandable pills to the remaining strip width (minus the "+" button
+// and the pinned squares), capped at the mockup's pill width. Only meaningful
+// while the strip is roomy — once pills would go narrower than
+// kTabPillTextMinWidth the layout switches to squares and this stops
+// describing every pill (see -tabWidths).
 - (CGFloat)fittedTabWidth {
-  NSUInteger count = MAX(_tabs.count, (NSUInteger)1);
-  CGFloat fitWidth = [self availableStripWidth] / count - 8.0;
+  NSUInteger count = MAX(_tabs.count - [self squarePinnedCount], (NSUInteger)1);
+  CGFloat fitWidth = [self expandableStripWidth] / count - 8.0;
   return MIN(MAX(fitWidth, kTabPillSquareWidth), kTabPillMaxWidth);
 }
 
 // YES once an even split would leave no room for text: pills become squares.
 - (BOOL)isCollapsed {
-  NSUInteger count = MAX(_tabs.count, (NSUInteger)1);
-  return [self availableStripWidth] / count - 8.0 < kTabPillTextMinWidth;
+  NSUInteger count = MAX(_tabs.count - [self squarePinnedCount], (NSUInteger)1);
+  return [self expandableStripWidth] / count - 8.0 < kTabPillTextMinWidth;
 }
 
-// Width of one drag slot. Collapsed, the pills the dragged pill travels past
-// are squares, so slots are square-sized even though the carried pill is not.
-- (CGFloat)dragSlotWidth {
-  return ([self isCollapsed] ? kTabPillSquareWidth : [self fittedTabWidth]) + 8.0;
+// Width of one drag slot for `tab`. Pinned pills only travel their group of
+// squares. Collapsed (or pinned), the pills the dragged pill travels past are
+// squares, so slots are square-sized even though the carried pill may not be.
+- (CGFloat)dragSlotWidthForTab:(BroTabView*)tab {
+  return (tab.pinned || [self isCollapsed] ? kTabPillSquareWidth
+                                           : [self fittedTabWidth]) +
+         8.0;
 }
 
-// Per-pill widths in strip order. Uniform while there is room; collapsed, every
-// inactive pill is a square and the active one takes the leftover space so its
-// URL stays readable and editable.
+// Per-pill widths in strip order. Pinned inactive pills are always squares;
+// the rest are uniform while there is room. Collapsed, every inactive pill is
+// a square and the active one takes the leftover space so its URL stays
+// readable and editable.
 - (NSArray<NSNumber*>*)tabWidths {
   NSMutableArray<NSNumber*>* widths =
       [NSMutableArray arrayWithCapacity:_tabs.count];
   if (![self isCollapsed]) {
     CGFloat uniform = [self fittedTabWidth];
-    for (NSUInteger i = 0; i < _tabs.count; i++) {
-      [widths addObject:@(uniform)];
+    for (BroTabView* tab in _tabs) {
+      [widths addObject:@(tab.pinned && !tab.isActive ? kTabPillSquareWidth
+                                                      : uniform)];
     }
     return widths;
   }
@@ -1763,8 +2043,10 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   for (BroTabView* tab in _tabs) {
     CGFloat tabWidth = widths[index++].doubleValue;
     // Narrow pills drop the close button so it doesn't crowd the favicon and
-    // title; narrower still they keep only the favicon.
-    tab.closable = _tabs.count > 1 && tabWidth >= kTabPillCloseMinWidth;
+    // title; narrower still they keep only the favicon. Pinned pills never
+    // show ✕ (Cmd+W still closes them).
+    tab.closable =
+        !tab.pinned && _tabs.count > 1 && tabWidth >= kTabPillCloseMinWidth;
     tab.iconOnly = tabWidth < kTabPillTextMinWidth;
     NSRect target = NSMakeRect(x, pillY, tabWidth, kTabPillHeight);
     if (dragging_ && tab == draggingTab_) {
@@ -1774,7 +2056,9 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     } else {
       tab.frame = target;
     }
-    x += tabWidth + 8.0;
+    // The split pair sits nearly flush (a 1pt seam) so it reads as one
+    // joined control; every other neighbor keeps the normal gap.
+    x += tabWidth + (tab.joinedSide == 1 ? 1.0 : 8.0);
   }
 
   NSRect addTarget =
@@ -1831,7 +2115,16 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (dragging_) {
     return;
   }
+  [hoverCardHideTimer_ invalidate];
+  hoverCardHideTimer_ = nil;
   [hoverCardTimer_ invalidate];
+  hoverCardTimer_ = nil;
+  // Once a card is up, moving across pills retargets it without a new dwell
+  // (like every browser's tab strip).
+  if (hoverCard_ && !hoverCard_.hidden) {
+    [self showHoverCardForTab:tab];
+    return;
+  }
   __weak BroTabView* weakTab = tab;
   __weak BroTabBar* weakSelf = self;
   hoverCardTimer_ =
@@ -1848,12 +2141,42 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 }
 
 - (void)tabHoverEnded:(BroTabView*)tab {
-  [self hideHoverCard];
+  // A dwell that hasn't fired is simply abandoned; a visible card gets the
+  // grace period so the mouse can travel onto it.
+  [hoverCardTimer_ invalidate];
+  hoverCardTimer_ = nil;
+  [self scheduleHoverCardHide];
+}
+
+- (void)cardHoverBegan {
+  [hoverCardHideTimer_ invalidate];
+  hoverCardHideTimer_ = nil;
+}
+
+- (void)cardHoverEnded {
+  [self scheduleHoverCardHide];
+}
+
+- (void)scheduleHoverCardHide {
+  [hoverCardHideTimer_ invalidate];
+  hoverCardHideTimer_ = nil;
+  if (!hoverCard_ || hoverCard_.hidden) {
+    return;
+  }
+  __weak BroTabBar* weakSelf = self;
+  hoverCardHideTimer_ =
+      [NSTimer scheduledTimerWithTimeInterval:kHoverCardHideGrace
+                                      repeats:NO
+                                        block:^(NSTimer* timer) {
+        [weakSelf hideHoverCard];
+      }];
 }
 
 - (void)hideHoverCard {
   [hoverCardTimer_ invalidate];
   hoverCardTimer_ = nil;
+  [hoverCardHideTimer_ invalidate];
+  hoverCardHideTimer_ = nil;
   hoverCard_.hidden = YES;
   hoverCardTabId_ = -1;
 }
@@ -1863,6 +2186,112 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 - (NSString*)hoverCardTitleForTab:(BroTabView*)tab {
   return tab.pageTitle.length > 0 ? tab.pageTitle
                                   : BroDisplayHostForURL(tab.tabURL);
+}
+
+- (BroTabView*)tabWithBrowserId:(int)browserId {
+  for (BroTabView* tab in _tabs) {
+    if (tab.browserId == browserId) {
+      return tab;
+    }
+  }
+  return nil;
+}
+
+- (void)configureHoverCardButtonsForTab:(BroTabView*)tab {
+  BroHoverButton* pin = hoverCard_.pinButton;
+  pin.image = RadixIconImage(
+      tab.pinned ? RadixIconDrawingPinFilled : RadixIconDrawingPin, 12);
+  pin.toolTip = tab.pinned ? @"Unpin Tab" : @"Pin Tab";
+  pin.accessibilityLabel = pin.toolTip;
+  pin.target = self;
+  pin.action = @selector(hoverCardPinPressed:);
+
+  BroHoverButton* split = hoverCard_.splitButton;
+  split.image = RadixIconImage(RadixIconViewVertical, 12);
+  BOOL isPane = SplitActive() && (tab.browserId == g_split_browser_id ||
+                                  tab.browserId == _activeTabId);
+  split.selectedState = isPane;
+  // A non-active tab becomes the right pane; the active tab pairs with its
+  // next neighbor; either pane's button exits the split. Only a lone tab has
+  // nothing to split with.
+  split.enabled = isPane || _tabs.count > 1;
+  split.toolTip = isPane ? @"Exit Split Screen" : @"Split Screen";
+  split.accessibilityLabel = split.toolTip;
+  split.target = self;
+  split.action = @selector(hoverCardSplitPressed:);
+}
+
+- (void)hoverCardPinPressed:(id)sender {
+  BroTabView* tab = [self tabWithBrowserId:hoverCardTabId_];
+  [self hideHoverCard];
+  if (tab) {
+    [self togglePinForTab:tab];
+  }
+}
+
+- (void)hoverCardSplitPressed:(id)sender {
+  int browserId = hoverCardTabId_;
+  [self hideHoverCard];
+  if (browserId < 0) {
+    return;
+  }
+  // On the active tab's own card there is no "other" tab in hand; pair it
+  // with its neighbor, same as the Window menu item.
+  if (browserId == _activeTabId && !SplitActive()) {
+    [self splitActiveTabWithNextTab];
+    return;
+  }
+  ToggleSplitForTab(browserId);
+}
+
+- (void)splitActiveTabWithNextTab {
+  NSInteger count = (NSInteger)_tabs.count;
+  if (count < 2) {
+    return;
+  }
+  NSInteger index = 0;
+  for (NSInteger i = 0; i < count; i++) {
+    if (_tabs[i].browserId == _activeTabId) {
+      index = i;
+      break;
+    }
+  }
+  ToggleSplitForTab(_tabs[(index + 1) % count].browserId);
+}
+
+- (void)ensureSplitPairAdjacent {
+  if (!dragging_ && SplitActive()) {
+    BroHandler* handler = BroHandler::GetInstance();
+    int activeId = handler ? handler->GetActiveBrowserId() : -1;
+    NSUInteger activeIndex = BroTabStripIndex(activeId);
+    NSUInteger splitIndex = BroTabStripIndex(g_split_browser_id);
+    if (activeIndex != NSNotFound && splitIndex != NSNotFound) {
+      BroTabView* activeTab = _tabs[activeIndex];
+      BroTabView* splitTab = _tabs[splitIndex];
+      NSUInteger gap = activeIndex > splitIndex ? activeIndex - splitIndex
+                                                : splitIndex - activeIndex;
+      // Never carry a pill across the pinned prefix; a cross-group pair just
+      // stays where it is (no joined rendering, still a working split).
+      if (gap != 1 && activeTab.pinned == splitTab.pinned) {
+        [_tabs removeObjectAtIndex:splitIndex];
+        NSUInteger target = [_tabs indexOfObject:activeTab];
+        if (splitIndex > activeIndex) {
+          target += 1;  // was after the active pill; stays on its right
+        }
+        [_tabs insertObject:splitTab atIndex:target];
+      }
+    }
+  }
+  // Styling first: the joined-pair seam feeds the gap applyTabLayout uses
+  // (and on split exit this restores the normal gap and corners).
+  RefreshSplitPaneStyling();
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = 0.18;
+    ctx.timingFunction = [CAMediaTimingFunction
+        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [self applyTabLayout:YES];
+  } completionHandler:nil];
+  [self.window recalculateKeyViewLoop];
 }
 
 - (void)showHoverCardForTab:(BroTabView*)tab {
@@ -1878,22 +2307,27 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   // occlude it.
   [hoverCard_ removeFromSuperview];
   [container addSubview:hoverCard_];
+  hoverCard_.hoverDelegate = self;
   hoverCardTabId_ = tab.browserId;
+  [self configureHoverCardButtonsForTab:tab];
 
-  CGFloat width = MIN(kHoverCardWidth, NSWidth(container.bounds) - 16.0);
+  // The card matches the hovered pill's width, reading as a dropdown of the
+  // pill; collapsed squares get the pill minimum so the text stays legible.
+  CGFloat width = MIN(MAX(NSWidth(tab.frame), kTabPillMinWidth),
+                      NSWidth(container.bounds) - 16.0);
   if (width < 100.0) {
     return;  // window too narrow for a useful card
   }
   if (BroURLIsBlank(tab.tabURL)) {
     // Blank tabs have no URL or metadata worth showing; the card invites
     // instead (mirrors the address field's empty state).
-    [hoverCard_ setTitle:@"New Tab"
+    [hoverCard_ setTitle:kBroBlankTabTitle
                      url:@"Ask anything…"
          pageDescription:nil
                    width:width];
   } else {
     [hoverCard_ setTitle:[self hoverCardTitleForTab:tab]
-                     url:tab.tabURL
+                     url:BroDisplayHostForURL(tab.tabURL)
          pageDescription:tab.pageDescription
                    width:width];
   }
@@ -1937,7 +2371,7 @@ static NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     if (hoverCardTabId_ == browserId && hoverCard_ && !hoverCard_.hidden &&
         !BroURLIsBlank(tab.tabURL)) {
       [hoverCard_ setTitle:[self hoverCardTitleForTab:tab]
-                       url:tab.tabURL
+                       url:BroDisplayHostForURL(tab.tabURL)
            pageDescription:tab.pageDescription
                      width:hoverCard_.frame.size.width];
       [self positionHoverCardForTab:tab];
@@ -2104,6 +2538,226 @@ static void ApplyViewportFrameToContainer(NSView* container, BOOL mobile) {
   }
 }
 
+static BOOL SplitActive(void) {
+  return g_split_browser_id >= 0 &&
+         g_browser_views[@(g_split_browser_id)] != nil;
+}
+
+// Strip index of a tab's pill; NSNotFound once the pill is gone.
+static NSUInteger BroTabStripIndex(int browser_id) {
+  NSArray<BroTabView*>* tabs = g_tab_bar.tabs;
+  for (NSUInteger i = 0; i < tabs.count; i++) {
+    if (tabs[i].browserId == browser_id) {
+      return i;
+    }
+  }
+  return NSNotFound;
+}
+
+// The divider's x for a given browser-area width: the dragged ratio, kept
+// far enough from the edges that neither pane collapses.
+static CGFloat SplitDividerX(CGFloat totalWidth) {
+  CGFloat x = floor(totalWidth * g_split_ratio);
+  if (totalWidth < 240.0) {
+    return floor(totalWidth / 2.0);
+  }
+  return MAX(120.0, MIN(totalWidth - 120.0, x));
+}
+
+#pragma mark - BroSplitDivider
+
+// The boundary between the split halves: a hairline with a centered grip
+// knob, in a 9pt-wide grab strip floating above both panes. Dragging it
+// re-balances the split (updates g_split_ratio and reframes the panes live).
+static const CGFloat kSplitDividerGrabWidth = 9.0;
+static BOOL g_split_divider_dragging = NO;
+
+@interface BroSplitDivider : NSView
+@end
+
+@implementation BroSplitDivider {
+  NSView* grip_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    NSView* line = [[NSView alloc]
+        initWithFrame:NSMakeRect((kSplitDividerGrabWidth - 1.0) / 2.0, 0, 1.0,
+                                 frame.size.height)];
+    line.wantsLayer = YES;
+    line.layer.backgroundColor = BroControlBorderColor().CGColor;
+    line.autoresizingMask = NSViewHeightSizable;
+    [self addSubview:line];
+
+    // The grip: a small rounded bar centered on the line, the visual
+    // affordance that the boundary is draggable.
+    grip_ = [[NSView alloc]
+        initWithFrame:NSMakeRect((kSplitDividerGrabWidth - 4.0) / 2.0,
+                                 (frame.size.height - 44.0) / 2.0, 4.0, 44.0)];
+    grip_.wantsLayer = YES;
+    grip_.layer.cornerRadius = 2.0;
+    grip_.layer.backgroundColor =
+        [NSColor colorWithWhite:1.0 alpha:0.4].CGColor;
+    grip_.autoresizingMask = NSViewMinYMargin | NSViewMaxYMargin;
+    [self addSubview:grip_];
+  }
+  return self;
+}
+
+// The divider sits in the full-size-content title-bar-free window; without
+// this a drag would move the window instead of the boundary.
+- (BOOL)mouseDownCanMoveWindow {
+  return NO;
+}
+
+- (void)resetCursorRects {
+  [self addCursorRect:self.bounds cursor:[NSCursor resizeLeftRightCursor]];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  g_split_divider_dragging = YES;
+  [[NSCursor resizeLeftRightCursor] push];
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+  NSView* parent = self.superview;
+  CGFloat width = NSWidth(parent.bounds);
+  if (!SplitActive() || width <= 0) {
+    return;
+  }
+  [[NSCursor resizeLeftRightCursor] set];
+  NSPoint p = [parent convertPoint:event.locationInWindow fromView:nil];
+  g_split_ratio = MAX(0.15, MIN(0.85, p.x / width));
+  UpdateChromeLayout();
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  g_split_divider_dragging = NO;
+  [NSCursor pop];
+}
+
+@end
+
+static BroSplitDivider* g_split_divider = nil;
+
+static void UpdateSplitDivider(void) {
+  NSView* parent = g_main_window.browserContainer;
+  if (!parent) {
+    return;
+  }
+  if (!g_split_divider) {
+    g_split_divider = [[BroSplitDivider alloc]
+        initWithFrame:NSMakeRect(0, 0, kSplitDividerGrabWidth,
+                                 NSHeight(parent.bounds))];
+  }
+  // The divider must stack above both CEF pane views to catch the mouse;
+  // containers re-attach above it, so re-add last — except mid-drag, when
+  // tearing the view out from under its own mouse tracking would end it.
+  if (g_split_divider.superview != parent ||
+      (!g_split_divider_dragging &&
+       parent.subviews.lastObject != g_split_divider)) {
+    [g_split_divider removeFromSuperview];
+    [parent addSubview:g_split_divider];
+  }
+  NSRect bounds = parent.bounds;
+  g_split_divider.frame = NSMakeRect(
+      SplitDividerX(bounds.size.width) - (kSplitDividerGrabWidth - 1.0) / 2.0,
+      0, kSplitDividerGrabWidth, bounds.size.height);
+  g_split_divider.autoresizingMask =
+      NSViewMinXMargin | NSViewMaxXMargin | NSViewHeightSizable;
+  g_split_divider.hidden = !SplitActive();
+  [g_split_divider.window invalidateCursorRectsForView:g_split_divider];
+}
+
+// Frames a tab container for its role: full-bleed (or the centered mobile
+// column) normally; half the browser area while split screen is active, with
+// a 2pt gutter. Panes mirror the tab strip: the earlier pill is the left
+// half, so activating the other pane never makes the pages swap sides. A
+// mobile-emulated tab centers its 390pt column within whatever region it got.
+static void ApplyFrameForTabContainer(NSView* container, int browser_id) {
+  BroHandler* handler = BroHandler::GetInstance();
+  int active_id = handler ? handler->GetActiveBrowserId() : -1;
+  if (!SplitActive() ||
+      (browser_id != active_id && browser_id != g_split_browser_id)) {
+    ApplyViewportFrameToContainer(container, TabIsMobile(browser_id));
+    return;
+  }
+  NSRect bounds = g_main_window.browserContainer.bounds;
+  CGFloat split_x = SplitDividerX(bounds.size.width);
+  int other_id = (browser_id == active_id) ? g_split_browser_id : active_id;
+  NSUInteger mine = BroTabStripIndex(browser_id);
+  NSUInteger theirs = BroTabStripIndex(other_id);
+  BOOL left = (mine != NSNotFound && theirs != NSNotFound)
+                  ? mine < theirs
+                  : (browser_id == active_id);
+  NSRect region =
+      left ? NSMakeRect(0, 0, split_x - 1.0, bounds.size.height)
+           : NSMakeRect(split_x + 1.0, 0, bounds.size.width - split_x - 1.0,
+                        bounds.size.height);
+  if (TabIsMobile(browser_id)) {
+    CGFloat width = MIN(kMobileViewportWidth, region.size.width);
+    region.origin.x += (region.size.width - width) / 2.0;
+    region.size.width = width;
+    container.frame = region;
+    container.autoresizingMask =
+        NSViewMinXMargin | NSViewMaxXMargin | NSViewHeightSizable;
+    return;
+  }
+  container.frame = region;
+  // Both halves and their margins scale by the same factor during a live
+  // resize, preserving the 50/50 split until UpdateChromeLayout re-derives
+  // exact frames.
+  container.autoresizingMask =
+      left ? (NSViewWidthSizable | NSViewMaxXMargin | NSViewHeightSizable)
+           : (NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable);
+}
+
+// Reflects the current split panes into the pill styling: the right pane gets
+// the active-ish border (BroTabView.isSplitPane), and when the pair's pills
+// are adjacent they render as one joined control (BroTabView.joinedSide)
+// mirroring the panes below.
+static void RefreshSplitPaneStyling(void) {
+  BOOL active = SplitActive();
+  for (BroTabView* tab in g_tab_bar.tabs) {
+    tab.isSplitPane = active && tab.browserId == g_split_browser_id;
+    tab.joinedSide = 0;
+  }
+  if (!active) {
+    return;
+  }
+  BroHandler* handler = BroHandler::GetInstance();
+  int active_id = handler ? handler->GetActiveBrowserId() : -1;
+  NSUInteger ai = BroTabStripIndex(active_id);
+  NSUInteger si = BroTabStripIndex(g_split_browser_id);
+  if (ai == NSNotFound || si == NSNotFound ||
+      (ai > si ? ai - si : si - ai) != 1) {
+    return;
+  }
+  g_tab_bar.tabs[MIN(ai, si)].joinedSide = 1;
+  g_tab_bar.tabs[MAX(ai, si)].joinedSide = 2;
+}
+
+// Ends the split and forgets its drag-adjusted balance.
+static void ClearSplit(void) {
+  g_split_browser_id = -1;
+  g_split_ratio = 0.5;
+  RefreshSplitPaneStyling();
+}
+
+// Drops the split when it stops making sense: its tab was closed, or the
+// split tab was promoted to active without going through the pane swap (e.g.
+// the handler picked it after the active tab closed).
+static void ValidateSplitState(int active_browser_id) {
+  if (g_split_browser_id < 0) {
+    return;
+  }
+  if (g_split_browser_id == active_browser_id ||
+      g_browser_views[@(g_split_browser_id)] == nil) {
+    ClearSplit();
+  }
+}
+
 // Creates a hidden per-tab container view inside the main browser area.
 // The browser created into it is adopted as a tab in OnTabCreated, which
 // finds the container as the superview of the browser's native view.
@@ -2117,12 +2771,6 @@ static NSView* CreateTabContainerView(void) {
   browserContainer.hidden = YES;  // Will be shown when tab is activated
   [g_main_window.browserContainer addSubview:browserContainer];
   return browserContainer;
-}
-
-// Blank pages (and browsers with no committed URL yet) keep their opaque CEF
-// view hidden so the glass window shows through instead of a black rectangle.
-static BOOL BroURLIsBlank(NSString* url) {
-  return url.length == 0 || [url isEqualToString:@"about:blank"];
 }
 
 // True while the whole window is occluded (miniaturized or fully covered);
@@ -2139,11 +2787,21 @@ static BOOL g_window_occluded = NO;
 // viewDidMoveToWindow(nil) is the signal the render widget host actually
 // honors (measured: rAF frozen, timers at 1Hz).
 static void UpdateTabContainerVisibility(int active_browser_id) {
+  // Mid-animation attach/detach would snap the animating frames (the toggle's
+  // own deferred reload fires OnTabURLChanged); park it for the completion.
+  if (g_viewport_animating) {
+    g_visibility_update_pending = YES;
+    return;
+  }
   BroHandler* handler = BroHandler::GetInstance();
+  ValidateSplitState(active_browser_id);
   NSView* parent = g_main_window.browserContainer;
   for (NSNumber* key in g_browser_views) {
-    BOOL hidden = (key.intValue != active_browser_id) ||
-                  [g_blank_tab_ids containsObject:key];
+    // Split screen widens the visible set to both panes; each stays attached
+    // and unthrottled (SetBrowserHidden(false)) while on screen.
+    BOOL visible = key.intValue == active_browser_id ||
+                   (SplitActive() && key.intValue == g_split_browser_id);
+    BOOL hidden = !visible || [g_blank_tab_ids containsObject:key];
     NSView* container = g_browser_views[key];
     BOOL detached = hidden || g_window_occluded;
     if (detached) {
@@ -2154,7 +2812,7 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
       }
     } else if (parent && container.superview != parent) {
       [parent addSubview:container];
-      ApplyViewportFrameToContainer(container, TabIsMobile(key.intValue));
+      ApplyFrameForTabContainer(container, key.intValue);
     }
     container.hidden = hidden;
     if (handler) {
@@ -2167,6 +2825,7 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
       [[NSColor blackColor]
           colorWithAlphaComponent:glass ? kGlassTintAlpha : 1.0]
           .CGColor;
+  UpdateSplitDivider();
 }
 
 static void UpdateChromeLayout(void) {
@@ -2174,25 +2833,44 @@ static void UpdateChromeLayout(void) {
     return;
   }
   for (NSNumber* key in g_browser_views) {
-    ApplyViewportFrameToContainer(g_browser_views[key],
-                                  TabIsMobile(key.intValue));
+    // Detached (throttled) containers get their frame on re-attach in
+    // UpdateTabContainerVisibility; re-framing them here is wasted work.
+    if (!g_browser_views[key].superview) {
+      continue;
+    }
+    ApplyFrameForTabContainer(g_browser_views[key], key.intValue);
   }
+  UpdateSplitDivider();
 }
 
 // Resizes the shell to hug the mobile viewport (or back to the saved desktop
 // frame), animating the window and the active tab's container as one motion.
 static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
+  UpdateWindowForViewportMode(mobile, animate, nil);
+}
+
+static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
+                                        void (^completion)(void)) {
   if (!g_main_window) {
+    if (completion) {
+      completion();
+    }
     return;
   }
   // In native fullscreen the shell can't hug the viewport; keep the current
   // centered-column behavior. windowDidExitFullScreen: re-syncs afterwards.
   if ((g_main_window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
     UpdateChromeLayout();
+    if (completion) {
+      completion();
+    }
     return;
   }
   if (mobile == g_window_in_mobile_layout) {
     UpdateChromeLayout();
+    if (completion) {
+      completion();
+    }
     return;
   }
   g_window_in_mobile_layout = mobile;
@@ -2230,21 +2908,51 @@ static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
       mobile ? NSMakeRect((contentWidth - columnWidth) / 2.0, 0, columnWidth,
                           contentHeight)
              : NSMakeRect(0, 0, contentWidth, contentHeight);
+  if (!mobile && SplitActive()) {
+    // The active container only owns one half while split (which half follows
+    // strip order); finish()'s UpdateChromeLayout re-derives both panes
+    // exactly.
+    CGFloat splitX = SplitDividerX(contentWidth);
+    BroHandler* h = BroHandler::GetInstance();
+    int active = h ? h->GetActiveBrowserId() : -1;
+    NSUInteger mine = BroTabStripIndex(active);
+    NSUInteger theirs = BroTabStripIndex(g_split_browser_id);
+    BOOL activeLeft = mine == NSNotFound || theirs == NSNotFound || mine < theirs;
+    containerTarget.origin.x = activeLeft ? 0 : splitX + 1.0;
+    containerTarget.size.width =
+        activeLeft ? splitX - 1.0 : contentWidth - splitX - 1.0;
+  }
 
   BroHandler* handler = BroHandler::GetInstance();
   int activeId = handler ? handler->GetActiveBrowserId() : -1;
   NSView* activeContainer =
       (activeId >= 0) ? g_browser_views[@(activeId)] : nil;
+  NSView* cefView = activeContainer.subviews.firstObject;
 
   void (^finish)(void) = ^{
-    // A newer toggle owns the layout now; let its completion do the work.
+    // A newer toggle owns the layout now; let its completion do the work
+    // (and its reload — dropping this completion is what coalesces rapid
+    // toggles into a single reload with the final state).
     if (token != g_viewport_anim_token || !g_main_window) {
       return;
     }
+    g_viewport_animating = NO;
     UpdateChromeLayout();  // exact frames + proper autoresizing masks
+    cefView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    cefView.frame = activeContainer.bounds;
     if (!mobile) {
       g_main_window.minSize = NSMakeSize(760, 400);
       g_saved_desktop_frame = NSZeroRect;
+    }
+    if (g_visibility_update_pending) {
+      g_visibility_update_pending = NO;
+      BroHandler* h = BroHandler::GetInstance();
+      if (h) {
+        UpdateTabContainerVisibility(h->GetActiveBrowserId());
+      }
+    }
+    if (completion) {
+      completion();
     }
   };
 
@@ -2256,17 +2964,72 @@ static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
 
   // Freeze autoresizing on the visible container so the window animation's
   // per-tick autoresize doesn't fight the animator; finish() restores the
-  // proper mask via ApplyViewportFrameToContainer.
+  // proper mask via ApplyViewportFrameToContainer. The CEF view inside is
+  // frozen too and snapped straight to its final size: resizing the render
+  // widget every animation tick forces Chromium to re-layout and allocate a
+  // new compositor surface ~17 times per toggle, which is what made the
+  // transition stutter. The animating container just clips/reveals it.
+  activeContainer.wantsLayer = YES;
+  activeContainer.layer.masksToBounds = YES;
+  cefView.autoresizingMask = NSViewNotSizable;
+  cefView.frame = NSMakeRect(0, 0, containerTarget.size.width,
+                             containerTarget.size.height);
   activeContainer.autoresizingMask = NSViewNotSizable;
+  g_viewport_animating = YES;
   [NSAnimationContext
       runAnimationGroup:^(NSAnimationContext* ctx) {
         ctx.duration = kViewportAnimDuration;
         ctx.timingFunction = [CAMediaTimingFunction
             functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-        [[g_main_window animator] setFrame:target display:YES];
+        [[g_main_window animator] setFrame:target display:NO];
         [[activeContainer animator] setFrame:containerTarget];
       }
       completionHandler:finish];
+}
+
+// Enters or exits split screen for |browser_id| (hover-card button and menu
+// item). A non-active tab becomes the right pane; either pane toggles the
+// split off; the active tab alone is a no-op (nothing to pair with).
+static void ToggleSplitForTab(int browser_id) {
+  BroHandler* handler = BroHandler::GetInstance();
+  if (!handler) {
+    return;
+  }
+  int active_id = handler->GetActiveBrowserId();
+  if (SplitActive() &&
+      (browser_id == g_split_browser_id || browser_id == active_id)) {
+    ClearSplit();
+  } else if (browser_id != active_id &&
+             g_browser_views[@(browser_id)] != nil) {
+    g_split_browser_id = browser_id;
+  } else {
+    return;
+  }
+  // Reorders the pair's pills to sit joined (or restores normal pills on
+  // exit) and refreshes the pane styling either way.
+  [g_tab_bar ensureSplitPairAdjacent];
+  // The split layout is desktop-shaped: leave the mobile shell while split,
+  // re-hug the active tab's viewport on exit. Either way the completion (or
+  // the early-out) runs UpdateChromeLayout, which frames the panes.
+  UpdateWindowForViewportMode(SplitActive() ? NO : TabIsMobile(active_id),
+                              YES);
+  UpdateTabContainerVisibility(active_id);
+}
+
+// Drag-to-join: a pill dropped onto another one splits the two tabs, the
+// dragged tab active. Any prior split gives way to the new pair.
+static void JoinTabsInSplit(int dragged_id, int target_id) {
+  BroHandler* handler = BroHandler::GetInstance();
+  if (!handler || dragged_id == target_id) {
+    return;
+  }
+  if (SplitActive()) {
+    ClearSplit();
+  }
+  // Main thread == CEF UI thread, so this activates synchronously and the
+  // toggle below pairs the target with the freshly active dragged tab.
+  handler->SetActiveBrowser(dragged_id);
+  ToggleSplitForTab(target_id);
 }
 
 // Chrome's preset zoom stops. CEF zoom levels are logarithmic:
@@ -2328,7 +3091,7 @@ static void ShowZoomHUD(int percent) {
     g_zoom_hud_label.bezeled = NO;
     g_zoom_hud_label.bordered = NO;
     g_zoom_hud_label.drawsBackground = NO;
-    g_zoom_hud_label.font = [NSFont boldSystemFontOfSize:14.0];
+    g_zoom_hud_label.font = BroUIFontBold(14.0);
     g_zoom_hud_label.textColor = [NSColor whiteColor];
     g_zoom_hud_label.alignment = NSTextAlignmentCenter;
     [g_zoom_hud addSubview:g_zoom_hud_label];
@@ -2686,6 +3449,15 @@ static void CreateNewBrowserTab(void) {
   nextTabShifted.hidden = YES;
   [windowMenu addItem:nextTabShifted];
 
+  // Tab actions; validateMenuItem: retitles them to match the current state.
+  [windowMenu addItem:[NSMenuItem separatorItem]];
+  [windowMenu addItemWithTitle:@"Pin Tab"
+                        action:@selector(togglePinActiveTab:)
+                 keyEquivalent:@""];
+  [windowMenu addItemWithTitle:@"Split Screen"
+                        action:@selector(toggleSplitScreen:)
+                 keyEquivalent:@""];
+
   // Cmd+1..8 jump to that tab; Cmd+9 jumps to the last tab (tag -1).
   [windowMenu addItem:[NSMenuItem separatorItem]];
   for (NSUInteger i = 0; i < 8; i++) {
@@ -2862,6 +3634,23 @@ static void CreateNewBrowserTab(void) {
   [g_tab_bar activateTabRelativeToActiveWithOffset:-1];
 }
 
+- (void)togglePinActiveTab:(id)sender {
+  for (BroTabView* tab in g_tab_bar.tabs) {
+    if (tab.browserId == g_tab_bar.activeTabId) {
+      [g_tab_bar togglePinForTab:tab];
+      return;
+    }
+  }
+}
+
+- (void)toggleSplitScreen:(id)sender {
+  if (SplitActive()) {
+    ToggleSplitForTab(g_split_browser_id);
+    return;
+  }
+  [g_tab_bar splitActiveTabWithNextTab];
+}
+
 // The delegate is the responder-chain target for every no-target menu item,
 // so the default branch must stay YES to keep the rest auto-enabled.
 - (BOOL)validateMenuItem:(NSMenuItem*)menuItem {
@@ -2887,6 +3676,21 @@ static void CreateNewBrowserTab(void) {
   }
   if (action == @selector(reopenClosedTab:)) {
     return g_closed_tab_urls.count > 0;
+  }
+  if (action == @selector(togglePinActiveTab:)) {
+    BroTabView* active = nil;
+    for (BroTabView* tab in g_tab_bar.tabs) {
+      if (tab.browserId == g_tab_bar.activeTabId) {
+        active = tab;
+        break;
+      }
+    }
+    menuItem.title = active.pinned ? @"Unpin Tab" : @"Pin Tab";
+    return active != nil;
+  }
+  if (action == @selector(toggleSplitScreen:)) {
+    menuItem.title = SplitActive() ? @"Exit Split Screen" : @"Split Screen";
+    return SplitActive() || (g_tab_bar && g_tab_bar.tabs.count > 1);
   }
   return YES;
 }
@@ -2978,6 +3782,9 @@ static void CreateNewBrowserTab(void) {
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
+  g_split_browser_id = -1;
+  g_split_ratio = 0.5;
+  g_split_divider = nil;
   [g_browser_views removeAllObjects];
   [g_blank_tab_ids removeAllObjects];
   [g_closed_tab_urls removeAllObjects];
@@ -3100,7 +3907,7 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
 
   // Add tab to tab bar
   if (g_tab_bar) {
-    [g_tab_bar addTabWithBrowserId:browser_id title:@"New Tab"];
+    [g_tab_bar addTabWithBrowserId:browser_id title:kBroBlankTabTitle];
     [g_tab_bar updateTabURL:browser_id url:urlStr];
     [g_tab_bar setActiveTab:browser_id];
   }
@@ -3121,6 +3928,9 @@ void DetachTabView(int browser_id) {
   // Deferred so the view teardown (which destroys the CEF browser) doesn't
   // re-enter CEF from inside DoClose.
   dispatch_async(dispatch_get_main_queue(), ^{
+    if (browser_id == g_split_browser_id) {
+      ClearSplit();
+    }
     NSView* containerView = g_browser_views[@(browser_id)];
     if (containerView) {
       [containerView removeFromSuperview];
@@ -3234,6 +4044,11 @@ void OnTabClosed(int browser_id) {
       [g_tab_bar removeTabWithBrowserId:browser_id];
     }
 
+    // A closed split pane ends the split; the survivor goes full-bleed below.
+    if (browser_id == g_split_browser_id) {
+      ClearSplit();
+    }
+
     // Remove and destroy the container view
     NSView* containerView = g_browser_views[@(browser_id)];
     if (containerView) {
@@ -3241,20 +4056,41 @@ void OnTabClosed(int browser_id) {
       [g_browser_views removeObjectForKey:@(browser_id)];
     }
     [g_blank_tab_ids removeObject:@(browser_id)];
+
+    BroHandler* handler = BroHandler::GetInstance();
+    if (handler && g_main_window) {
+      UpdateTabContainerVisibility(handler->GetActiveBrowserId());
+      UpdateChromeLayout();
+    }
   });
 }
 
 void OnActiveTabChanged(int browser_id) {
   BroRunOnMain(^{
+    // Selecting the right pane swaps panes instead of ending the split: the
+    // outgoing active tab takes the right slot and the clicked tab becomes
+    // the active/left one, so the address bar and shortcuts follow it.
+    if (SplitActive() && browser_id == g_split_browser_id && g_tab_bar &&
+        g_tab_bar.activeTabId != browser_id) {
+      g_split_browser_id = g_tab_bar.activeTabId;
+    }
+
     // Update tab bar
     if (g_tab_bar) {
       [g_tab_bar setActiveTab:browser_id];
+      // The pair may have changed (pane swap above, or a third tab replacing
+      // the left pane); keep its pills joined and styled.
+      if (SplitActive()) {
+        [g_tab_bar ensureSplitPairAdjacent];
+      }
     }
 
     UpdateTabContainerVisibility(browser_id);
 
-    // The shell follows the active tab's viewport mode.
-    UpdateWindowForViewportMode(TabIsMobile(browser_id), YES);
+    // The shell follows the active tab's viewport mode; while split it stays
+    // desktop-shaped regardless of per-tab emulation.
+    UpdateWindowForViewportMode(SplitActive() ? NO : TabIsMobile(browser_id),
+                                YES);
   });
 }
 

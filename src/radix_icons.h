@@ -16,6 +16,9 @@ typedef NS_ENUM(NSInteger, RadixIcon) {
   RadixIconDesktop,
   RadixIconMobile,
   RadixIconGlobe,
+  RadixIconDrawingPin,
+  RadixIconDrawingPinFilled,
+  RadixIconViewVertical,
 };
 
 // Returns a template NSImage of the icon scaled from its native 15x15

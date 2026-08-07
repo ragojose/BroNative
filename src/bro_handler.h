@@ -82,6 +82,11 @@ class BroHandler : public CefClient,
     return mobile_tab_ids_.count(browser_id) > 0;
   }
 
+  // Reload a tab. Used to apply a pending user agent override once the
+  // viewport toggle animation has finished (the UA only takes effect on the
+  // next navigation).
+  void ReloadTab(int browser_id);
+
   // Asynchronously fetches the tab's <meta name=description> via the DevTools
   // protocol; the result arrives through OnTabDescriptionAvailable.
   // Best-effort: silently does nothing if the browser is gone, and never
