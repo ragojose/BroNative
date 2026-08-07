@@ -7,15 +7,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>English</string>
 	<key>CFBundleExecutable</key>
-	<string>Bro</string>
+	<string>@PRODUCT_NAME@</string>
 	<key>CFBundleIconFile</key>
-	<string>cefsimple.icns</string>
+	<string>bro.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.bro.browser</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Bro</string>
+	<string>@PRODUCT_NAME@</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleSignature</key>

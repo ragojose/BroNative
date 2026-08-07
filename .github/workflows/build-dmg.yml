@@ -51,7 +51,7 @@ jobs:
 
       - name: Codesign (ad-hoc)
         run: |
-          app="build/Bro.app"
+          app="build/Bro Computer.app"
           codesign --force --sign - "$app/Contents/Frameworks/Chromium Embedded Framework.framework"
           for helper in "$app/Contents/Frameworks/"*.app; do
             codesign --force --sign - "$helper"
@@ -63,11 +63,11 @@ jobs:
         id: dmg
         run: |
           version=$(sed -n 's/.*VERSION_SHORT "\([^"]*\)".*/\1/p' CMakeLists.txt | head -n1)
-          dmg="Bro-${version:-1.0.0}-$(git rev-parse --short HEAD).dmg"
+          dmg="Bro-Computer-${version:-1.0.0}-$(git rev-parse --short HEAD).dmg"
           staging=$(mktemp -d)
-          ditto "build/Bro.app" "$staging/Bro.app"
+          ditto "build/Bro Computer.app" "$staging/Bro Computer.app"
           ln -s /Applications "$staging/Applications"
-          hdiutil create -volname "Bro" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          hdiutil create -volname "Bro Computer" -srcfolder "$staging" -ov -format UDZO "$dmg"
           rm -rf "$staging"
           echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
 
