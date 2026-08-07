@@ -47,7 +47,7 @@ set(BRO_HELPER_SRCS
 
 # Bundle resources
 set(BRO_RESOURCES
-    src/mac/cefsimple.icns
+    src/mac/bro.icns
     src/mac/wasm-bench.html
     src/mac/gpu-bench.html
 )
@@ -65,7 +65,9 @@ set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
 )
 
 # App bundle info
-set(PRODUCT_NAME "Bro")
+# PRODUCT_NAME is the user-visible app/bundle name; EXECUTABLE_NAME stays
+# space-free because it doubles as the CMake target name.
+set(PRODUCT_NAME "Bro Computer")
 set(EXECUTABLE_NAME "Bro")
 set(VERSION_SHORT "1.0.0")
 
@@ -104,15 +106,15 @@ set_target_properties(${EXECUTABLE_NAME} PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.bro.browser"
-    MACOSX_BUNDLE_BUNDLE_NAME "Bro"
+    MACOSX_BUNDLE_BUNDLE_NAME "${PRODUCT_NAME}"
     MACOSX_BUNDLE_BUNDLE_VERSION "${VERSION_SHORT}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
-    OUTPUT_NAME "Bro"
+    OUTPUT_NAME "${PRODUCT_NAME}"
 )
 
 # Helper apps. Chromium on macOS launches subprocesses from helper bundles with
-# exact names: "Bro Helper.app", "Bro Helper (Alerts).app", "Bro Helper (GPU).app",
-# "Bro Helper (Plugin).app", "Bro Helper (Renderer).app". CEF_HELPER_APP_SUFFIXES
+# exact names derived from the app name: "Bro Computer Helper.app",
+# "Bro Computer Helper (Alerts).app", "(GPU)", "(Plugin)", "(Renderer)". CEF_HELPER_APP_SUFFIXES
 # (from cef_variables.cmake) enumerates them as "<name suffix>:<target suffix>:<plist suffix>".
 foreach(_suffix_list ${CEF_HELPER_APP_SUFFIXES})
   string(REPLACE ":" ";" _suffix_list ${_suffix_list})
@@ -121,7 +123,7 @@ foreach(_suffix_list ${CEF_HELPER_APP_SUFFIXES})
   list(GET _suffix_list 2 _plist_suffix)
 
   set(_helper_target "${EXECUTABLE_NAME}_Helper${_target_suffix}")
-  set(_helper_output_name "${EXECUTABLE_NAME} Helper${_name_suffix}")
+  set(_helper_output_name "${PRODUCT_NAME} Helper${_name_suffix}")
 
   set(HELPER_EXECUTABLE_NAME "${_helper_output_name}")
   set(HELPER_BUNDLE_ID_SUFFIX "${_plist_suffix}")

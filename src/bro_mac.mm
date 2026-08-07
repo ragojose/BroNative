@@ -3273,7 +3273,7 @@ static void CreateNewBrowserTab(void) {
   // Create the main window
   g_main_window = [[BroWindow alloc] init];
   g_main_window.delegate = self;
-  g_main_window.title = @"Bro";
+  g_main_window.title = @"Bro Computer";
 
   // Show the window
   [g_main_window makeKeyAndOrderFront:nil];
@@ -3291,11 +3291,11 @@ static void CreateNewBrowserTab(void) {
   NSMenuItem* appMenuItem = [[NSMenuItem alloc] init];
   NSMenu* appMenu = [[NSMenu alloc] init];
 
-  [appMenu addItemWithTitle:@"About Bro"
+  [appMenu addItemWithTitle:@"About Bro Computer"
                      action:@selector(orderFrontStandardAboutPanel:)
               keyEquivalent:@""];
   [appMenu addItem:[NSMenuItem separatorItem]];
-  [appMenu addItemWithTitle:@"Quit Bro"
+  [appMenu addItemWithTitle:@"Quit Bro Computer"
                      action:@selector(terminate:)
               keyEquivalent:@"q"];
 
