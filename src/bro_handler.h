@@ -70,6 +70,11 @@ class BroHandler : public CefClient,
   // Close a specific browser (tab)
   void CloseBrowser(int browser_id);
 
+  // Tell the browser whether its view is effectively visible so background
+  // tabs throttle rendering and timers (hiding the parent NSView alone does
+  // not reach Chromium's occlusion tracking in windowed CEF).
+  void SetBrowserHidden(int browser_id, bool hidden);
+
   // Toggle mobile device emulation (viewport metrics, user agent, touch) for
   // a single tab via the DevTools protocol. Other tabs are unaffected.
   void SetTabMobileEmulation(int browser_id, bool enabled);

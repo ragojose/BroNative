@@ -105,6 +105,19 @@ void BroHandler::SetActiveBrowser(int browser_id) {
   }
 }
 
+void BroHandler::SetBrowserHidden(int browser_id, bool hidden) {
+  if (!CefCurrentlyOn(TID_UI)) {
+    CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetBrowserHidden, this,
+                                       browser_id, hidden));
+    return;
+  }
+
+  auto it = browser_map_.find(browser_id);
+  if (it != browser_map_.end() && it->second) {
+    it->second->GetHost()->WasHidden(hidden);
+  }
+}
+
 void BroHandler::CloseBrowser(int browser_id) {
   if (!CefCurrentlyOn(TID_UI)) {
     CefPostTask(TID_UI,
