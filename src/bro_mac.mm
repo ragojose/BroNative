@@ -1265,6 +1265,29 @@ static NSDictionary* BroLayerTransitionActions(void) {
   }
 }
 
+// Middle-click closes the tab, like every other Chromium browser. It fires on
+// release and only inside the pill, so sliding off cancels the way the ✕
+// button already does. Going through handleClose: means a lone tab closes the
+// window, exactly as Cmd+W does.
+- (void)otherMouseDown:(NSEvent*)event {
+  // Claim the middle press so AppKit routes its release here too; anything
+  // else (mouse back/forward) keeps bubbling.
+  if (event.buttonNumber != 2) {
+    [super otherMouseDown:event];
+  }
+}
+
+- (void)otherMouseUp:(NSEvent*)event {
+  if (event.buttonNumber != 2) {
+    [super otherMouseUp:event];
+    return;
+  }
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  if (NSPointInRect(p, self.bounds)) {
+    [self handleClose:self];
+  }
+}
+
 - (void)mouseEntered:(NSEvent*)event {
   hovered_ = YES;
   [self updateAppearance];
