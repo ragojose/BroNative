@@ -1614,12 +1614,39 @@ static BOOL BroURLIsBlank(NSString* url) {
   return url.length == 0 || [url isEqualToString:@"about:blank"];
 }
 
+// True while the whole window is occluded (miniaturized or fully covered);
+// every tab counts as hidden so even the active one throttles.
+static BOOL g_window_occluded = NO;
+
 // Central visibility rule: only the active tab's container is visible, and
-// not even that one while the tab is blank (glass new-tab state).
+// not even that one while the tab is blank (glass new-tab state). Hiding the
+// container NSView is not enough for Chromium's occlusion tracking in
+// windowed CEF (measured: background tabs kept rendering rAF at ~45fps and
+// timers at ~4.5Hz), so hidden containers are detached from the window
+// entirely — viewDidMoveToWindow(nil) is the signal the render widget host
+// actually honors (measured: rAF frozen, timers at 1Hz).
 static void UpdateTabContainerVisibility(int active_browser_id) {
+  BroHandler* handler = BroHandler::GetInstance();
+  NSView* parent = g_main_window.browserContainer;
   for (NSNumber* key in g_browser_views) {
-    g_browser_views[key].hidden = (key.intValue != active_browser_id) ||
-                                  [g_blank_tab_ids containsObject:key];
+    BOOL hidden = (key.intValue != active_browser_id) ||
+                  [g_blank_tab_ids containsObject:key];
+    NSView* container = g_browser_views[key];
+    BOOL detached = hidden || g_window_occluded;
+    if (detached) {
+      // g_browser_views keeps the container (and the CEF view inside it)
+      // alive while it is out of the view hierarchy.
+      if (container.superview) {
+        [container removeFromSuperview];
+      }
+    } else if (parent && container.superview != parent) {
+      [parent addSubview:container];
+      ApplyViewportFrameToContainer(container, TabIsMobile(key.intValue));
+    }
+    container.hidden = hidden;
+    if (handler) {
+      handler->SetBrowserHidden(key.intValue, detached);
+    }
   }
 }
 
@@ -2267,6 +2294,24 @@ static void CreateNewBrowserTab(void) {
   g_tab_bar = nil;
   [g_browser_views removeAllObjects];
   [g_blank_tab_ids removeAllObjects];
+}
+
+// Miniaturized or fully covered windows report as non-visible; treat every
+// tab as hidden so even the foreground one stops rendering, and restore the
+// active tab when the window becomes visible again.
+- (void)windowDidChangeOcclusionState:(NSNotification*)notification {
+  NSWindow* window = notification.object;
+  if (window != g_main_window) {
+    return;
+  }
+  BOOL occluded =
+      (window.occlusionState & NSWindowOcclusionStateVisible) == 0;
+  if (occluded == g_window_occluded) {
+    return;
+  }
+  g_window_occluded = occluded;
+  BroHandler* handler = BroHandler::GetInstance();
+  UpdateTabContainerVisibility(handler ? handler->GetActiveBrowserId() : -1);
 }
 
 // Fullscreen squares off the window corners, so the rounded hairline frame
