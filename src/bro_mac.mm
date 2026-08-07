@@ -114,6 +114,105 @@ static NSDictionary* BroLayerTransitionActions(void) {
   return actions;
 }
 
+#pragma mark - BroFaviconLoader
+
+// Fetches and caches favicons off the main thread. Replaces the previous
+// blocking -[NSImage initWithContentsOfURL:] which performed synchronous
+// network I/O on a shared GCD queue with no cache, dedup, or timeout.
+@interface BroFaviconLoader : NSObject
++ (instancetype)sharedLoader;
+// Completion is always invoked on the main thread. Passes nil on failure.
+- (void)fetchFavicon:(NSString*)urlString
+          completion:(void (^)(NSImage* image))completion;
+@end
+
+@implementation BroFaviconLoader {
+  NSURLSession* session_;
+  NSCache<NSString*, NSImage*>* cache_;
+  // URLs that recently failed; skipped so a 404 favicon isn't refetched on
+  // every navigation.
+  NSMutableSet<NSString*>* failed_;
+  // In-flight dedup: completions waiting on a URL already being fetched.
+  // Main-thread only.
+  NSMutableDictionary<NSString*, NSMutableArray<void (^)(NSImage*)>*>* inflight_;
+}
+
++ (instancetype)sharedLoader {
+  static BroFaviconLoader* shared = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    shared = [[BroFaviconLoader alloc] init];
+  });
+  return shared;
+}
+
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    NSURLSessionConfiguration* config =
+        [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    // Favicons must never hold sockets long.
+    config.timeoutIntervalForRequest = 8;
+    config.timeoutIntervalForResource = 15;
+    session_ = [NSURLSession sessionWithConfiguration:config];
+    cache_ = [[NSCache alloc] init];
+    cache_.countLimit = 100;
+    failed_ = [NSMutableSet set];
+    inflight_ = [NSMutableDictionary dictionary];
+  }
+  return self;
+}
+
+- (void)fetchFavicon:(NSString*)urlString
+          completion:(void (^)(NSImage*))completion {
+  NSImage* cached = [cache_ objectForKey:urlString];
+  if (cached) {
+    completion(cached);
+    return;
+  }
+  if ([failed_ containsObject:urlString]) {
+    completion(nil);
+    return;
+  }
+  NSURL* url = [NSURL URLWithString:urlString];
+  if (!url) {
+    completion(nil);
+    return;
+  }
+
+  NSMutableArray* waiters = inflight_[urlString];
+  if (waiters) {
+    [waiters addObject:[completion copy]];
+    return;
+  }
+  inflight_[urlString] = [NSMutableArray arrayWithObject:[completion copy]];
+
+  NSURLSessionDataTask* task = [session_
+        dataTaskWithURL:url
+      completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        // Decode off-main on the session's queue; only delivery hops to main.
+        NSImage* image = nil;
+        if (!error && data.length > 0) {
+          image = [[NSImage alloc] initWithData:data];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (image) {
+            [self->cache_ setObject:image forKey:urlString];
+          } else {
+            [self->failed_ addObject:urlString];
+          }
+          NSArray* pending = self->inflight_[urlString];
+          [self->inflight_ removeObjectForKey:urlString];
+          for (void (^waiter)(NSImage*) in pending) {
+            waiter(image);
+          }
+        });
+      }];
+  [task resume];
+}
+
+@end
+
 #pragma mark - BroHoverButton
 
 // Icon button with hover/pressed/selected backgrounds, a pointing-hand
@@ -664,6 +763,10 @@ static NSDictionary* BroLayerTransitionActions(void) {
   BOOL hovered_;
   BOOL focused_;
   BOOL wasActiveAtMouseDown_;
+  // Bumped on every setFaviconURL:; a fetch completion only applies its image
+  // if the generation still matches, so a slow response for a previous page
+  // can't overwrite the current page's favicon. Main-thread only.
+  NSUInteger faviconGeneration_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame browserId:(int)browserId {
@@ -750,19 +853,19 @@ static NSDictionary* BroLayerTransitionActions(void) {
 - (void)setFaviconURL:(NSString*)urlString {
   if (!urlString || urlString.length == 0) return;
 
-  NSURL* url = [NSURL URLWithString:urlString];
-  if (!url) return;
-
-  // Load favicon asynchronously
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-    NSImage* image = [[NSImage alloc] initWithContentsOfURL:url];
-    if (image) {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        self.faviconView.image = image;
-        self.faviconView.contentTintColor = nil;
-      });
-    }
-  });
+  NSUInteger generation = ++faviconGeneration_;
+  __weak BroTabView* weakSelf = self;
+  [[BroFaviconLoader sharedLoader]
+      fetchFavicon:urlString
+        completion:^(NSImage* image) {
+          BroTabView* strongSelf = weakSelf;
+          if (!strongSelf || !image ||
+              strongSelf->faviconGeneration_ != generation) {
+            return;
+          }
+          strongSelf.faviconView.image = image;
+          strongSelf.faviconView.contentTintColor = nil;
+        }];
 }
 
 - (void)setTabURL:(NSString*)url {
@@ -782,6 +885,9 @@ static NSDictionary* BroLayerTransitionActions(void) {
 }
 
 - (void)setLoading:(BOOL)loading {
+  if (_isLoading == loading) {
+    return;  // Repeated OnLoadingStateChange must not restart the spinner.
+  }
   _isLoading = loading;
   if (loading) {
     _faviconView.hidden = YES;
@@ -1896,6 +2002,9 @@ static void CreateNewBrowserTab(void) {
   [viewMenu addItemWithTitle:@"WebAssembly Benchmark"
                       action:@selector(openWasmBenchmark:)
                keyEquivalent:@""];
+  [viewMenu addItemWithTitle:@"GPU Benchmark"
+                      action:@selector(openGpuBenchmark:)
+               keyEquivalent:@""];
 
   viewMenuItem.submenu = viewMenu;
   [mainMenu addItem:viewMenuItem];
@@ -2078,6 +2187,15 @@ static void CreateNewBrowserTab(void) {
   }
 }
 
+- (void)openGpuBenchmark:(id)sender {
+  NSString* path = [[NSBundle mainBundle] pathForResource:@"gpu-bench"
+                                                   ofType:@"html"];
+  if (path) {
+    NSURL* url = [NSURL fileURLWithPath:path];
+    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
+  }
+}
+
 - (void)focusAddressBar:(id)sender {
   if (g_toolbar) {
     [g_toolbar focusAddressField];
@@ -2175,9 +2293,22 @@ static void CreateNewBrowserTab(void) {
 
 #pragma mark - Callback Functions for Handler
 
+// The CEF UI thread is the main thread here, so pure UI-update callbacks run
+// their block inline instead of paying a dispatch (block alloc + a run-loop
+// turn of latency) per load event. Lifecycle callbacks that tear down views or
+// create browsers keep their deliberate dispatch_async deferral — running
+// those synchronously re-enters CEF from inside its own callbacks.
+static void BroRunOnMain(void (^block)(void)) {
+  if ([NSThread isMainThread]) {
+    block();
+  } else {
+    dispatch_async(dispatch_get_main_queue(), block);
+  }
+}
+
 // These functions are called from BroHandler to update the UI
 void UpdateNavigationState(bool canGoBack, bool canGoForward) {
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_toolbar) {
       [g_toolbar updateNavigationState:canGoBack canGoForward:canGoForward];
     }
@@ -2185,11 +2316,12 @@ void UpdateNavigationState(bool canGoBack, bool canGoForward) {
 }
 
 void UpdateURL(const std::string& url) {
-  // Convert before dispatching: the block would otherwise capture the
-  // std::string parameter by reference, which dangles once the caller
-  // returns (use-after-free; crashed with garbage/NULL c_str()).
+  // Convert before dispatching: on the async fallback path the block would
+  // otherwise capture the std::string parameter by reference, which dangles
+  // once the caller returns (use-after-free; crashed with garbage/NULL
+  // c_str()).
   NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_toolbar) {
       [g_toolbar updateURL:urlStr];
     }
@@ -2292,7 +2424,7 @@ void RemovePopupTabContainer(int popup_id) {
 void OnTabTitleChanged(int browser_id, const std::string& title) {
   // Convert before dispatching (see UpdateURL).
   NSString* titleStr = [NSString stringWithUTF8String:title.c_str()] ?: @"";
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabTitle:browser_id title:titleStr];
     }
@@ -2302,7 +2434,7 @@ void OnTabTitleChanged(int browser_id, const std::string& title) {
 void OnTabURLChanged(int browser_id, const std::string& url) {
   // Convert before dispatching (see UpdateURL).
   NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabURL:browser_id url:urlStr];
     }
@@ -2324,7 +2456,7 @@ void OnTabURLChanged(int browser_id, const std::string& url) {
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url) {
   // Convert before dispatching (see UpdateURL).
   NSString* urlStr = [NSString stringWithUTF8String:favicon_url.c_str()] ?: @"";
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabFavicon:browser_id faviconURL:urlStr];
     }
@@ -2332,7 +2464,7 @@ void OnTabFaviconChanged(int browser_id, const std::string& favicon_url) {
 }
 
 void OnTabLoadingChanged(int browser_id, bool is_loading) {
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabLoading:browser_id loading:is_loading];
     }
@@ -2357,7 +2489,7 @@ void OnTabClosed(int browser_id) {
 }
 
 void OnActiveTabChanged(int browser_id) {
-  dispatch_async(dispatch_get_main_queue(), ^{
+  BroRunOnMain(^{
     // Update tab bar
     if (g_tab_bar) {
       [g_tab_bar setActiveTab:browser_id];
@@ -2421,10 +2553,21 @@ int main(int argc, char* argv[]) {
 
     // Persistent cache in Application Support (the temp directory is purged
     // by the OS, which silently discarded the HTTP cache and the V8/WASM
-    // compiled-code caches between launches).
-    NSString* appSupport = NSSearchPathForDirectoriesInDomains(
-        NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
-    NSString* cachePath = [appSupport stringByAppendingPathComponent:@"Bro"];
+    // compiled-code caches between launches). BRO_USER_DATA_DIR overrides the
+    // location so test harnesses can run isolated instances concurrently (the
+    // profile directory holds the process-singleton lock, so two instances
+    // sharing it cannot both launch).
+    NSString* cachePath = nil;
+    if (const char* data_dir = getenv("BRO_USER_DATA_DIR")) {
+      if (data_dir[0] == '/') {
+        cachePath = [NSString stringWithUTF8String:data_dir];
+      }
+    }
+    if (!cachePath) {
+      NSString* appSupport = NSSearchPathForDirectoriesInDomains(
+          NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+      cachePath = [appSupport stringByAppendingPathComponent:@"Bro"];
+    }
     [[NSFileManager defaultManager] createDirectoryAtPath:cachePath
                               withIntermediateDirectories:YES
                                                attributes:nil
