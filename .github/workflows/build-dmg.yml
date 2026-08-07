@@ -1,0 +1,98 @@
+name: Build DMG
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-dmg-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CEF_VERSION: cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache CEF
+        id: cef-cache
+        uses: actions/cache@v4
+        with:
+          path: cef-project/third_party/cef
+          key: cef-${{ env.CEF_VERSION }}
+
+      - name: Download CEF
+        if: steps.cef-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p cef-project/third_party/cef
+          cd cef-project/third_party/cef
+          url="https://cef-builds.spotifycdn.com/$(printf '%s' "$CEF_VERSION" | sed 's/+/%2B/g').tar.bz2"
+          curl -fL --retry 3 -o cef.tar.bz2 "$url"
+          tar xjf cef.tar.bz2
+          rm cef.tar.bz2
+
+      - name: Install ninja
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake -G Ninja -B build
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Codesign (ad-hoc)
+        run: |
+          app="build/Bro.app"
+          codesign --force --sign - "$app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          for helper in "$app/Contents/Frameworks/"*.app; do
+            codesign --force --sign - "$helper"
+          done
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+      - name: Create DMG
+        id: dmg
+        run: |
+          version=$(sed -n 's/.*VERSION_SHORT "\([^"]*\)".*/\1/p' CMakeLists.txt | head -n1)
+          dmg="Bro-${version:-1.0.0}-$(git rev-parse --short HEAD).dmg"
+          staging=$(mktemp -d)
+          ditto "build/Bro.app" "$staging/Bro.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "Bro" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          rm -rf "$staging"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dmg.outputs.dmg }}
+          path: ${{ steps.dmg.outputs.dmg }}
+          if-no-files-found: error
+
+      - name: Update latest release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f latest
+          git push -f origin latest
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --prerelease --title "Latest build" \
+              --notes "Automated build from main. Ad-hoc signed: right-click > Open on first launch."
+          fi
+          # Drop stale per-commit DMG assets before uploading the new one
+          gh release view latest --json assets -q '.assets[].name' | while read -r asset; do
+            case "$asset" in
+              Bro-*.dmg) gh release delete-asset latest "$asset" -y ;;
+            esac
+          done
+          gh release upload latest "${{ steps.dmg.outputs.dmg }}" --clobber
