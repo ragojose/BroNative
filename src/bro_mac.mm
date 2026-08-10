@@ -2831,6 +2831,22 @@ static void ToggleTabSearchPanel(void) {
   // pill has traveled from its own slot, in slots: past 0.5 it overlaps the
   // neighbor (join zone), past 0.9 it has all but displaced it (reorder).
   NSInteger current = [_tabs indexOfObject:tab];
+  if (current == NSNotFound) {
+    // The close is deferred (dispatch_async, to avoid re-entering CEF), so it
+    // can land between two mouseDragged: events of a live drag and pull the
+    // pill out of _tabs out from under us. Abort rather than index into a
+    // slot that no longer exists.
+    if (dragging_) {
+      [NSCursor pop];
+      [self.window enableCursorRects];
+      [[NSCursor arrowCursor] set];
+    }
+    draggingTab_ = nil;
+    dragging_ = NO;
+    joinTargetTab_.dropTarget = NO;
+    joinTargetTab_ = nil;
+    return;
+  }
   CGFloat delta = (newX - groupOriginX) / slotWidth -
                   (CGFloat)(current - groupStart);
   NSInteger hoverIndex = current + (NSInteger)lround(delta);
@@ -2886,8 +2902,14 @@ static void ToggleTabSearchPanel(void) {
     }];
     [self.window recalculateKeyViewLoop];
     if (joinTarget) {
-      // Dropped onto another pill: split the two tabs.
-      JoinTabsInSplit(tab.browserId, joinTarget.browserId);
+      // A deferred tab close (dispatch_async) can pull either pill out of
+      // _tabs mid-drag, leaving joinTarget stale; skip the join instead of
+      // handing a dead browser id to JoinTabsInSplit/SetActiveBrowser.
+      if ([_tabs indexOfObject:tab] != NSNotFound &&
+          [_tabs indexOfObject:joinTarget] != NSNotFound) {
+        // Dropped onto another pill: split the two tabs.
+        JoinTabsInSplit(tab.browserId, joinTarget.browserId);
+      }
     } else if (SplitActive()) {
       // A drag can pull the split pair apart; snap it back together so the
       // joined pills keep mirroring the panes below.
@@ -2960,6 +2982,20 @@ static void ToggleTabSearchPanel(void) {
   }
 
   if (tabToRemove) {
+    if (tabToRemove == draggingTab_) {
+      // The close is deferred (dispatch_async) so it can land mid-drag; tear
+      // down the drag now, before the pill it was tracking disappears out
+      // from under the next mouseDragged: event.
+      if (dragging_) {
+        [NSCursor pop];
+        [self.window enableCursorRects];
+        [[NSCursor arrowCursor] set];
+      }
+      draggingTab_ = nil;
+      dragging_ = NO;
+      joinTargetTab_.dropTarget = NO;
+      joinTargetTab_ = nil;
+    }
     // If the closed pill held keyboard focus, hand it to a neighbor so focus
     // doesn't silently fall back to the window.
     if (self.window.firstResponder == tabToRemove) {
