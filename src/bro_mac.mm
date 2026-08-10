@@ -178,6 +178,18 @@ static void CreateNewBrowserTabWithURL(const std::string& url);
 static void ToggleTabSearchPanel(void);
 static void HideTabSearchPanel(void);
 
+// Transient overlays (the tab search panel, the downloads popover) must not
+// outlive a command that changes what's underneath them -- otherwise they're
+// left floating over content or chrome they no longer describe. Each overlay
+// used to hand-roll its own dismissal at a handful of call sites and they
+// drifted out of sync (see M1/L1 in the codebase audit); every command that
+// changes page or layout state should dismiss through this one helper
+// instead of picking and choosing which overlay to hide.
+static void BroDismissTransientOverlays(void) {
+  HideTabSearchPanel();
+  BroHideDownloadsPopover();
+}
+
 // The main window's browser container (overlay parent for the tab hover
 // card); nil before the window exists. Implemented after BroWindow.
 static NSView* BroBrowserContainerView(void);
@@ -2608,11 +2620,15 @@ static void ShowTabSearchPanel(void) {
 
   if (!g_tab_search_click_monitor) {
     g_tab_search_click_monitor = [NSEvent
-        addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown |
-                                             NSEventMaskRightMouseDown
+        addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown |
+                                              NSEventMaskRightMouseDown |
+                                              NSEventMaskOtherMouseDown)
                                      handler:^NSEvent*(NSEvent* event) {
-          if (!TabSearchPanelVisible() ||
-              event.window != g_tab_search_panel.window) {
+          if (!TabSearchPanelVisible()) {
+            return event;
+          }
+          if (event.window != g_tab_search_panel.window) {
+            HideTabSearchPanel();
             return event;
           }
           NSPoint inPanel =
@@ -4535,6 +4551,11 @@ static void CreateNewBrowserTab(void) {
        event.type == NSEventTypeOtherMouseUp) &&
       (event.buttonNumber == 3 || event.buttonNumber == 4) &&
       event.window == g_main_window) {
+    // Local NSEvent monitors run inside -[NSApplication sendEvent:]'s call to
+    // super, so the tab search panel's and downloads popover's outside-click
+    // monitors never see these buttons -- dismiss explicitly here, the only
+    // place that can.
+    BroDismissTransientOverlays();
     // Navigate on the press; the release is swallowed too so no view is left
     // tracking a button-down it never saw finish.
     if (event.type == NSEventTypeOtherMouseDown) {
@@ -4865,24 +4886,28 @@ static void CreateNewBrowserTab(void) {
 
 // Menu actions
 - (void)goBack:(id)sender {
+  BroDismissTransientOverlays();
   if (g_toolbar) {
     [g_toolbar goBack:sender];
   }
 }
 
 - (void)goForward:(id)sender {
+  BroDismissTransientOverlays();
   if (g_toolbar) {
     [g_toolbar goForward:sender];
   }
 }
 
 - (void)reloadPage:(id)sender {
+  BroDismissTransientOverlays();
   if (g_toolbar) {
     [g_toolbar refresh:sender];
   }
 }
 
 - (void)hardReload:(id)sender {
+  BroDismissTransientOverlays();
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
@@ -4954,6 +4979,7 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)togglePinActiveTab:(id)sender {
+  BroDismissTransientOverlays();
   for (BroTabView* tab in g_tab_bar.tabs) {
     if (tab.browserId == g_tab_bar.activeTabId) {
       [g_tab_bar togglePinForTab:tab];
@@ -4963,6 +4989,7 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)toggleSplitScreen:(id)sender {
+  BroDismissTransientOverlays();
   if (SplitActive()) {
     ToggleSplitForTab(g_split_browser_id);
     return;
@@ -5037,12 +5064,14 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)focusAddressBar:(id)sender {
+  BroDismissTransientOverlays();
   if (g_toolbar) {
     [g_toolbar focusAddressField];
   }
 }
 
 - (void)stepZoom:(BOOL)zoomingIn {
+  BroDismissTransientOverlays();
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
@@ -5065,6 +5094,7 @@ static void CreateNewBrowserTab(void) {
 }
 
 - (void)zoomReset:(id)sender {
+  BroDismissTransientOverlays();
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
