@@ -37,16 +37,15 @@
 	<string>BroApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
-	<!-- Sparkle. SUPublicEDKey is a placeholder: the release owner must run
-	     Sparkle's generate_keys, paste the printed public key here, and add the
-	     private key as the SPARKLE_PRIVATE_KEY repository secret. Until then the
-	     app skips the updater entirely (see BroStartUpdater). -->
+	<!-- Sparkle. The private half of SUPublicEDKey lives in the release owner's
+	     login Keychain and in the SPARKLE_PRIVATE_KEY repository secret. It
+	     cannot be rotated: shipped apps only accept updates signed by it. -->
 	<!-- The `updates` release hosts the feed, every DMG, and every delta. This
 	     URL is baked into shipped apps and can never change. -->
 	<key>SUFeedURL</key>
 	<string>https://github.com/ragojose/BroNative/releases/download/updates/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>REPLACE_WITH_SPARKLE_PUBLIC_KEY</string>
+	<string>IEKhkh8/bcliMaXm8qJ1x4ck7mIakAmcSUc2MFU6fqE=</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 	<!-- Once a day; Sparkle only checks while the app is running. -->
