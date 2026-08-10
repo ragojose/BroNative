@@ -18,7 +18,10 @@ Requires macOS 12.0+ on Apple Silicon.
 Bro Computer updates itself. It checks once a day while running, and you can ask
 it to look now with **Bro Computer → Check for Updates…**. Updates install in
 place, so you only download the full DMG once — after that you get a patch
-against the build you already have, not another 158 MB.
+against the build you already have, not another 158 MB. The one exception is
+the first update after signing keys are enabled or rotated: it has no older
+build to patch against, so it ships as a full download, and patches resume
+from the build after that.
 
 > The menu item is greyed out until the maintainer sets up signing keys — see
 > [Enabling updates](#enabling-updates-maintainer-one-time) at the end. Builds
