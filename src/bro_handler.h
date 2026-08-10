@@ -202,6 +202,10 @@ class BroHandler : public CefClient,
   // Platform-specific show window
   void PlatformShowWindow(CefRefPtr<CefBrowser> browser);
 
+  // Writes |text| to the system clipboard (used by the "Copy Link" context
+  // menu item; custom menu IDs get no default handler from CEF).
+  void PlatformCopyToClipboard(const std::string& text);
+
  private:
   // Applies (or clears) the device emulation overrides on one browser.
   void ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
