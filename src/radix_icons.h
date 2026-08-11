@@ -1,6 +1,6 @@
 // Radix Icons (https://www.radix-ui.com/icons, MIT) rendered natively.
-// Icons are embedded as SVG path data and drawn into template NSImages,
-// so they can be tinted with contentTintColor like SF Symbols.
+// Icons ship as bundled PDF assets (Resources/Icons), loaded into template
+// NSImages so they can be tinted with contentTintColor like SF Symbols.
 
 #ifndef RADIX_ICONS_H_
 #define RADIX_ICONS_H_

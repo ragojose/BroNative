@@ -5,27 +5,22 @@
 #ifndef BRO_HANDLER_H_
 #define BRO_HANDLER_H_
 
+#include "browser_registry.h"
 #include "include/cef_client.h"
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_download_handler.h"
-#include "include/cef_registration.h"
+#include "tab_description_fetcher.h"
 
-#include <list>
-#include <map>
 #include <set>
 
 // Forward declare UI callback functions (implemented in bro_mac.mm).
 // All of these are invoked on the CEF UI thread, which is the main thread.
 void UpdateNavigationState(bool canGoBack, bool canGoForward);
 void UpdateURL(const std::string& url);
-void SetLoading(bool loading);
 // Adopts the browser as a tab if its native view lives in the tab container.
 // Returns false for browsers hosted elsewhere (e.g. DevTools).
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view);
 void OnTabTitleChanged(int browser_id, const std::string& title);
-// Delivers the page's <meta name=description> content (possibly empty) in
-// response to FetchTabDescription.
-void OnTabDescriptionAvailable(int browser_id, const std::string& description);
 void OnTabURLChanged(int browser_id, const std::string& url);
 void OnTabFaviconChanged(int browser_id, const std::string& favicon_url);
 void OnTabClosed(int browser_id);
@@ -82,7 +77,7 @@ class BroHandler : public CefClient,
   void SetActiveBrowser(int browser_id);
 
   // Get active browser ID
-  int GetActiveBrowserId() const { return active_browser_id_; }
+  int GetActiveBrowserId() const { return browser_registry_.active_id(); }
 
   // Close a specific browser (tab)
   void CloseBrowser(int browser_id);
@@ -228,22 +223,11 @@ class BroHandler : public CefClient,
   // state. Gates OnDownloadUpdated, which also fires before OnBeforeDownload.
   std::set<uint32_t> active_download_ids_;
 
-  // Per-browser DevTools observer registrations (alive until the browser
-  // closes) and the message id of each browser's in-flight meta-description
-  // request.
-  std::map<int, CefRefPtr<CefRegistration>> devtools_registrations_;
-  std::map<int, int> pending_description_requests_;
+  // Live browsers (tabs) and which one is active.
+  BrowserRegistry browser_registry_;
 
-  // List of existing browser windows.
-  typedef std::list<CefRefPtr<CefBrowser>> BrowserList;
-  BrowserList browser_list_;
-
-  // Map of browser ID to browser for quick lookup
-  typedef std::map<int, CefRefPtr<CefBrowser>> BrowserMap;
-  BrowserMap browser_map_;
-
-  // Active browser ID (current tab)
-  int active_browser_id_ = -1;
+  // DevTools CDP round trip that backs FetchTabDescription.
+  TabDescriptionFetcher tab_description_fetcher_;
 
   // True while CloseAllBrowsers is tearing everything down (window close /
   // app quit). Individual tab closes are handled by detaching the tab's view
