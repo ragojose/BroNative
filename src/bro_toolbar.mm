@@ -139,7 +139,11 @@ NSString* BroResolveQueryToURL(NSString* query) {
     _addressField.bordered = NO;
     _addressField.drawsBackground = NO;
     _addressField.focusRingType = NSFocusRingTypeNone;
-    _addressField.textColor = [NSColor labelColor];
+    // Explicit white, not labelColor: the chrome row is a vibrancy surface,
+    // and semantic colors composite through the glass material where they
+    // can lose contrast against the dark pill. Every other chrome color in
+    // this file is already explicit for the same reason.
+    _addressField.textColor = [NSColor whiteColor];
     _addressField.delegate = self;
     _addressField.cell.scrollable = YES;
     _addressField.cell.usesSingleLineMode = YES;
@@ -507,7 +511,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
     if ([_addressField.superview isKindOfClass:[BroTabView class]]) {
       ((BroTabView*)_addressField.superview).editingAddress = NO;
     }
-    _addressField.textColor = [NSColor labelColor];
+    // Same explicit white as the init path — see the comment there.
+    _addressField.textColor = [NSColor whiteColor];
     [self displayCompactURL];
   }
 }
