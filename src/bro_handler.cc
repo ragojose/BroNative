@@ -147,6 +147,37 @@ void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
   }
 }
 
+void BroHandler::AdoptTabMobileEmulation(int browser_id) {
+  CEF_REQUIRE_UI_THREAD();
+
+  if (IsTabMobile(browser_id)) {
+    return;
+  }
+  // Recorded synchronously: the caller lays the shell and the tab's container
+  // out from this state in the same turn.
+  mobile_tab_ids_.insert(browser_id);
+
+  CefPostTask(TID_UI,
+              base::BindOnce(&BroHandler::ApplyPendingMobileEmulation, this,
+                             browser_id));
+}
+
+void BroHandler::ApplyPendingMobileEmulation(int browser_id) {
+  CEF_REQUIRE_UI_THREAD();
+
+  // The tab may have closed or been switched back to desktop while the task
+  // was queued.
+  if (!IsTabMobile(browser_id)) {
+    return;
+  }
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  if (browser) {
+    // No reload: a freshly adopted tab has not made its first user-driven
+    // navigation yet, which is when the user agent override takes effect.
+    ApplyEmulationToBrowser(browser, /*mobile=*/true, /*reload=*/false);
+  }
+}
+
 void BroHandler::ReloadTab(int browser_id) {
   if (!CefCurrentlyOn(TID_UI)) {
     CefPostTask(TID_UI,

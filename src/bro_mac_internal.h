@@ -284,6 +284,9 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 // the active pill reveals it only while editing.
 @interface BroTabView : NSView
 @property (nonatomic, assign) int browserId;
+// The tab bar remains the interaction owner even though pills live inside its
+// scroll view's document view rather than as direct children.
+@property (nonatomic, weak) BroTabBar* owningTabBar;
 @property (nonatomic, strong) NSImageView* faviconView;
 @property (nonatomic, strong) BroShimmerTextView* titleLabel;
 // Each pill owns its editor for its entire lifetime. Only the active pill may
@@ -336,9 +339,10 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 
 #pragma mark - BroTabBar
 
-// The tab strip lives INSIDE the toolbar row: each tab is a pill (favicon +
-// host + close), the active pill hosts the editable address field, and the
-// "+" button trails the last pill.
+// The tab strip lives INSIDE the toolbar row: tab pills scroll horizontally,
+// the active pill hosts the editable address field, the "+" trails the last
+// pill until the pills overflow, and the search control stays pinned at the
+// trailing edge.
 @interface BroTabBar : NSView
 @property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
 @property (nonatomic, strong) BroHoverButton* addTabButton;

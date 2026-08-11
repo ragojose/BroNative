@@ -516,7 +516,6 @@ NSString* BroResolveQueryToURL(NSString* query) {
   // (adaptive hairline border and primary text) from click-in through typing.
   field.stringValue = BroURLIsBlank(tab.tabURL) ? @"" : tab.tabURL;
   tab.editingAddress = YES;
-  field.textColor = [NSColor labelColor];
   // Configure synchronously so AppKit never presents one frame with its
   // default font/insets before snapping to the shared tab metrics. Some
   // responder paths install the field editor just after becomeFirstResponder;
@@ -555,7 +554,6 @@ NSString* BroResolveQueryToURL(NSString* query) {
     });
   }
   tab.editingAddress = NO;
-  field.textColor = [NSColor labelColor];
 }
 
 - (void)focusAddressField {
