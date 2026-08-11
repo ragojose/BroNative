@@ -4,6 +4,8 @@
 
 #include "bro_app.h"
 
+#include <string>
+
 #include "include/cef_command_line.h"
 #include "include/wrapper/cef_helpers.h"
 #include "bro_handler.h"
@@ -27,6 +29,24 @@ void BroApp::OnBeforeCommandLineProcessing(
   command_line->AppendSwitch("enable-gpu");
   command_line->AppendSwitchWithValue("use-angle", "metal");
   command_line->AppendSwitch("ignore-gpu-blocklist");
+
+  // Chrome's Reading Mode ships in CEF without the profile plumbing it
+  // expects: its ReadAnythingSoftNavigationObserver dereferences a null
+  // coordinator the moment any page performs a soft navigation (History API /
+  // same-document), taking the whole browser process down. Symbolicated from
+  // a field crash on wakawaka.world, 2026-08-11 (build 85). Disabling the
+  // feature removes the observer; merge with any existing list rather than
+  // clobbering the features CEF disables on its own.
+  const char kDisableFeatures[] = "disable-features";
+  std::string disabled =
+      command_line->HasSwitch(kDisableFeatures)
+          ? command_line->GetSwitchValue(kDisableFeatures).ToString()
+          : std::string();
+  if (!disabled.empty()) {
+    disabled += ",";
+  }
+  disabled += "ReadAnything";
+  command_line->AppendSwitchWithValue(kDisableFeatures, disabled);
 }
 
 void BroApp::OnContextInitialized() {
