@@ -5261,12 +5261,6 @@ void UpdateURL(const std::string& url) {
   });
 }
 
-void SetLoading(bool loading) {
-  // Loading state is shown per-tab (each pill swaps its favicon for a
-  // spinner via OnTabLoadingChanged); nothing extra to do for the active tab.
-  (void)loading;
-}
-
 #pragma mark - Downloads model
 
 static NSMutableArray<BroDownloadEntry*>* BroDownloadsList(void) {

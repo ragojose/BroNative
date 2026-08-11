@@ -100,7 +100,6 @@ void BroHandler::SetActiveBrowser(int browser_id) {
     if (browser) {
       UpdateURL(browser->GetMainFrame()->GetURL().ToString());
       UpdateNavigationState(browser->CanGoBack(), browser->CanGoForward());
-      SetLoading(browser->IsLoading());
     }
   }
 }
@@ -479,7 +478,6 @@ void BroHandler::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
   // Only update toolbar UI for the active tab
   if (browser_id == active_browser_id_) {
     UpdateNavigationState(canGoBack, canGoForward);
-    SetLoading(isLoading);
   }
 }
 

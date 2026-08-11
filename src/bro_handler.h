@@ -18,7 +18,6 @@
 // All of these are invoked on the CEF UI thread, which is the main thread.
 void UpdateNavigationState(bool canGoBack, bool canGoForward);
 void UpdateURL(const std::string& url);
-void SetLoading(bool loading);
 // Adopts the browser as a tab if its native view lives in the tab container.
 // Returns false for browsers hosted elsewhere (e.g. DevTools).
 bool OnTabCreated(int browser_id, const std::string& url, void* native_view);
