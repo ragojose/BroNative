@@ -142,6 +142,27 @@ extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
 extern void CreateNewBrowserTab(void);
 extern void CreateNewBrowserTabWithURL(const std::string& url);
 
+// Every emphasized control border — selected pill, hover, keyboard focus,
+// address-editing ring, the "+" button — and the window frame is the same
+// 1pt #111111 hairline.
+extern NSColor* BroControlBorderColor(void);
+
+// True if the given tab has mobile emulation active.
+extern BOOL TabIsMobile(int browser_id);
+
+// Split screen: the tab shown beside the active one; -1 = no split. The
+// active tab is always the left pane and keeps the address bar and chrome
+// shortcuts; selecting the right pane's pill swaps it into the active slot.
+// These stay in the hub (bro_mac.mm) -- BroTabBar orchestrates split via
+// these calls without owning the state.
+extern int g_split_browser_id;
+extern BOOL SplitActive(void);
+extern void ToggleSplitForTab(int browser_id);
+extern void RefreshSplitPaneStyling(void);
+extern void ClearSplit(void);
+extern void JoinTabsInSplit(int dragged_id, int target_id);
+extern NSUInteger BroTabStripIndex(int browser_id);
+
 // Tab search panel (⇧⌘A / the tab strip's chevron): toggle shows or hides
 // the dropdown; hide is safe to call any time. Defined with the panel class.
 extern void ToggleTabSearchPanel(void);

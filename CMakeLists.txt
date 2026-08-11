@@ -67,6 +67,7 @@ set(BRO_SRCS
     src/bro_mac.mm
     src/bro_mac_internal.h
     src/bro_tabsearch.mm
+    src/bro_tabstrip.mm
     src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm
