@@ -72,6 +72,17 @@ static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
 // as the new-tab state.
 static NSMutableSet<NSNumber*>* g_blank_tab_ids = nil;
 
+// Tabs whose live container is dissolving into the glass backdrop. Membership
+// owns the deferred detach; re-attaching a tab removes it so the stale
+// animation completion becomes a no-op.
+static NSMutableSet<NSNumber*>* g_fading_out_ids = nil;
+
+// CEF's hosted IOSurface does not reliably inherit its container's group
+// opacity. Page/glass dissolves therefore animate an AppKit-owned glass veil
+// above it instead of attempting to fade the CEF view itself.
+static NSView* g_glass_transition_overlay = nil;
+static int g_glass_transition_token = 0;
+
 // BroClosedTabEntry and the closed-tab history list live in
 // bro_closed_tabs.mm, behind BroRecordClosedTab/BroClosedTabsList/
 // BroClosedTabsCount/BroRemoveClosedTab/BroClearClosedTabs.
@@ -224,6 +235,57 @@ static CGFloat BroResolveShellCornerRadius(NSWindow* window) {
 // NSVisualEffectView): the chrome row wears the same shared tint as every
 // glass surface, and the browser-area tint fades down to it when blank.
 static const CFTimeInterval kGlassBackdropFadeDuration = 0.30;
+static const CFTimeInterval kGlassPageFadeInDuration = 0.42;
+static const CFTimeInterval kGlassHandoffDelay = 0.02;
+
+// A pronounced ease-in-out keeps the page and tint changes gentle at both
+// ends while still moving decisively through the middle of the dissolve.
+static CAMediaTimingFunction* BroGlassTransitionTimingFunction(void) {
+  return [CAMediaTimingFunction functionWithControlPoints:0.65
+                                                       :0.0
+                                                       :0.35
+                                                       :1.0];
+}
+
+// Coming out of glass needs a gentler curve so an incoming CEF frame joins
+// the dissolve instead of appearing to snap in through the middle.
+static CAMediaTimingFunction* BroPageFadeInTimingFunction(void) {
+  return [CAMediaTimingFunction functionWithControlPoints:0.37
+                                                       :0.0
+                                                       :0.63
+                                                       :1.0];
+}
+
+// Builds a live copy of the blank-tab glass material above the browser area.
+// Unlike a CEF snapshot, this is entirely AppKit-owned and its opacity is
+// reliable in both directions.
+static NSView* BroCreateGlassTransitionOverlay(NSView* parent,
+                                               CGFloat initialAlpha) {
+  if (!parent) {
+    return nil;
+  }
+  [g_glass_transition_overlay removeFromSuperview];
+
+  NSVisualEffectView* glass =
+      [[NSVisualEffectView alloc] initWithFrame:parent.bounds];
+  glass.material = NSVisualEffectMaterialHUDWindow;
+  glass.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+  glass.state = NSVisualEffectStateActive;
+  glass.wantsLayer = YES;
+  glass.alphaValue = initialAlpha;
+  glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+  NSView* tint = [[NSView alloc] initWithFrame:glass.bounds];
+  tint.wantsLayer = YES;
+  tint.layer.backgroundColor = [NSColor blackColor].CGColor;
+  tint.alphaValue = kBroGlassTintAlpha;
+  tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [glass addSubview:tint];
+
+  [parent addSubview:glass positioned:NSWindowAbove relativeTo:nil];
+  g_glass_transition_overlay = glass;
+  return glass;
+}
 
 @interface BroWindow : NSWindow {
   BOOL _glassBackdropVisible;
@@ -233,6 +295,7 @@ static const CFTimeInterval kGlassBackdropFadeDuration = 0.30;
 @property (nonatomic, strong) BroTabBar* tabBar;
 @property (nonatomic, strong) NSView* borderOverlay;
 @property (nonatomic, strong) NSView* backdropTint;
+- (BOOL)glassBackdropVisible;
 - (void)setGlassBackdropVisible:(BOOL)visible;
 @end
 
@@ -346,6 +409,7 @@ NSView* BroBrowserContainerView(void) {
     g_browser_views = [NSMutableDictionary dictionary];
     g_blank_tab_ids = [NSMutableSet set];
     g_pending_address_focus_containers = [NSHashTable weakObjectsHashTable];
+    g_fading_out_ids = [NSMutableSet set];
     // Closed-tab history lazily initializes itself on first use.
 
     // Keep the Tab-key loop current as pills and buttons come and go.
@@ -364,15 +428,22 @@ NSView* BroBrowserContainerView(void) {
 // (glass on) or back to opaque (glass off). Animates alphaValue via the
 // animator so rapid tab flips retarget the in-flight fade; `hidden` is never
 // touched — a hidden tint would flash the window transparent.
+- (BOOL)glassBackdropVisible {
+  return _glassBackdropVisible;
+}
+
 - (void)setGlassBackdropVisible:(BOOL)visible {
   if (visible == _glassBackdropVisible) {
     return;
   }
   _glassBackdropVisible = visible;
   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = BroMotionReduced() ? 0.0 : kGlassBackdropFadeDuration;
-    ctx.timingFunction = [CAMediaTimingFunction
-        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    ctx.duration = BroMotionReduced()
+                       ? 0.0
+                       : (visible ? kGlassBackdropFadeDuration
+                                  : kGlassPageFadeInDuration);
+    ctx.timingFunction = visible ? BroGlassTransitionTimingFunction()
+                                 : BroPageFadeInTimingFunction();
     self.backdropTint.animator.alphaValue =
         visible ? kBroGlassTintAlpha : 1.0;
   } completionHandler:nil];
@@ -686,6 +757,8 @@ static NSView* CreateTabContainerView(void) {
     return nil;
   }
   NSView* browserContainer = [[NSView alloc] init];
+  browserContainer.wantsLayer = YES;
+  browserContainer.layer.backgroundColor = [NSColor blackColor].CGColor;
   ApplyViewportFrameToContainer(browserContainer, NO);
   browserContainer.hidden = YES;  // Will be shown when tab is activated
   [g_main_window.browserContainer addSubview:browserContainer];
@@ -714,6 +787,15 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
   BroHandler* handler = BroHandler::GetInstance();
   ValidateSplitState(active_browser_id);
   NSView* parent = g_main_window.browserContainer;
+  // Glass backdrop iff every visible pane is blank: a blank tab draws no page
+  // pixels, so the backdrop is its entire surface. With a split showing one
+  // loaded pane the window stays opaque black — half-glass at the divider
+  // would look broken. active_browser_id == -1 (no tabs) resolves to black.
+  BOOL activeBlank = [g_blank_tab_ids containsObject:@(active_browser_id)];
+  BOOL partnerBlank =
+      !SplitActive() || [g_blank_tab_ids containsObject:@(g_split_browser_id)];
+  BOOL wantsGlass = activeBlank && partnerBlank;
+  BOOL glassWasVisible = [g_main_window glassBackdropVisible];
   for (NSNumber* key in g_browser_views) {
     // Split screen widens the visible set to both panes; each stays attached
     // and unthrottled (SetBrowserHidden(false)) while on screen.
@@ -723,29 +805,108 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
     NSView* container = g_browser_views[key];
     BOOL detached = hidden || g_window_occluded;
     if (detached) {
-      // g_browser_views keeps the container (and the CEF view inside it)
-      // alive while it is out of the view hierarchy.
-      if (container.superview) {
-        [container removeFromSuperview];
+      BOOL wasOnScreen = container.superview == parent && !container.hidden;
+      BOOL shouldFadeOut = wantsGlass && wasOnScreen && !g_window_occluded &&
+                           !BroMotionReduced();
+      if (shouldFadeOut) {
+        if (![g_fading_out_ids containsObject:key]) {
+          [g_fading_out_ids addObject:key];
+          NSView* glassOverlay =
+              BroCreateGlassTransitionOverlay(parent, 0.0);
+          int transitionToken = ++g_glass_transition_token;
+          [NSAnimationContext
+              runAnimationGroup:^(NSAnimationContext* ctx) {
+                ctx.duration = kGlassBackdropFadeDuration;
+                ctx.timingFunction = BroGlassTransitionTimingFunction();
+                glassOverlay.animator.alphaValue = 1.0;
+              }
+              completionHandler:^{
+                if (transitionToken != g_glass_transition_token ||
+                    g_glass_transition_overlay != glassOverlay) {
+                  return;
+                }
+                if ([g_fading_out_ids containsObject:key] &&
+                    g_browser_views[key] == container) {
+                  [g_fading_out_ids removeObject:key];
+                  [container removeFromSuperview];
+                  container.hidden = YES;
+                  container.alphaValue = 1.0;
+                  BroHandler* currentHandler = BroHandler::GetInstance();
+                  if (currentHandler) {
+                    currentHandler->SetBrowserHidden(key.intValue, true);
+                  }
+                }
+                // Keep the finished veil for one display frame so the real
+                // backdrop tint has certainly reached its matching endpoint.
+                dispatch_after(
+                    dispatch_time(DISPATCH_TIME_NOW,
+                                  (int64_t)(kGlassHandoffDelay * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(), ^{
+                      if (transitionToken != g_glass_transition_token ||
+                          g_glass_transition_overlay != glassOverlay) {
+                        return;
+                      }
+                      [glassOverlay removeFromSuperview];
+                      g_glass_transition_overlay = nil;
+                    });
+              }];
+        }
+      } else {
+        // g_browser_views keeps the container (and the CEF view inside it)
+        // alive while it is out of the view hierarchy.
+        [g_fading_out_ids removeObject:key];
+        if (container.superview) {
+          [container removeFromSuperview];
+        }
+        container.hidden = YES;
+        container.alphaValue = 1.0;
+        if (handler) {
+          handler->SetBrowserHidden(key.intValue, true);
+        }
       }
-    } else if (parent && container.superview != parent) {
-      [parent addSubview:container];
-      ApplyFrameForTabContainer(container, key.intValue);
-    }
-    container.hidden = hidden;
-    if (handler) {
-      handler->SetBrowserHidden(key.intValue, detached);
+    } else {
+      [g_fading_out_ids removeObject:key];
+      BOOL wasDetached = container.superview != parent;
+      BOOL shouldFadeIn = glassWasVisible && !wantsGlass && wasDetached &&
+                          !BroMotionReduced();
+      NSView* revealOverlay =
+          shouldFadeIn ? BroCreateGlassTransitionOverlay(parent, 1.0) : nil;
+      container.alphaValue = 1.0;
+      if (parent && wasDetached) {
+        if (revealOverlay) {
+          [parent addSubview:container
+                   positioned:NSWindowBelow
+                   relativeTo:revealOverlay];
+        } else {
+          [parent addSubview:container];
+        }
+        ApplyFrameForTabContainer(container, key.intValue);
+      }
+      container.hidden = NO;
+      if (revealOverlay) {
+        int transitionToken = ++g_glass_transition_token;
+        [NSAnimationContext
+            runAnimationGroup:^(NSAnimationContext* ctx) {
+              ctx.duration = kGlassPageFadeInDuration;
+              ctx.timingFunction = BroPageFadeInTimingFunction();
+              revealOverlay.animator.alphaValue = 0.0;
+            }
+            completionHandler:^{
+              if (transitionToken != g_glass_transition_token ||
+                  g_glass_transition_overlay != revealOverlay) {
+                return;
+              }
+              [revealOverlay removeFromSuperview];
+              g_glass_transition_overlay = nil;
+            }];
+      }
+      if (handler) {
+        handler->SetBrowserHidden(key.intValue, false);
+      }
     }
   }
   UpdateSplitDivider();
-  // Glass backdrop iff every visible pane is blank: a blank tab draws no page
-  // pixels, so the backdrop is its entire surface. With a split showing one
-  // loaded pane the window stays opaque black — half-glass at the divider
-  // would look broken. active_browser_id == -1 (no tabs) resolves to black.
-  BOOL activeBlank = [g_blank_tab_ids containsObject:@(active_browser_id)];
-  BOOL partnerBlank =
-      !SplitActive() || [g_blank_tab_ids containsObject:@(g_split_browser_id)];
-  [g_main_window setGlassBackdropVisible:(activeBlank && partnerBlank)];
+  [g_main_window setGlassBackdropVisible:wantsGlass];
 }
 
 static void UpdateChromeLayout(void) {
@@ -2097,6 +2258,10 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   g_split_divider = nil;
   [g_browser_views removeAllObjects];
   [g_blank_tab_ids removeAllObjects];
+  [g_fading_out_ids removeAllObjects];
+  ++g_glass_transition_token;
+  [g_glass_transition_overlay removeFromSuperview];
+  g_glass_transition_overlay = nil;
   // The closed-tab list intentionally survives: it is persisted and feeds
   // Reopen Closed Tab across launches.
   // Flush any debounced history writes before the app winds down.
