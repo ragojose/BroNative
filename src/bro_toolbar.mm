@@ -6,12 +6,47 @@
 #include "include/cef_browser.h"
 #include "bro_handler.h"
 #import "bro_mac_internal.h"
+#import "bro_motion.h"
 #import "radix_icons.h"
 
 #pragma mark - BroToolbar
 
 // g_toolbar is declared extern in bro_mac_internal.h.
 BroToolbar* g_toolbar = nil;
+
+// Resolves what the user typed into a loadable URL: safe schemes pass
+// through, about: passes through, a dotted word gets https://, and anything
+// else becomes a Google search. Shared by the address field and the command
+// palette's fallback row (which shows the classification before navigating).
+// Declared extern in bro_mac_internal.h. |query| must already be trimmed;
+// returns nil for an empty query.
+NSString* BroResolveQueryToURL(NSString* query) {
+  if (query.length == 0) {
+    return nil;
+  }
+  NSString* lower = query.lowercaseString;
+
+  if ([query containsString:@"://"]) {
+    // Only navigate to safe schemes; anything else (javascript:, data:, ...)
+    // falls through to search.
+    if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"] ||
+        [lower hasPrefix:@"file://"]) {
+      return query;
+    }
+  } else if ([lower hasPrefix:@"about:"]) {
+    return query;
+  } else if ([query containsString:@"."] && ![query containsString:@" "]) {
+    return [@"https://" stringByAppendingString:query];
+  }
+
+  // Treat as search query. Encode everything outside the unreserved set so
+  // characters like & and + can't alter the query string.
+  NSMutableCharacterSet* allowed = [NSMutableCharacterSet alphanumericCharacterSet];
+  [allowed addCharactersInString:@"-._~"];
+  NSString* encoded = [query stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+  return [NSString stringWithFormat:@"https://www.google.com/search?q=%@",
+                                    encoded ?: @""];
+}
 
 // BroAddressField's @interface is declared in bro_mac_internal.h (shared
 // with bro_mac.mm, where BroTabView checks isKindOfClass:[BroAddressField
@@ -42,7 +77,14 @@ BroToolbar* g_toolbar = nil;
 
 @end
 
-@implementation BroToolbar
+@implementation BroToolbar {
+  // Hover zone spanning the search + downloads buttons; both stay hidden
+  // (alpha 0) until the pointer enters it.
+  NSTrackingArea* revealTrackingArea_;
+  BOOL revealZoneHovered_;
+  // Invalidates a pending auto-hide scheduled by pulseDownloadsButton.
+  NSUInteger revealGeneration_;
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
   self = [super initWithFrame:frame];
@@ -82,16 +124,22 @@ BroToolbar* g_toolbar = nil;
     _refreshButton.toolTip = @"Reload page (⌘R)";
     [self addSubview:_refreshButton];
 
+    _navigationHighlightGroup =
+        [[BroHoverHighlightGroup alloc] initWithContainerView:self];
+    _backButton.highlightGroup = _navigationHighlightGroup;
+    _forwardButton.highlightGroup = _navigationHighlightGroup;
+    _refreshButton.highlightGroup = _navigationHighlightGroup;
+
     // The editable address field lives inside the ACTIVE tab pill (the tab
     // strip re-parents it on tab switches); created here without a superview.
-    _addressField = [[BroAddressField alloc] initWithFrame:NSMakeRect(0, 0, 100, 18)];
-    _addressField.font = BroUIFont(12.0);
+    _addressField = [[BroAddressField alloc]
+        initWithFrame:NSMakeRect(0, 0, 100, kTabTextFrameHeight)];
+    _addressField.font = BroUIFont(kTabTextFontSize);
     _addressField.bezeled = NO;
     _addressField.bordered = NO;
     _addressField.drawsBackground = NO;
     _addressField.focusRingType = NSFocusRingTypeNone;
     _addressField.textColor = [NSColor labelColor];
-    _addressField.placeholderString = @"Enter URL or search";
     _addressField.delegate = self;
     _addressField.cell.scrollable = YES;
     _addressField.cell.usesSingleLineMode = YES;
@@ -99,6 +147,22 @@ BroToolbar* g_toolbar = nil;
     // scrolls while typing.
     _addressField.cell.lineBreakMode = NSLineBreakByTruncatingTail;
     _addressField.cell.truncatesLastVisibleLine = YES;
+    // AppKit draws an empty field's placeholder through NSTextFieldCell, not
+    // through the field editor. Its borderless-cell default sits at the
+    // bottom of our 18pt frame, 3pt below the centered tab baseline. Apply the
+    // missing half-leading explicitly so the placeholder occupies the exact
+    // same origin as resting and selected text.
+    CGFloat placeholderHeight =
+        [_addressField.cell cellSizeForBounds:_addressField.bounds].height;
+    CGFloat placeholderBaselineOffset = ceil(
+        MAX(0.0, (kTabTextFrameHeight - placeholderHeight) / 2.0));
+    _addressField.placeholderAttributedString = [[NSAttributedString alloc]
+        initWithString:@"Enter URL or search"
+            attributes:@{
+              NSFontAttributeName : BroUIFont(kTabTextFontSize),
+              NSForegroundColorAttributeName : [NSColor placeholderTextColor],
+              NSBaselineOffsetAttributeName : @(placeholderBaselineOffset),
+            }];
     _addressField.accessibilityLabel = @"Address and search bar";
 
     // Viewport mode toggles pinned to the right edge. Exposed as a radio
@@ -119,15 +183,24 @@ BroToolbar* g_toolbar = nil;
     _desktopButton.autoresizingMask = NSViewMinXMargin;
     [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
     [self addSubview:_desktopButton];
-    // Downloads sits left of the viewport radio group, set off by a wider
-    // gap so it doesn't read as a third mode.
-    rightX -= kButtonSize + kButtonSpacing + 8.0;
+    // Downloads sits left of the viewport radio group at the same spacing —
+    // the four trailing icons (search, downloads, desktop, mobile) read as
+    // one evenly spaced cluster.
+    rightX -= kButtonSize + kButtonSpacing;
     _downloadsButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
                                               icon:RadixIconDownload
                                             action:@selector(toggleDownloads:)
                                              label:@"Downloads"];
     _downloadsButton.autoresizingMask = NSViewMinXMargin;
+    // Hidden until the pointer enters the shared reveal zone (see
+    // updateTrackingAreas), together with the tab strip's search button.
+    _downloadsButton.alphaValue = 0.0;
     [self addSubview:_downloadsButton];
+    _trailingHighlightGroup =
+        [[BroHoverHighlightGroup alloc] initWithContainerView:self];
+    _downloadsButton.highlightGroup = _trailingHighlightGroup;
+    _desktopButton.highlightGroup = _trailingHighlightGroup;
+    _mobileButton.highlightGroup = _trailingHighlightGroup;
     // The selected toggle is disabled but must keep its bright tint, so don't
     // let AppKit dim the icon.
     ((NSButtonCell*)_mobileButton.cell).imageDimsWhenDisabled = NO;
@@ -157,6 +230,91 @@ BroToolbar* g_toolbar = nil;
   button.accessibilityLabel = label;
   button.toolTip = label;
   return button;
+}
+
+#pragma mark - Search/downloads hover reveal
+
+// One tracking rect covers both hideable icons — the tab strip's search
+// button and the downloads button — plus the gap between them, full toolbar
+// height, so the pair reveals as soon as the pointer nears either. The rect
+// is explicit (not InVisibleRect) because it spans a subview of a sibling;
+// AppKit re-invokes this on geometry changes, and bro_mac.mm calls it once
+// more after the tab bar exists.
+- (void)updateTrackingAreas {
+  [super updateTrackingAreas];
+  if (revealTrackingArea_) {
+    [self removeTrackingArea:revealTrackingArea_];
+    revealTrackingArea_ = nil;
+  }
+  NSRect zone = _downloadsButton.frame;
+  NSView* searchButton = g_tab_bar.tabSearchButton;
+  if (searchButton && searchButton.window == self.window) {
+    zone = NSUnionRect(zone,
+                       [self convertRect:searchButton.bounds
+                                fromView:searchButton]);
+  }
+  zone = NSInsetRect(zone, -8.0, 0);
+  zone.origin.y = 0;
+  zone.size.height = NSHeight(self.bounds);
+  revealTrackingArea_ = [[NSTrackingArea alloc]
+      initWithRect:zone
+           options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+             owner:self
+          userInfo:nil];
+  [self addTrackingArea:revealTrackingArea_];
+}
+
+- (void)setSearchDownloadsRevealed:(BOOL)revealed {
+  CGFloat alpha = revealed ? 1.0 : 0.0;
+  NSView* searchButton = g_tab_bar.tabSearchButton;
+  if (BroMotionReduced()) {
+    _downloadsButton.alphaValue = alpha;
+    searchButton.alphaValue = alpha;
+    return;
+  }
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = kCloseButtonFadeDuration;
+    _downloadsButton.animator.alphaValue = alpha;
+    searchButton.animator.alphaValue = alpha;
+  }];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+  revealZoneHovered_ = YES;
+  [self setSearchDownloadsRevealed:YES];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  revealZoneHovered_ = NO;
+  [self setSearchDownloadsRevealed:NO];
+}
+
+// Nudge when a download starts or finishes. With the icons hidden at rest,
+// the nudge is the reveal itself: fade the pair in, then back out unless
+// the pointer is in the zone. If they're already revealed, fall back to the
+// original opacity dip on the downloads button. Declared in
+// bro_mac_internal.h; called from bro_downloads.mm.
+- (void)pulseDownloadsButton {
+  revealGeneration_++;
+  NSUInteger generation = revealGeneration_;
+  if (revealZoneHovered_) {
+    if (!BroMotionReduced()) {
+      _downloadsButton.alphaValue = 0.25;
+      [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = 0.5;
+        _downloadsButton.animator.alphaValue = 1.0;
+      }];
+    }
+    return;
+  }
+  [self setSearchDownloadsRevealed:YES];
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+        if (generation == revealGeneration_ && !revealZoneHovered_) {
+          [self setSearchDownloadsRevealed:NO];
+        }
+      });
 }
 
 #pragma mark - Navigation Actions
@@ -194,32 +352,8 @@ BroToolbar* g_toolbar = nil;
 - (void)navigateToURL:(NSString*)urlString {
   urlString = [urlString stringByTrimmingCharactersInSet:
       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-  if (urlString.length == 0) return;
-
-  NSString* lower = urlString.lowercaseString;
-  NSString* target = nil;
-
-  if ([urlString containsString:@"://"]) {
-    // Only navigate to safe schemes; anything else (javascript:, data:, ...)
-    // falls through to search.
-    if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"] ||
-        [lower hasPrefix:@"file://"]) {
-      target = urlString;
-    }
-  } else if ([lower hasPrefix:@"about:"]) {
-    target = urlString;
-  } else if ([urlString containsString:@"."] && ![urlString containsString:@" "]) {
-    target = [@"https://" stringByAppendingString:urlString];
-  }
-
-  if (!target) {
-    // Treat as search query. Encode everything outside the unreserved set so
-    // characters like & and + can't alter the query string.
-    NSMutableCharacterSet* allowed = [NSMutableCharacterSet alphanumericCharacterSet];
-    [allowed addCharactersInString:@"-._~"];
-    NSString* encoded = [urlString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-    target = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded ?: @""];
-  }
+  NSString* target = BroResolveQueryToURL(urlString);
+  if (!target) return;
 
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
@@ -290,6 +424,49 @@ BroToolbar* g_toolbar = nil;
 
 #pragma mark - NSTextFieldDelegate
 
+- (BOOL)configureAddressFieldEditor {
+  NSTextView* editor = (NSTextView*)[_addressField currentEditor];
+  if (![editor isKindOfClass:[NSTextView class]]) {
+    return NO;
+  }
+
+  NSFont* font = BroUIFont(kTabTextFontSize);
+  editor.font = font;
+  editor.insertionPointColor = [NSColor whiteColor];
+  editor.textColor = [NSColor whiteColor];
+  editor.drawsBackground = NO;
+
+  // NSTextView adds five points of line-fragment padding by default. The
+  // resting Core Text renderer starts at x=0, so leaving that default in
+  // place makes the selected URL jump right on focus even though both views
+  // have the same frame. Remove every editor-owned inset explicitly.
+  editor.textContainer.lineFragmentPadding = 0.0;
+
+  // Use the exact Core Text baseline equation from BroTextMorphView. AppKit's
+  // cell reports a 13pt height for Geist 10 while Core Text's pixel-aligned
+  // line box is 14pt; centering the cell therefore puts selected text 1pt
+  // above the resting host. Deriving the editor inset from the same font
+  // metrics keeps both renderers on precisely the same baseline.
+  CGFloat lineHeight =
+      ceil(font.ascender - font.descender + font.leading);
+  CGFloat baselineFromBottom = ceil(-font.descender);
+  CGFloat baselineFromTop =
+      (_addressField.bounds.size.height + lineHeight) / 2.0 -
+      baselineFromBottom;
+  editor.textContainerInset =
+      NSMakeSize(0.0, MAX(0.0, baselineFromTop - font.ascender));
+
+  // Selection inverts against the dark chrome: a white highlight with
+  // near-black glyphs, instead of the system's blue-on-white.
+  editor.selectedTextAttributes = @{
+    NSBackgroundColorAttributeName : [NSColor whiteColor],
+    NSForegroundColorAttributeName :
+        [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0],
+  };
+  [editor selectAll:nil];
+  return YES;
+}
+
 - (void)addressFieldDidFocus {
   // Show the full URL for editing; the host pill shows the focused look
   // (gray hairline border, pure white text) from click-in through typing.
@@ -300,32 +477,21 @@ BroToolbar* g_toolbar = nil;
     ((BroTabView*)_addressField.superview).editingAddress = YES;
   }
   _addressField.textColor = [NSColor whiteColor];
-  dispatch_async(dispatch_get_main_queue(), ^{
-    NSTextView* editor = (NSTextView*)[self.addressField currentEditor];
-    if ([editor isKindOfClass:[NSTextView class]]) {
-      editor.insertionPointColor = [NSColor whiteColor];
-      editor.textColor = [NSColor whiteColor];
-      editor.drawsBackground = NO;
-      // AppKit pins field-editor text to the top of its bounds, while the
-      // settled URL is vertically centered by the text-field cell. Use the
-      // settled URL's baseline for editing too, so focusing and typing never
-      // makes the text jump.
-      CGFloat textHeight =
-          [self.addressField.cell cellSizeForBounds:self.addressField.bounds]
-              .height;
-      editor.textContainerInset = NSMakeSize(
-          0.0, MAX(0.0, (self.addressField.bounds.size.height - textHeight) /
-                            2.0));
-      // Selection inverts against the dark chrome: a white highlight with
-      // near-black glyphs, instead of the system's blue-on-white.
-      editor.selectedTextAttributes = @{
-        NSBackgroundColorAttributeName : [NSColor whiteColor],
-        NSForegroundColorAttributeName :
-            [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0],
-      };
-      [editor selectAll:nil];
-    }
-  });
+  // Configure synchronously so AppKit never presents one frame with its
+  // default font/insets before snapping to the shared tab metrics. Some
+  // responder paths install the field editor just after becomeFirstResponder;
+  // retain a one-turn fallback only for those paths.
+  if (![self configureAddressFieldEditor]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self configureAddressFieldEditor];
+    });
+  }
+}
+
+- (void)controlTextDidBeginEditing:(NSNotification*)notification {
+  if (notification.object == _addressField) {
+    [self configureAddressFieldEditor];
+  }
 }
 
 - (void)controlTextDidEndEditing:(NSNotification*)notification {
@@ -348,7 +514,15 @@ BroToolbar* g_toolbar = nil;
 
 - (void)focusAddressField {
   if (_addressField.superview) {
-    [self.window makeFirstResponder:_addressField];
+    BroTabView* tab = [_addressField.superview isKindOfClass:[BroTabView class]]
+                          ? (BroTabView*)_addressField.superview
+                          : nil;
+    // A hidden control cannot become first responder. Reveal the editor first;
+    // becomeFirstResponder then replaces the compact host with the full URL.
+    tab.editingAddress = YES;
+    if (![self.window makeFirstResponder:_addressField]) {
+      tab.editingAddress = NO;
+    }
   }
 }
 

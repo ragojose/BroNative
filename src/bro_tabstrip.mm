@@ -10,6 +10,8 @@
 
 #include "bro_handler.h"
 #import "bro_mac_internal.h"
+#import "bro_motion.h"
+#import "bro_text_morph.h"
 #import "radix_icons.h"
 
 // Scales about the view's center regardless of the layer's anchorPoint.
@@ -111,8 +113,8 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
   if (pressed_) {
     alpha = 0.16;
   } else if (_selectedState) {
-    alpha = (self.enabled && hovered_) ? 0.14 : 0.10;
-  } else if (self.enabled && hovered_) {
+    alpha = (self.enabled && hovered_ && !_highlightGroup) ? 0.14 : 0.10;
+  } else if (self.enabled && hovered_ && !_highlightGroup) {
     alpha = 0.08;
   }
   self.layer.backgroundColor =
@@ -124,11 +126,10 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 // Disabled buttons and Reduce Motion users get no motion.
 - (void)refreshTransform {
   CGFloat scale = 1.0;
-  if (self.enabled &&
-      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
+  if (self.enabled && !BroMotionReduced()) {
     if (pressed_) {
       scale = kIconPressScale;
-    } else if (hovered_) {
+    } else if (hovered_ && !_highlightGroup) {
       scale = kIconHoverScale;
     }
   }
@@ -142,6 +143,9 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 }
 
 - (void)setEnabled:(BOOL)enabled {
+  if (!enabled && self.enabled && hovered_) {
+    [_highlightGroup hoverOffView:self];
+  }
   [super setEnabled:enabled];
   [self refreshBackground];
   [self refreshTransform];
@@ -162,6 +166,7 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
   [super viewDidHide];
   hovered_ = NO;
   pressed_ = NO;
+  [_highlightGroup hoverOffView:self];
   [self refreshBackground];
   [self refreshTransform];
 }
@@ -173,7 +178,11 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 }
 
 - (void)mouseEntered:(NSEvent*)event {
+  if (!self.enabled) {
+    return;
+  }
   hovered_ = YES;
+  [_highlightGroup hoverOnView:self];
   [self refreshBackground];
   [self refreshTransform];
 }
@@ -181,6 +190,7 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 - (void)mouseExited:(NSEvent*)event {
   hovered_ = NO;
   pressed_ = NO;
+  [_highlightGroup hoverOffView:self];
   [self refreshBackground];
   [self refreshTransform];
 }
@@ -278,21 +288,13 @@ void BroFetchFaviconGuarded(NSString* urlString,
     [self addSubview:_loadingSpinner];
 
     // Host label (hidden on the active pill, where the address field shows)
-    _titleLabel = [[NSTextField alloc]
-        initWithFrame:NSMakeRect(32, (kTabPillHeight - 18) / 2.0,
-                                 frame.size.width - 32 - 26, 18)];
-    _titleLabel.stringValue = kBroBlankTabTitle;
-    _titleLabel.font = BroUIFont(12.0);
-    _titleLabel.textColor = [NSColor secondaryLabelColor];
-    _titleLabel.bordered = NO;
-    _titleLabel.editable = NO;
-    _titleLabel.selectable = NO;
-    _titleLabel.drawsBackground = NO;
-    _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    _titleLabel.cell.truncatesLastVisibleLine = YES;
-    // Single-line mode matches the address field's cell so the text doesn't
-    // shift when the label swaps for the field on tab activation.
-    _titleLabel.cell.usesSingleLineMode = YES;
+    _titleLabel = [[BroTextMorphView alloc]
+        initWithFont:BroUIFont(kTabTextFontSize)
+                 color:[NSColor secondaryLabelColor]];
+    _titleLabel.frame = NSMakeRect(
+        32, (kTabPillHeight - kTabTextFrameHeight) / 2.0,
+        frame.size.width - 32 - 26, kTabTextFrameHeight);
+    [_titleLabel setText:kBroBlankTabTitle animated:NO];
     _titleLabel.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_titleLabel];
 
@@ -358,9 +360,10 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _pageDescription = nil;
   }
   _tabURL = newURL;
-  _titleLabel.stringValue = BroURLIsBlank(_tabURL)
-      ? kBroBlankTabTitle
-      : BroDisplayHostForURL(_tabURL);
+  NSString* display = BroURLIsBlank(_tabURL)
+                          ? kBroBlankTabTitle
+                          : BroDisplayHostForURL(_tabURL);
+  [_titleLabel setText:display animated:self.window != nil];
 }
 
 // Hosts the toolbar's shared address field (this pill is the active tab).
@@ -370,7 +373,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 - (void)attachAddressField:(NSTextField*)field {
   field.autoresizingMask = NSViewNotSizable;
   [self addSubview:field];
-  _titleLabel.hidden = YES;
+  _editingAddress = NO;
   [self layoutPillContents];
 }
 
@@ -382,19 +385,25 @@ void BroFetchFaviconGuarded(NSString* urlString,
   NSRect iconFrame = NSMakeRect(iconX, (kTabPillHeight - 15) / 2.0, 15, 15);
   _faviconView.frame = iconFrame;
   _loadingSpinner.frame = iconFrame;
-  _titleLabel.hidden = _iconOnly || _isActive;
+  // Resting active and inactive tabs deliberately share the morph view. The
+  // NSTextField appears only while editing, eliminating the renderer/baseline
+  // swap that made text jump when merely changing tabs.
+  BOOL showEditor = _isActive && _editingAddress;
+  _titleLabel.hidden = _iconOnly || showEditor;
 
   // Text runs from the favicon's right edge to just inside the ✕ (or the
   // pill's edge when there is no room for one). Clamped at zero so a collapsed
   // pill can't produce a negative width.
   CGFloat textRight = _closable ? 26.0 : 10.0;
   NSRect textFrame =
-      NSMakeRect(32, (self.bounds.size.height - 18) / 2.0,
-                 MAX(0.0, self.bounds.size.width - 32 - textRight), 18);
+      NSMakeRect(32,
+                 (self.bounds.size.height - kTabTextFrameHeight) / 2.0,
+                 MAX(0.0, self.bounds.size.width - 32 - textRight),
+                 kTabTextFrameHeight);
   _titleLabel.frame = textFrame;
   for (NSView* v in self.subviews) {
     if ([v isKindOfClass:[BroAddressField class]]) {
-      v.hidden = _iconOnly;
+      v.hidden = _iconOnly || !showEditor;
       v.frame = textFrame;
       break;
     }
@@ -440,7 +449,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (_isActive) {
     self.layer.backgroundColor = [NSColor blackColor].CGColor;
     self.layer.borderColor = BroControlBorderColor().CGColor;
-    _titleLabel.textColor = [NSColor labelColor];
+    _titleLabel.color = [NSColor labelColor];
   } else {
     // The split screen's right pane keeps the active pill's look while
     // inactive, so both on-screen halves read as selected — with a faint
@@ -453,10 +462,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
         (_isSplitPane || hovered_ || focused_)
             ? BroControlBorderColor().CGColor
             : [NSColor colorWithWhite:1.0 alpha:0.05].CGColor;
-    _titleLabel.textColor = [NSColor secondaryLabelColor];
-    // The address field only lives in the active pill, so the label comes
-    // back — unless the pill is collapsed to its favicon.
-    _titleLabel.hidden = _iconOnly;
+    _titleLabel.color = [NSColor secondaryLabelColor];
   }
   // A dragged pill hovering this one (drop = split the two tabs) outshines
   // every other state so the target is unmistakable.
@@ -478,8 +484,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
   closeButtonShown_ = shown;
   // Pills built off-window (init-time updateAppearance) must not fade in.
   BOOL animate =
-      self.window != nil &&
-      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion;
+      self.window != nil && !BroMotionReduced();
   if (!animate) {
     _closeButton.hidden = !shown;
     _closeButton.alphaValue = 1.0;
@@ -520,6 +525,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
 
 - (void)setIsActive:(BOOL)isActive {
   _isActive = isActive;
+  if (!isActive) {
+    _editingAddress = NO;
+  }
   [self updateAppearance];
   [self layoutPillContents];
 }
@@ -527,6 +535,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 - (void)setEditingAddress:(BOOL)editingAddress {
   _editingAddress = editingAddress;
   [self updateAppearance];
+  [self layoutPillContents];
 }
 
 - (void)setDropTarget:(BOOL)dropTarget {
@@ -563,8 +572,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (self.layer.maskedCorners == mask) {
     return;
   }
-  if (self.window != nil &&
-      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
+  if (self.window != nil && !BroMotionReduced()) {
     CATransition* fade = [CATransition animation];
     fade.type = kCATransitionFade;
     fade.duration = kCloseButtonFadeDuration;
@@ -751,7 +759,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 - (NSString*)accessibilityLabel {
-  NSString* host = _titleLabel.stringValue;
+  NSString* host = _titleLabel.text;
   NSString* label = host.length > 0
       ? host
       : (self.pageTitle.length > 0 ? self.pageTitle : kBroBlankTabTitle);
@@ -815,7 +823,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 @end
 
 @implementation BroTabHoverCard {
-  NSTextField* titleLabel_;
+  BroTextMorphView* titleLabel_;
   NSTextField* urlLabel_;
   NSTextField* descriptionLabel_;
 }
@@ -840,15 +848,10 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (self) {
     self.wantsLayer = YES;
     self.layer.cornerRadius = 8.0;
-    // Slightly lighter and more opaque than the zoom HUD so the card stays
-    // readable over dark page content.
-    self.layer.backgroundColor =
-        [NSColor colorWithWhite:0.18 alpha:0.96].CGColor;
-    self.layer.borderWidth = 1.0;
-    self.layer.borderColor =
-        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+    BroApplyElevation(self, BroElevationOverlay);
 
-    titleLabel_ = BroHoverCardLabel(BroUIFontBold(12.0), 1.0);
+    titleLabel_ = [[BroTextMorphView alloc]
+        initWithFont:BroUIFontBold(12.0) color:[NSColor whiteColor]];
     urlLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.55);
     descriptionLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.75);
     descriptionLabel_.lineBreakMode = NSLineBreakByWordWrapping;
@@ -902,13 +905,13 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   const CGFloat rowGap = 3.0;
   const CGFloat textWidth = width - padX * 2;
 
-  titleLabel_.stringValue = title ?: @"";
+  [titleLabel_ setText:title ?: @""
+               animated:self.window != nil && !self.hidden];
   urlLabel_.stringValue = url ?: @"";
   descriptionLabel_.stringValue = desc ?: @"";
   descriptionLabel_.hidden = desc.length == 0;
 
-  CGFloat titleHeight = ceil([titleLabel_.cell cellSizeForBounds:
-      NSMakeRect(0, 0, CGFLOAT_MAX, CGFLOAT_MAX)].height);
+  CGFloat titleHeight = titleLabel_.desiredSize.height;
   CGFloat urlHeight = ceil([urlLabel_.cell cellSizeForBounds:
       NSMakeRect(0, 0, CGFLOAT_MAX, CGFLOAT_MAX)].height);
 
@@ -1010,23 +1013,25 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _addTabButton.toolTip = @"New tab (⌘N)";
     [self addSubview:_addTabButton];
 
-    // Tab search chevron, pinned at the strip's right edge (the "+" button
-    // trails the last pill; this one never moves).
+    // Palette search button, pinned at the strip's right edge (the "+"
+    // button trails the last pill; this one never moves). Sized and styled
+    // like the toolbar buttons to its right — it reads as part of that
+    // trailing cluster, and hides/reveals with the downloads button (the
+    // toolbar owns the shared hover zone).
     _tabSearchButton = [[BroHoverButton alloc]
-        initWithFrame:NSMakeRect(frame.size.width - kAddTabButtonSize, addY,
-                                 kAddTabButtonSize, kAddTabButtonSize)];
+        initWithFrame:NSMakeRect(frame.size.width - kButtonSize,
+                                 (frame.size.height - kButtonSize) / 2.0,
+                                 kButtonSize, kButtonSize)];
     _tabSearchButton.bordered = NO;
     _tabSearchButton.title = @"";
-    _tabSearchButton.image = RadixIconImage(RadixIconChevronDown, 10);
+    _tabSearchButton.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
     _tabSearchButton.imagePosition = NSImageOnly;
     _tabSearchButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
-    _tabSearchButton.layer.cornerRadius = 4.0;
-    _tabSearchButton.baseBorderWidth = 1.0;
-    _tabSearchButton.baseBorderColor = BroControlBorderColor();
     _tabSearchButton.target = self;
     _tabSearchButton.action = @selector(toggleTabSearch:);
     _tabSearchButton.accessibilityLabel = @"Search tabs";
     _tabSearchButton.toolTip = @"Search tabs (⇧⌘A)";
+    _tabSearchButton.alphaValue = 0.0;
     [self addSubview:_tabSearchButton];
   }
   return self;
@@ -1051,7 +1056,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 }
 
 - (void)toggleTabSearch:(id)sender {
-  ToggleTabSearchPanel();
+  ToggleCommandPalette(BroPaletteScopeTabs);
 }
 
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title {
@@ -1072,13 +1077,28 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   tab.frame = NSMakeRect((_tabs.count - 1) * (tabWidth + kTabGap), pillY,
                          tabWidth, kTabPillHeight);
   tab.alphaValue = 0.0;
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = 0.22;
-    ctx.timingFunction = [CAMediaTimingFunction
-        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+  BroRunLayoutSpring(^{
     [self applyTabLayout:YES];
-    tab.animator.alphaValue = 1.0;
-  } completionHandler:nil];
+  }, nil);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  tab.alphaValue = 1.0;
+  [CATransaction commit];
+  if (!BroMotionReduced()) {
+    CABasicAnimation* fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.fromValue = @0.0;
+    fade.toValue = @1.0;
+    fade.duration = 0.15;
+    fade.timingFunction = [CAMediaTimingFunction
+        functionWithName:kCAMediaTimingFunctionEaseOut];
+    [tab.layer addAnimation:fade forKey:@"bro.tab.enter.opacity"];
+    CASpringAnimation* scale =
+        BroSpringForKeyPath(@"transform", BroSpringInteractive);
+    scale.fromValue = [NSValue valueWithCATransform3D:
+        BroCenteredScale(tab, 0.97)];
+    scale.toValue = [NSValue valueWithCATransform3D:CATransform3DIdentity];
+    [tab.layer addAnimation:scale forKey:@"bro.tab.enter.transform"];
+  }
   [self.window recalculateKeyViewLoop];
 }
 
@@ -1174,12 +1194,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     } else {
       [_tabs removeObjectAtIndex:current];
       [_tabs insertObject:tab atIndex:hoverIndex];
-      [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-        ctx.duration = 0.15;
-        ctx.timingFunction = [CAMediaTimingFunction
-            functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+      BroRunLayoutSpring(^{
         [self applyTabLayout:YES];
-      } completionHandler:nil];
+      }, nil);
     }
   }
   if (joinTargetTab_ != joinTarget) {
@@ -1205,14 +1222,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     [self.window enableCursorRects];
     [[NSCursor arrowCursor] set];
     // Snap the released pill into its slot, then drop it back to pill level.
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-      ctx.duration = 0.15;
-      ctx.timingFunction = [CAMediaTimingFunction
-          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    BroRunLayoutSpring(^{
       [self applyTabLayout:YES];
-    } completionHandler:^{
+    }, ^{
       tab.layer.zPosition = 0.0;
-    }];
+    });
     [self.window recalculateKeyViewLoop];
     if (joinTarget) {
       // A deferred tab close (dispatch_async) can pull either pill out of
@@ -1281,12 +1295,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     [self ensureSplitPairAdjacent];
     return;
   }
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = 0.18;
-    ctx.timingFunction = [CAMediaTimingFunction
-        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+  BroRunLayoutSpring(^{
     [self applyTabLayout:YES];
-  } completionHandler:nil];
+  }, nil);
   [self.window recalculateKeyViewLoop];
 }
 
@@ -1341,10 +1352,12 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
           functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
       tabToRemove.animator.frame = collapsed;
       tabToRemove.animator.alphaValue = 0.0;
-      [self applyTabLayout:YES];
     } completionHandler:^{
       [tabToRemove removeFromSuperview];
     }];
+    BroRunLayoutSpring(^{
+      [self applyTabLayout:YES];
+    }, nil);
     [self.window recalculateKeyViewLoop];
   }
 }
@@ -1362,9 +1375,21 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
   // The active pill hosts the shared editable address field.
   if (g_toolbar) {
-    [g_toolbar.addressField removeFromSuperview];
-    if (activeTab) {
-      [activeTab attachAddressField:g_toolbar.addressField];
+    NSTextField* addressField = g_toolbar.addressField;
+    // CEF may report the already-active browser again while its field editor
+    // is live. Re-parenting the same control in that state leaves AppKit's
+    // window-owned editor visible while attachAddressField restores the
+    // compact title, drawing both strings on top of each other. Keep same-tab
+    // activation idempotent; for a real switch, finish editing before moving
+    // the shared field to its new pill.
+    if (addressField.superview != activeTab) {
+      if (addressField.currentEditor) {
+        [self.window makeFirstResponder:nil];
+      }
+      [addressField removeFromSuperview];
+      if (activeTab) {
+        [activeTab attachAddressField:addressField];
+      }
     }
     // The viewport toggles reflect the active tab's own emulation state.
     [g_toolbar setViewportMode:TabIsMobile(browserId)];
@@ -1376,12 +1401,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   // expanded active). Animate it; with no pins and room for everyone, every
   // pill is already the same width and there is nothing to move.
   if (([self isCollapsed] || [self pinnedCount] > 0) && !dragging_) {
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-      ctx.duration = 0.18;
-      ctx.timingFunction = [CAMediaTimingFunction
-          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    BroRunLayoutSpring(^{
       [self applyTabLayout:YES];
-    } completionHandler:nil];
+    }, nil);
   }
 }
 
@@ -1425,9 +1447,10 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 }
 
 - (CGFloat)availableStripWidth {
-  // The right edge reserves the trailing "+" button and the pinned tab
-  // search chevron.
-  return self.frame.size.width - 2.0 * (kAddTabButtonSize + 8.0);
+  // The right edge reserves the trailing "+" button and the pinned search
+  // button (toolbar-button sized).
+  return self.frame.size.width - (kAddTabButtonSize + 8.0) -
+         (kButtonSize + 8.0);
 }
 
 // Pinned pills are kept as a strict prefix of _tabs; every layout and drag
@@ -1559,11 +1582,12 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _addTabButton.frame = addTarget;
   }
 
-  // The chevron never trails the pills; it stays pinned at the right edge.
+  // The search button never trails the pills; it stays pinned at the right
+  // edge.
   _tabSearchButton.frame =
-      NSMakeRect(self.frame.size.width - kAddTabButtonSize,
-                 (self.frame.size.height - kAddTabButtonSize) / 2.0,
-                 kAddTabButtonSize, kAddTabButtonSize);
+      NSMakeRect(self.frame.size.width - kButtonSize,
+                 (self.frame.size.height - kButtonSize) / 2.0,
+                 kButtonSize, kButtonSize);
 }
 
 - (void)layoutTabs {
@@ -1575,8 +1599,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   [self layoutTabs];
   // A resize invalidates the card's position; hiding beats tracking it.
   [self hideHoverCard];
-  // Same for the tab search panel, which anchors to the chevron.
-  HideTabSearchPanel();
+  // Same for the command palette, whose centering is now stale.
+  HideCommandPalette();
 }
 
 - (void)tabSelected:(BroTabView*)tab {
@@ -1674,7 +1698,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   hoverCardTimer_ = nil;
   [hoverCardHideTimer_ invalidate];
   hoverCardHideTimer_ = nil;
-  hoverCard_.hidden = YES;
+  BroOverlayHide(hoverCard_);
   hoverCardTabId_ = -1;
 }
 
@@ -1782,12 +1806,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   // Styling first: the joined-pair seam feeds the gap applyTabLayout uses
   // (and on split exit this restores the normal gap and corners).
   RefreshSplitPaneStyling();
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = 0.18;
-    ctx.timingFunction = [CAMediaTimingFunction
-        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+  BroRunLayoutSpring(^{
     [self applyTabLayout:YES];
-  } completionHandler:nil];
+  }, nil);
   [self.window recalculateKeyViewLoop];
 }
 
@@ -1798,7 +1819,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   }
   if (!hoverCard_) {
     hoverCard_ = [[BroTabHoverCard alloc] initWithFrame:NSZeroRect];
+    hoverCard_.hidden = YES;
   }
+  BOOL wasVisible = !hoverCard_.hidden;
   // Re-add last on every show: tab containers created since the previous
   // hover stack above the card, and the native CEF views inside them would
   // occlude it.
@@ -1828,8 +1851,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
          pageDescription:tab.pageDescription
                    width:width];
   }
-  [self positionHoverCardForTab:tab];
-  hoverCard_.hidden = NO;
+  [self positionHoverCardForTab:tab animated:wasVisible];
+  BroOverlayShow(hoverCard_);
 
   // Fetch the description on first hover per page; the card shows right away
   // with title + URL and fills in when (if) the result arrives.
@@ -1843,7 +1866,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 // Hangs the card just below the toolbar, x-aligned with the pill and clamped
 // to the container edges.
-- (void)positionHoverCardForTab:(BroTabView*)tab {
+- (void)positionHoverCardForTab:(BroTabView*)tab animated:(BOOL)animated {
   NSView* container = hoverCard_.superview;
   if (!container || tab.superview != self) {
     return;
@@ -1853,7 +1876,13 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   CGFloat x = MIN(NSMinX(pill), NSMaxX(container.bounds) - size.width - 8.0);
   x = MAX(x, 8.0);
   CGFloat y = NSMaxY(container.bounds) - size.height - 6.0;
-  hoverCard_.frame = NSMakeRect(x, y, size.width, size.height);
+  NSRect target = NSMakeRect(x, y, size.width, size.height);
+  if (animated) {
+    BroSpringRetargetFrame(hoverCard_, target, BroSpringLayout,
+                           @"bro.hover-card.frame");
+  } else {
+    hoverCard_.frame = target;
+  }
 }
 
 - (void)updateTabDescription:(int)browserId description:(NSString*)desc {
@@ -1871,7 +1900,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
                        url:BroDisplayHostForURL(tab.tabURL)
            pageDescription:tab.pageDescription
                      width:hoverCard_.frame.size.width];
-      [self positionHoverCardForTab:tab];
+      [self positionHoverCardForTab:tab animated:YES];
     }
     break;
   }

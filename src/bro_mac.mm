@@ -21,6 +21,7 @@
 #import "bro_mac_internal.h"
 #import "bro_closed_tabs.h"
 #import "bro_history.h"
+#import "bro_motion.h"
 #import "bro_persist.h"
 
 // Forward declarations
@@ -90,10 +91,10 @@ static CGFloat g_split_ratio = 0.5;
 // of resetting to 50/50. Session-only.
 static CGFloat g_last_split_ratio = 0.5;
 
-// CreateNewBrowserTab(WithURL), ToggleTabSearchPanel, and HideTabSearchPanel
+// CreateNewBrowserTab(WithURL), ToggleCommandPalette, and HideCommandPalette
 // are declared extern in bro_mac_internal.h.
 
-// Transient overlays (the tab search panel, the downloads popover) must not
+// Transient overlays (the command palette, the downloads popover) must not
 // outlive a command that changes what's underneath them -- otherwise they're
 // left floating over content or chrome they no longer describe. Each overlay
 // used to hand-roll its own dismissal at a handful of call sites and they
@@ -101,7 +102,7 @@ static CGFloat g_last_split_ratio = 0.5;
 // changes page or layout state should dismiss through this one helper
 // instead of picking and choosing which overlay to hide.
 static void BroDismissTransientOverlays(void) {
-  HideTabSearchPanel();
+  HideCommandPalette();
   BroHideDownloadsPopover();
 }
 
@@ -160,13 +161,15 @@ NSString* BroDisplayHostForURL(NSString* urlString) {
 NSDictionary* BroLayerTransitionActions(void) {
   NSMutableDictionary* actions = [NSMutableDictionary dictionary];
   for (NSString* key in
-       @[ @"borderColor", @"backgroundColor", @"borderWidth", @"transform" ]) {
+       @[ @"borderColor", @"backgroundColor", @"borderWidth" ]) {
     CABasicAnimation* fade = [CABasicAnimation animationWithKeyPath:key];
     fade.duration = 0.15;
     fade.timingFunction =
         [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
     actions[key] = fade;
   }
+  actions[@"transform"] =
+      BroSpringForKeyPath(@"transform", BroSpringInteractive);
   return actions;
 }
 
@@ -265,12 +268,18 @@ NSView* BroBrowserContainerView(void) {
     // Tab strip inline in the toolbar row: after the nav buttons, before the
     // right-aligned viewport toggles.
     CGFloat stripX = kTrafficLightInset + 3 * (kButtonSize + kButtonSpacing) + 8.0;
-    CGFloat stripRight = frame.size.width - 12.0 - kButtonSize - kButtonSpacing -
-                         kButtonSize - kButtonSpacing - 8.0 - kButtonSize - 16.0;
+    // The strip's right edge (where its pinned search button sits) keeps the
+    // same kButtonSpacing gap to the downloads/desktop/mobile buttons, so all
+    // four trailing icons are evenly spaced.
+    CGFloat stripRight =
+        frame.size.width - 12.0 - 3.0 * (kButtonSize + kButtonSpacing);
     _tabBar = [[BroTabBar alloc]
         initWithFrame:NSMakeRect(stripX, 0, stripRight - stripX, kToolbarHeight)];
     [_navToolbar addSubview:_tabBar];
     g_tab_bar = _tabBar;
+    // The toolbar's search/downloads reveal zone spans a tab-bar subview, so
+    // recompute it now that the tab bar exists.
+    [_navToolbar updateTrackingAreas];
 
     // Create container for browser views (below chrome)
     _browserContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, toolbarY)];
@@ -926,8 +935,8 @@ static void ShowZoomHUD(int percent) {
     g_zoom_hud = [[NSView alloc] initWithFrame:NSZeroRect];
     g_zoom_hud.wantsLayer = YES;
     g_zoom_hud.layer.cornerRadius = 8.0;
-    g_zoom_hud.layer.backgroundColor =
-        [NSColor colorWithWhite:0.15 alpha:0.92].CGColor;
+    BroApplyElevation(g_zoom_hud, BroElevationOverlay);
+    g_zoom_hud.hidden = YES;
 
     g_zoom_hud_label = [[NSTextField alloc] initWithFrame:NSZeroRect];
     g_zoom_hud_label.editable = NO;
@@ -960,8 +969,7 @@ static void ShowZoomHUD(int percent) {
   g_zoom_hud_label.frame =
       NSMakeRect(padX, padY, labelSize.width, labelSize.height);
 
-  g_zoom_hud.hidden = NO;
-  g_zoom_hud.alphaValue = 1.0;
+  BroOverlayShow(g_zoom_hud);
 
   [g_zoom_hud_timer invalidate];
   g_zoom_hud_timer =
@@ -969,17 +977,7 @@ static void ShowZoomHUD(int percent) {
                                       repeats:NO
                                         block:^(NSTimer* timer) {
         g_zoom_hud_timer = nil;
-        [NSAnimationContext
-            runAnimationGroup:^(NSAnimationContext* ctx) {
-              ctx.duration = 0.25;
-              g_zoom_hud.animator.alphaValue = 0.0;
-            }
-            completionHandler:^{
-              // Skip hiding if another press restarted the HUD mid-fade.
-              if (!g_zoom_hud_timer) {
-                g_zoom_hud.hidden = YES;
-              }
-            }];
+        BroOverlayHide(g_zoom_hud);
       }];
 }
 
@@ -1327,6 +1325,9 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   [fileMenu addItemWithTitle:@"Open Location..."
                       action:@selector(focusAddressBar:)
                keyEquivalent:@"l"];
+  [fileMenu addItemWithTitle:@"Command Palette…"
+                      action:@selector(showCommandPalette:)
+               keyEquivalent:@"k"];
 
   fileMenuItem.submenu = fileMenu;
   [mainMenu addItem:fileMenuItem];
@@ -1666,8 +1667,14 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   [g_tab_bar splitActiveTabWithNextTab];
 }
 
+- (void)showCommandPalette:(id)sender {
+  ToggleCommandPalette(BroPaletteScopeAll);
+}
+
+// ⇧⌘A and the tab strip's chevron keep their tab-search identity; they open
+// the same palette pre-scoped to tabs.
 - (void)showTabSearch:(id)sender {
-  ToggleTabSearchPanel();
+  ToggleCommandPalette(BroPaletteScopeTabs);
 }
 
 // The delegate is the responder-chain target for every no-target menu item,
@@ -1787,10 +1794,10 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)windowWillClose:(NSNotification*)notification {
-  HideTabSearchPanel();
-  // The retained panel belongs to the dying window's view tree; rebuild it
+  HideCommandPalette();
+  // The retained palette belongs to the dying window's view tree; rebuild it
   // fresh for any future window.
-  TeardownTabSearchPanel();
+  TeardownCommandPalette();
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
@@ -2053,10 +2060,10 @@ void OnTabLoadingChanged(int browser_id, bool is_loading) {
 
 void OnTabClosed(int browser_id) {
   dispatch_async(dispatch_get_main_queue(), ^{
-    // The panel's open-tab rows are now stale; it also self-hides after
+    // The palette's open-tab rows are now stale; it also self-hides after
     // reopening a closed tab (which lands here for the departing tab's id
     // only on real closes, not reopens — either way hiding is safe).
-    HideTabSearchPanel();
+    HideCommandPalette();
     // Remove from tab bar
     if (g_tab_bar) {
       // Record the tab for Reopen Closed Tab and the tab search panel's
@@ -2109,10 +2116,10 @@ void OnTabClosed(int browser_id) {
 
 void OnActiveTabChanged(int browser_id) {
   BroRunOnMain(^{
-    // Any tab switch dismisses the panel: switches from inside it hide
+    // Any tab switch dismisses the palette: switches from inside it hide
     // explicitly too (idempotent), and outside ones (⌘1-9, Ctrl+Tab) would
     // otherwise leave it floating over the new page.
-    HideTabSearchPanel();
+    HideCommandPalette();
     // Selecting the right pane swaps panes instead of ending the split: the
     // outgoing active tab takes the right slot and the clicked tab becomes
     // the active/left one, so the address bar and shortcuts follow it.
