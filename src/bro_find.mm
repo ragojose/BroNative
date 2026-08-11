@@ -7,16 +7,17 @@
 
 @class BroFindBar;
 
-@interface BroFindField : NSSearchField
+@interface BroFindField : NSTextField
 @property(nonatomic, weak) BroFindBar* findBar;
 @end
 
-@interface BroFindBar : NSView <NSTextFieldDelegate, NSSearchFieldDelegate>
+@interface BroFindBar : NSView <NSTextFieldDelegate>
 - (void)prepareForDisplay;
 - (void)stopFinding;
 - (void)findNext:(id)sender;
 - (void)findPrevious:(id)sender;
 - (void)closeFind:(id)sender;
+- (void)keepAboveBrowser;
 - (void)updateIdentifier:(int)identifier
                    count:(int)count
                  ordinal:(int)ordinal;
@@ -46,15 +47,16 @@
 @end
 
 @implementation BroFindBar {
+  NSView* contentHost_;
   BroFindField* searchField_;
   NSTextField* countLabel_;
+  BroHoverHighlightGroup* actionHighlightGroup_;
   __weak NSResponder* previousFirstResponder_;
   int lastFindIdentifier_;
   int lastActiveOrdinal_;
 }
 
 static BroHoverButton* BroFindButton(NSRect frame,
-                                     NSString* title,
                                      NSImage* image,
                                      NSString* label,
                                      NSString* keyEquivalent,
@@ -63,11 +65,10 @@ static BroHoverButton* BroFindButton(NSRect frame,
                                      SEL action) {
   BroHoverButton* button = [[BroHoverButton alloc] initWithFrame:frame];
   button.bordered = NO;
-  button.title = title ?: @"";
-  button.font = BroUIFont(13.0);
+  button.title = @"";
   button.image = image;
-  button.imagePosition = image ? NSImageOnly : NSNoImage;
-  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+  button.imagePosition = NSImageOnly;
+  button.contentTintColor = [NSColor labelColor];
   button.target = target;
   button.action = action;
   [button configureActionLabel:label
@@ -86,44 +87,75 @@ static BroHoverButton* BroFindButton(NSRect frame,
   self.layer.cornerRadius =
       BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
   BroApplyElevation(self, BroElevationPanel);
-  BroInstallGlassBackdrop(self, self.layer.cornerRadius);
+  contentHost_ = BroInstallGlassSurface(self, self.layer.cornerRadius);
   self.accessibilityElement = YES;
   self.accessibilityRole = NSAccessibilityGroupRole;
   self.accessibilityLabel = @"Find in page";
 
-  searchField_ = [[BroFindField alloc] initWithFrame:NSMakeRect(8, 6, 164, 24)];
+  const CGFloat centerY = NSMidY(self.bounds);
+
+  NSImageView* searchIcon = [[NSImageView alloc]
+      initWithFrame:NSMakeRect(12.0, centerY - 7.5, 15.0, 15.0)];
+  searchIcon.image = RadixIconImage(RadixIconMagnifyingGlass, 15.0);
+  searchIcon.contentTintColor = [NSColor secondaryLabelColor];
+  searchIcon.accessibilityElement = NO;
+  [contentHost_ addSubview:searchIcon];
+
+  searchField_ = [[BroFindField alloc]
+      initWithFrame:NSMakeRect(35.0, centerY - 9.0, 137.0, 18.0)];
   searchField_.findBar = self;
   searchField_.delegate = self;
-  searchField_.placeholderString = @"Find in page";
-  searchField_.sendsSearchStringImmediately = YES;
+  searchField_.font = BroUIFont(13.0);
+  searchField_.textColor = [NSColor labelColor];
+  searchField_.bordered = NO;
+  searchField_.bezeled = NO;
+  searchField_.drawsBackground = NO;
+  searchField_.focusRingType = NSFocusRingTypeNone;
+  searchField_.cell.usesSingleLineMode = YES;
+  searchField_.cell.scrollable = YES;
+  searchField_.placeholderAttributedString = [[NSAttributedString alloc]
+      initWithString:@"Find in page"
+          attributes:@{
+            NSFontAttributeName : BroUIFont(13.0),
+            NSForegroundColorAttributeName : [NSColor tertiaryLabelColor],
+          }];
   searchField_.accessibilityLabel = @"Find in page";
   searchField_.accessibilityHelp =
       @"Type search text. Press Return for the next match or Shift-Return for the previous match.";
-  [self addSubview:searchField_];
+  [contentHost_ addSubview:searchField_];
 
   countLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.55);
-  countLabel_.frame = NSMakeRect(178, 6, 48, 24);
+  countLabel_.frame = NSMakeRect(178.0, centerY - 9.0, 48.0, 18.0);
   countLabel_.alignment = NSTextAlignmentCenter;
   countLabel_.lineBreakMode = NSLineBreakByClipping;
   countLabel_.accessibilityElement = YES;
   countLabel_.accessibilityLabel = @"No search results yet";
-  [self addSubview:countLabel_];
+  [contentHost_ addSubview:countLabel_];
 
   const NSEventModifierFlags command = NSEventModifierFlagCommand;
   BroHoverButton* previous = BroFindButton(
-      NSMakeRect(230, 4, 28, 28), @"↑", nil, @"Find Previous", @"g",
+      NSMakeRect(230.0, centerY - 14.0, 28.0, 28.0),
+      RadixIconImage(RadixIconArrowUp, 15.0), @"Find Previous", @"g",
       command | NSEventModifierFlagShift, self, @selector(findPrevious:));
-  [self addSubview:previous];
+  [contentHost_ addSubview:previous];
 
-  BroHoverButton* next = BroFindButton(NSMakeRect(262, 4, 28, 28), @"↓", nil,
-                                       @"Find Next", @"g", command, self,
-                                       @selector(findNext:));
-  [self addSubview:next];
+  BroHoverButton* next = BroFindButton(
+      NSMakeRect(262.0, centerY - 14.0, 28.0, 28.0),
+      RadixIconImage(RadixIconArrowDown, 15.0), @"Find Next", @"g", command,
+      self, @selector(findNext:));
+  [contentHost_ addSubview:next];
 
   BroHoverButton* close = BroFindButton(
-      NSMakeRect(294, 4, 28, 28), @"", RadixIconImage(RadixIconCross2, 13),
-      @"Close Find Bar", @"\e", 0, self, @selector(closeFind:));
-  [self addSubview:close];
+      NSMakeRect(294.0, centerY - 14.0, 28.0, 28.0),
+      RadixIconImage(RadixIconCross2, 13.0), @"Close Find Bar", @"\e", 0,
+      self, @selector(closeFind:));
+  [contentHost_ addSubview:close];
+
+  actionHighlightGroup_ =
+      [[BroHoverHighlightGroup alloc] initWithContainerView:contentHost_];
+  previous.highlightGroup = actionHighlightGroup_;
+  next.highlightGroup = actionHighlightGroup_;
+  close.highlightGroup = actionHighlightGroup_;
 
   return self;
 }
@@ -148,6 +180,15 @@ static BroHoverButton* BroFindButton(NSRect frame,
   return handler ? handler->GetBrowser() : nullptr;
 }
 
+- (void)keepAboveBrowser {
+  // Windowed CEF operations can raise the native browser view both when a
+  // search starts and when results arrive. Keep the overlay above that child
+  // view throughout the find session without disturbing its live editor.
+  if (self.superview) {
+    [self.superview addSubview:self positioned:NSWindowAbove relativeTo:nil];
+  }
+}
+
 - (void)startNewSearch {
   CefRefPtr<CefBrowser> browser = [self activeBrowser];
   if (!browser) {
@@ -164,6 +205,7 @@ static BroHoverButton* BroFindButton(NSRect frame,
   countLabel_.accessibilityLabel = @"Searching";
   lastActiveOrdinal_ = 0;
   browser->GetHost()->Find([query UTF8String], true, false, false);
+  [self keepAboveBrowser];
 }
 
 - (void)findInDirection:(BOOL)forward {
@@ -175,10 +217,9 @@ static BroHoverButton* BroFindButton(NSRect frame,
   if (browser) {
     browser->GetHost()->Find([searchField_.stringValue UTF8String], forward,
                              false, true);
-    // A windowed CEF child can raise its native view while moving to the next
-    // match. Reassert the find bar as the top sibling and keep typing focus in
-    // the query field after the browser scrolls the result into view.
-    [self.superview addSubview:self positioned:NSWindowAbove relativeTo:nil];
+    [self keepAboveBrowser];
+    // Navigation can move focus into the browser while it scrolls the active
+    // match; hand it back so the query remains immediately editable.
     [self.window makeFirstResponder:searchField_];
   }
 }
@@ -216,6 +257,7 @@ static BroHoverButton* BroFindButton(NSRect frame,
   if (identifier < lastFindIdentifier_) {
     return;
   }
+  [self keepAboveBrowser];
   if (identifier > lastFindIdentifier_) {
     lastFindIdentifier_ = identifier;
     lastActiveOrdinal_ = 0;

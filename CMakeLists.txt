@@ -115,6 +115,8 @@ set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
 set(BRO_ICON_RESOURCES
     src/mac/icons/arrow-left.pdf
     src/mac/icons/arrow-right.pdf
+    src/mac/icons/arrow-up.pdf
+    src/mac/icons/arrow-down.pdf
     src/mac/icons/reload.pdf
     src/mac/icons/plus.pdf
     src/mac/icons/cross-2.pdf

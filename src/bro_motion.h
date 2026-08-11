@@ -52,8 +52,8 @@ extern void BroRunLayoutSpring(void (^changes)(void),
 
 extern void BroApplyElevation(NSView* view, BroElevation elevation);
 
-// Shared material tokens for every glass surface: the window shell, active
-// browse input, and floating panels all use this tint/style/hairline recipe.
+// Shared material tokens for every glass surface. macOS 26 uses untinted
+// Regular glass; older systems retain the dark HUD-style fallback.
 extern const CGFloat kBroGlassTintAlpha;
 extern const CGFloat kBroGlassBorderWidth;
 extern NSColor* BroGlassTintColor(void);
@@ -61,10 +61,19 @@ extern NSColor* BroGlassBorderColor(void);
 extern NSGlassEffectViewStyle BroGlassEffectStyle(void)
     API_AVAILABLE(macos(26.0));
 
-// Replaces the elevation's flat fill with the shared Liquid Glass backdrop.
-// Call after BroApplyElevation and before adding any other subviews so the
-// backdrop stays the bottom sibling.
-extern void BroInstallGlassBackdrop(NSView* panel, CGFloat cornerRadius);
+// Installs the stable, shell-sized backdrop. It deliberately uses the
+// conventional behind-window blur plus one tint rather than Liquid Glass,
+// whose large-surface lensing continuously refracts background geometry.
+// The returned sibling host owns the toolbar and other shell content.
+extern NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius);
+
+// Replaces the elevation's flat fill with the shared glass surface and
+// returns the sibling host that must own the surface's controls. Keeping the
+// host outside NSGlassEffectView.contentView preserves normal field-editor,
+// hit-testing, visibility, and Core Animation behavior on macOS 26; older
+// systems use the same hierarchy above the existing HUD blur + tint.
+// Call after BroApplyElevation and add all visible content to the result.
+extern NSView* BroInstallGlassSurface(NSView* panel, CGFloat cornerRadius);
 extern void BroOverlayShow(NSView* view);
 extern void BroOverlayHide(NSView* view);
 

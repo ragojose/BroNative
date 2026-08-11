@@ -10,6 +10,8 @@
 typedef NS_ENUM(NSInteger, RadixIcon) {
   RadixIconArrowLeft,
   RadixIconArrowRight,
+  RadixIconArrowUp,
+  RadixIconArrowDown,
   RadixIconReload,
   RadixIconPlus,
   RadixIconCross2,

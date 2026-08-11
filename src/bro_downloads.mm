@@ -168,6 +168,7 @@ static const CGFloat kDownloadsFooterHeight = 36.0;
 @end
 
 @implementation BroDownloadsPopover {
+  NSView* contentHost_;
   NSTextField* headerLabel_;
   BroHoverButton* clearButton_;
   BroHoverButton* viewAllButton_;
@@ -193,7 +194,10 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
           attributes:@{
             NSFontAttributeName : font,
             NSForegroundColorAttributeName :
-                [NSColor colorWithWhite:1.0 alpha:whiteAlpha],
+                whiteAlpha >= 0.8 ? [NSColor labelColor]
+                                  : (whiteAlpha >= 0.5
+                                         ? [NSColor secondaryLabelColor]
+                                         : [NSColor tertiaryLabelColor]),
             NSParagraphStyleAttributeName : style,
           }];
 }
@@ -205,24 +209,23 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     self.layer.cornerRadius =
         BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
     BroApplyElevation(self, BroElevationPanel);
-    BroInstallGlassBackdrop(self, self.layer.cornerRadius);
+    contentHost_ = BroInstallGlassSurface(self, self.layer.cornerRadius);
 
     self.accessibilityRole = NSAccessibilityGroupRole;
     self.accessibilityLabel = @"Recent downloads";
 
     rowHighlightGroup_ =
-        [[BroHoverHighlightGroup alloc] initWithContainerView:self];
+        [[BroHoverHighlightGroup alloc] initWithContainerView:contentHost_];
 
     headerLabel_ = BroHoverCardLabel(BroUIFontBold(10.0), 0.55);
     headerLabel_.attributedStringValue = [[NSAttributedString alloc]
         initWithString:@"RECENT DOWNLOADS"
             attributes:@{
               NSFontAttributeName : BroUIFontBold(10.0),
-              NSForegroundColorAttributeName :
-                  [NSColor colorWithWhite:1.0 alpha:0.55],
+              NSForegroundColorAttributeName : [NSColor secondaryLabelColor],
               NSKernAttributeName : @0.5,
             }];
-    [self addSubview:headerLabel_];
+    [contentHost_ addSubview:headerLabel_];
 
     clearButton_ = [[BroHoverButton alloc]
         initWithFrame:NSMakeRect(0, 0, 48.0, 20.0)];
@@ -233,13 +236,12 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     clearButton_.action = @selector(clearDownloads:);
     // Plain label only: a tooltip would just repeat the visible title.
     clearButton_.accessibilityLabel = @"Clear recent downloads";
-    [self addSubview:clearButton_];
+    [contentHost_ addSubview:clearButton_];
 
     separator_ = [[NSView alloc] initWithFrame:NSZeroRect];
     separator_.wantsLayer = YES;
-    separator_.layer.backgroundColor =
-        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
-    [self addSubview:separator_];
+    separator_.layer.backgroundColor = [NSColor separatorColor].CGColor;
+    [contentHost_ addSubview:separator_];
 
     viewAllButton_ = [[BroHoverButton alloc] initWithFrame:NSZeroRect];
     viewAllButton_.bordered = NO;
@@ -249,7 +251,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     viewAllButton_.target = self;
     viewAllButton_.action = @selector(viewAllDownloads:);
     viewAllButton_.accessibilityLabel = @"View all downloads";
-    [self addSubview:viewAllButton_];
+    [contentHost_ addSubview:viewAllButton_];
 
     rowViews_ = [NSMutableArray array];
     rowEntries_ = [NSMutableArray array];
@@ -309,7 +311,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     CGFloat rowY = listBottom + (rowCount - 1 - i) * kDownloadsRowHeight;
     NSView* row = [self makeRowForEntry:entry index:i];
     row.frame = NSMakeRect(0, rowY, width, kDownloadsRowHeight);
-    [self addSubview:row];
+    [contentHost_ addSubview:row];
     [rowViews_ addObject:row];
   }
 
@@ -361,7 +363,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     icon.image = [[NSWorkspace sharedWorkspace] iconForFile:entry.path];
   } else {
     icon.image = RadixIconImage(RadixIconDownload, 15.0);
-    icon.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    icon.contentTintColor = [NSColor secondaryLabelColor];
   }
   [row addSubview:icon];
 
@@ -392,7 +394,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     track.accessibilityElement = NO;
     track.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(track.frame));
     track.layer.backgroundColor =
-        [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
+        [[NSColor labelColor] colorWithAlphaComponent:0.15].CGColor;
     [row addSubview:track];
     if (entry.totalBytes > 0) {
       double fraction = MIN(
@@ -402,8 +404,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
       fill.wantsLayer = YES;
       fill.accessibilityElement = NO;
       fill.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(fill.frame));
-      fill.layer.backgroundColor =
-          [NSColor colorWithWhite:1.0 alpha:0.85].CGColor;
+      fill.layer.backgroundColor = [NSColor labelColor].CGColor;
       [row addSubview:fill];
     }
   }
@@ -416,7 +417,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     reveal.title = @"";
     reveal.imagePosition = NSImageOnly;
     reveal.image = RadixIconImage(RadixIconMagnifyingGlass, 15.0);
-    reveal.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    reveal.contentTintColor = [NSColor labelColor];
     [reveal configureActionLabel:
                 [NSString stringWithFormat:@"Show %@ in Finder", entry.name]
                   keyEquivalent:@"r"
