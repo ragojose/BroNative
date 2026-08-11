@@ -71,6 +71,8 @@ set(BRO_SRCS
     src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm
+    src/browser_registry.cc
+    src/browser_registry.h
     src/radix_icons.h
     src/radix_icons.mm
 )

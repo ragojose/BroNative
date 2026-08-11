@@ -58,25 +58,11 @@ BroHandler* BroHandler::GetInstance() {
 }
 
 CefRefPtr<CefBrowser> BroHandler::GetBrowser() {
-  // Return the active browser, or the first one if no active browser set
-  if (active_browser_id_ != -1) {
-    auto it = browser_map_.find(active_browser_id_);
-    if (it != browser_map_.end()) {
-      return it->second;
-    }
-  }
-  if (!browser_list_.empty()) {
-    return browser_list_.front();
-  }
-  return nullptr;
+  return browser_registry_.GetActive();
 }
 
 CefRefPtr<CefBrowser> BroHandler::GetBrowserById(int browser_id) {
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end()) {
-    return it->second;
-  }
-  return nullptr;
+  return browser_registry_.GetById(browser_id);
 }
 
 void BroHandler::SetActiveBrowser(int browser_id) {
@@ -86,21 +72,17 @@ void BroHandler::SetActiveBrowser(int browser_id) {
     return;
   }
 
-  if (browser_id == active_browser_id_) {
+  if (browser_id == browser_registry_.active_id()) {
     return;
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end()) {
-    active_browser_id_ = browser_id;
+  CefRefPtr<CefBrowser> browser = browser_registry_.SetActive(browser_id);
+  if (browser) {
     OnActiveTabChanged(browser_id);
 
     // Update UI with the new active tab's state
-    CefRefPtr<CefBrowser> browser = it->second;
-    if (browser) {
-      UpdateURL(browser->GetMainFrame()->GetURL().ToString());
-      UpdateNavigationState(browser->CanGoBack(), browser->CanGoForward());
-    }
+    UpdateURL(browser->GetMainFrame()->GetURL().ToString());
+    UpdateNavigationState(browser->CanGoBack(), browser->CanGoForward());
   }
 }
 
@@ -111,9 +93,9 @@ void BroHandler::SetBrowserHidden(int browser_id, bool hidden) {
     return;
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end() && it->second) {
-    it->second->GetHost()->WasHidden(hidden);
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  if (browser) {
+    browser->GetHost()->WasHidden(hidden);
   }
 }
 
@@ -124,10 +106,7 @@ void BroHandler::CloseBrowser(int browser_id) {
     return;
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end()) {
-    it->second->GetHost()->CloseBrowser(false);
-  }
+  browser_registry_.CloseBrowser(browser_id);
 }
 
 void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
@@ -146,11 +125,11 @@ void BroHandler::SetTabMobileEmulation(int browser_id, bool enabled) {
     mobile_tab_ids_.erase(browser_id);
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end()) {
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  if (browser) {
     // No reload here: the caller reloads after the viewport animation so the
     // page load doesn't compete with the window animation for the main thread.
-    ApplyEmulationToBrowser(it->second, enabled, /*reload=*/false);
+    ApplyEmulationToBrowser(browser, enabled, /*reload=*/false);
   }
 }
 
@@ -161,9 +140,9 @@ void BroHandler::ReloadTab(int browser_id) {
     return;
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it != browser_map_.end() && it->second) {
-    it->second->Reload();
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  if (browser) {
+    browser->Reload();
   }
 }
 
@@ -174,11 +153,11 @@ void BroHandler::FetchTabDescription(int browser_id) {
     return;
   }
 
-  auto it = browser_map_.find(browser_id);
-  if (it == browser_map_.end() || !it->second) {
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  if (!browser) {
     return;
   }
-  CefRefPtr<CefBrowserHost> host = it->second->GetHost();
+  CefRefPtr<CefBrowserHost> host = browser->GetHost();
   if (!host) {
     return;
   }
@@ -326,7 +305,7 @@ void BroHandler::OnAddressChange(CefRefPtr<CefBrowser> browser,
     // Every tab pill shows its own URL's host.
     OnTabURLChanged(browser->GetIdentifier(), url.ToString());
     // The editable address field only tracks the active tab.
-    if (browser->GetIdentifier() == active_browser_id_) {
+    if (browser->GetIdentifier() == browser_registry_.active_id()) {
       UpdateURL(url.ToString());
     }
   }
@@ -389,9 +368,8 @@ void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
 
   int browser_id = browser->GetIdentifier();
 
-  // Add to the list and map of existing browsers.
-  browser_list_.push_back(browser);
-  browser_map_[browser_id] = browser;
+  // Add to the registry.
+  browser_registry_.Add(browser);
 
   // Adopt as a tab if the browser's view lives in the tab container. Every
   // browser that reaches this handler was created with this CefClient (tabs
@@ -401,7 +379,7 @@ void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
       OnTabCreated(browser_id, browser->GetMainFrame()->GetURL().ToString(),
                    browser->GetHost()->GetWindowHandle());
   if (adopted) {
-    active_browser_id_ = browser_id;
+    browser_registry_.SetActive(browser_id);
   }
 }
 
@@ -415,13 +393,13 @@ bool BroHandler::DoClose(CefRefPtr<CefBrowser> browser) {
   // without sending a close to the shared window (which would close every
   // tab). The whole-window path is used when tearing everything down or for
   // the last remaining browser.
-  if (!closing_all_ && browser_list_.size() > 1 && HasTabView(browser_id)) {
+  if (!closing_all_ && browser_registry_.size() > 1 && HasTabView(browser_id)) {
     DetachTabView(browser_id);
     return true;
   }
 
   // Closing the main window requires special handling.
-  if (browser_list_.size() == 1) {
+  if (browser_registry_.size() == 1) {
     is_closing_ = true;
   }
 
@@ -434,15 +412,8 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
 
   int browser_id = browser->GetIdentifier();
 
-  // Remove from the list and map of existing browsers.
-  BrowserList::iterator bit = browser_list_.begin();
-  for (; bit != browser_list_.end(); ++bit) {
-    if ((*bit)->IsSame(browser)) {
-      browser_list_.erase(bit);
-      break;
-    }
-  }
-  browser_map_.erase(browser_id);
+  // Remove from the registry.
+  browser_registry_.Remove(browser);
   mobile_tab_ids_.erase(browser_id);
   // Dropping the registration unregisters the DevTools observer, so no
   // description results arrive for a dead browser.
@@ -453,12 +424,14 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
   OnTabClosed(browser_id);
 
   // If we closed the active browser, switch to another one
-  if (browser_id == active_browser_id_ && !browser_list_.empty()) {
-    active_browser_id_ = browser_list_.front()->GetIdentifier();
-    OnActiveTabChanged(active_browser_id_);
+  if (browser_id == browser_registry_.active_id()) {
+    CefRefPtr<CefBrowser> new_active = browser_registry_.SelectNextActive();
+    if (new_active) {
+      OnActiveTabChanged(new_active->GetIdentifier());
+    }
   }
 
-  if (browser_list_.empty()) {
+  if (browser_registry_.empty()) {
     // All browser windows have closed. Quit the application message loop.
     CefQuitMessageLoop();
   }
@@ -476,7 +449,7 @@ void BroHandler::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
   OnTabLoadingChanged(browser_id, isLoading);
 
   // Only update toolbar UI for the active tab
-  if (browser_id == active_browser_id_) {
+  if (browser_id == browser_registry_.active_id()) {
     UpdateNavigationState(canGoBack, canGoForward);
   }
 }
@@ -660,11 +633,11 @@ void BroHandler::ShowMainWindow() {
     return;
   }
 
-  if (browser_list_.empty()) {
+  if (browser_registry_.empty()) {
     return;
   }
 
-  auto main_browser = browser_list_.front();
+  auto main_browser = browser_registry_.front();
   if (is_alloy_style_) {
     PlatformShowWindow(main_browser);
   }
@@ -677,14 +650,11 @@ void BroHandler::CloseAllBrowsers(bool force_close) {
     return;
   }
 
-  if (browser_list_.empty()) {
+  if (browser_registry_.empty()) {
     return;
   }
 
   closing_all_ = true;
 
-  BrowserList::const_iterator it = browser_list_.begin();
-  for (; it != browser_list_.end(); ++it) {
-    (*it)->GetHost()->CloseBrowser(force_close);
-  }
+  browser_registry_.CloseAll(force_close);
 }

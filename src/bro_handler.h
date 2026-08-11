@@ -5,12 +5,12 @@
 #ifndef BRO_HANDLER_H_
 #define BRO_HANDLER_H_
 
+#include "browser_registry.h"
 #include "include/cef_client.h"
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_registration.h"
 
-#include <list>
 #include <map>
 #include <set>
 
@@ -81,7 +81,7 @@ class BroHandler : public CefClient,
   void SetActiveBrowser(int browser_id);
 
   // Get active browser ID
-  int GetActiveBrowserId() const { return active_browser_id_; }
+  int GetActiveBrowserId() const { return browser_registry_.active_id(); }
 
   // Close a specific browser (tab)
   void CloseBrowser(int browser_id);
@@ -227,16 +227,8 @@ class BroHandler : public CefClient,
   std::map<int, CefRefPtr<CefRegistration>> devtools_registrations_;
   std::map<int, int> pending_description_requests_;
 
-  // List of existing browser windows.
-  typedef std::list<CefRefPtr<CefBrowser>> BrowserList;
-  BrowserList browser_list_;
-
-  // Map of browser ID to browser for quick lookup
-  typedef std::map<int, CefRefPtr<CefBrowser>> BrowserMap;
-  BrowserMap browser_map_;
-
-  // Active browser ID (current tab)
-  int active_browser_id_ = -1;
+  // Live browsers (tabs) and which one is active.
+  BrowserRegistry browser_registry_;
 
   // True while CloseAllBrowsers is tearing everything down (window close /
   // app quit). Individual tab closes are handled by detaching the tab's view
