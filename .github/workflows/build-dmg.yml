@@ -20,18 +20,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # Every DMG, every delta, and the appcast live on this one release. Sparkle's
-  # generate_appcast emits a single download-url-prefix for full archives and
-  # deltas alike, so they have to share a host; per-version releases cannot.
-  # Assets are only ever added or replaced, never renamed, so a URL Sparkle
-  # published stays valid.
+  # The release holds exactly two assets: the current DMG and appcast.xml.
+  # "Publish update channel" deletes anything else on the release every run,
+  # and generate_appcast's --maximum-versions 1 keeps the feed to that one
+  # item. Deliberate trade-off for simplicity: every update is a full
+  # download, not a diff — no delta chain to fetch, generate, or prune.
   CHANNEL_TAG: updates
-  # Deltas generated per build. Also how many previous DMGs get pulled down,
-  # since building a delta needs both sides — keep it small, they are ~158 MB.
-  MAX_DELTAS: "2"
-  # DMGs retained on the release. Must equal MAX_DELTAS + 1 so delta sources
-  # survive and every retained DMG is still listed in the regenerated appcast.
-  KEEP_ARCHIVES: "3"
 
 jobs:
   build:
@@ -99,16 +93,28 @@ jobs:
       # than before. Either publishes a version below what users already have,
       # which silently stops updates. Equal is allowed — that is a re-run of an
       # already-published commit, which the publish step handles by clobbering.
+      #
+      # Reads the live appcast rather than release assets: the release is
+      # pruned to a single current DMG every run, so an asset listing no
+      # longer carries the previously published build number once a new DMG
+      # replaces it. The appcast's sparkle:version is the actual source of
+      # truth for what's live.
       - name: Assert version moves forward
         if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHANNEL_TAG: ${{ env.CHANNEL_TAG }}
         run: |
-          highest=$(gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
-            | sed -n 's/^Bro-Computer-.*-\([0-9][0-9]*\)\.dmg$/\1/p' | sort -n | tail -1)
+          url="https://github.com/${{ github.repository }}/releases/download/${{ env.CHANNEL_TAG }}/appcast.xml"
+          # No -f: curl still prints the write-out format on an HTTP error
+          # response, so pairing -f with `|| echo "000"` would concatenate
+          # into garbage like "404000". Drop -f and only fall back to "000"
+          # when curl itself fails to complete the request (DNS, network).
+          status=$(curl -sSL -o appcast-check.xml -w '%{http_code}' "$url") || status="000"
+          if [ "$status" != "200" ]; then
+            echo "No published appcast yet (HTTP $status); nothing to compare against."
+            exit 0
+          fi
+          highest=$(sed -n 's/.*sparkle:version="\([0-9][0-9]*\)".*/\1/p' appcast-check.xml | sort -n | tail -1)
           if [ -z "$highest" ]; then
-            echo "No published builds yet; nothing to compare against."
+            echo "Appcast has no sparkle:version entries yet; nothing to compare against."
             exit 0
           fi
           build="${{ steps.version.outputs.build }}"
@@ -156,10 +162,9 @@ jobs:
           path: ${{ steps.version.outputs.dmg }}
           if-no-files-found: error
 
-      # One additive release is the whole distribution channel: every DMG,
-      # every delta, and the appcast. generate_appcast emits a single
-      # download-url-prefix covering full archives AND deltas, so they must
-      # share a host — which is why per-version releases are gone.
+      # The whole distribution channel is one additive release: the current
+      # DMG and the appcast. Every run replaces both and deletes anything else
+      # that has accumulated on the release.
       - name: Publish update channel
         if: github.ref == 'refs/heads/main'
         env:
@@ -186,69 +191,38 @@ jobs:
               --notes "Automated builds from main. Managed by CI."
           fi
 
-          # Published DMGs, oldest first by build number. The trailing `|| true`
-          # matters: under pipefail a grep that legitimately matches nothing (an
-          # empty channel, no deltas yet) would otherwise abort the whole step.
-          list_dmgs() {
-            gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
-              | grep -E '^Bro-Computer-.+-[0-9]+\.dmg$' \
-              | sed -E 's/^(.*)-([0-9]+)\.dmg$/\2 \1-\2.dmg/' \
-              | sort -n | awk '{print $2}' || true
-          }
-
-          list_dmgs > published.txt
           mkdir -p archives
-          # Deltas need both sides, so pull down the most recent few. Bounded by
-          # MAX_DELTAS because each of these is a ~158 MB download.
-          tail -n "$MAX_DELTAS" published.txt | grep -vxF "$dmg" > fetch.txt || true
-          while read -r a; do
-            [ -n "$a" ] || continue
-            echo "fetching $a for delta generation"
-            gh release download "$CHANNEL_TAG" -p "$a" -D archives --clobber || true
-          done < fetch.txt
           cp "$dmg" archives/
 
           if [ -z "${SPARKLE_PRIVATE_KEY:-}" ]; then
             echo "::warning::SPARKLE_PRIVATE_KEY is not set — publishing the DMG but no appcast. Automatic updates stay off until the secret is added."
             gh release upload "$CHANNEL_TAG" "archives/$dmg" --clobber
           else
-            # Key over stdin so it never lands on disk. generate_appcast writes
-            # appcast.xml and any *.delta into the archives directory.
+            # Key over stdin so it never lands on disk. archives/ holds only
+            # the current DMG — nothing to diff against, so generate_appcast
+            # writes a full-enclosure-only entry. --maximum-versions 1 keeps
+            # the feed itself to that one item.
             printf '%s' "$SPARKLE_PRIVATE_KEY" | build/_deps/sparkle-src/bin/generate_appcast archives/ \
               --download-url-prefix "$prefix" \
-              --maximum-deltas "$MAX_DELTAS" \
+              --maximum-versions 1 \
               --ed-key-file -
             ls -la archives/
             gh release upload "$CHANNEL_TAG" "archives/$dmg" archives/appcast.xml --clobber
-            for d in archives/*.delta; do
-              [ -e "$d" ] || continue
-              gh release upload "$CHANNEL_TAG" "$d" --clobber
-            done
           fi
 
           printf '%s\n\n%s\n\n%s\n' \
             "**[Download Bro Computer $short (build $build)]($prefix$dmg)**" \
-            "Built automatically from main (${{ github.sha }}). Older builds below are kept so the updater can patch from them." \
+            "Built automatically from main (${{ github.sha }})." \
             "Ad-hoc signed, not notarized: on first launch right-click the app and choose Open." > notes.md
           gh release edit "$CHANNEL_TAG" --title "Bro Computer $short (build $build)" --notes-file notes.md
 
-          # Retain a bounded window. Anything older is unreachable from the
-          # appcast anyway; Sparkle offers the newest full DMG to old versions.
-          list_dmgs > current.txt
-          total=$(wc -l < current.txt | tr -d ' ')
-          drop=$((total - KEEP_ARCHIVES))
-          if [ "$drop" -gt 0 ]; then
-            head -n "$drop" current.txt > prune.txt
-            while read -r old; do
-              [ -n "$old" ] || continue
-              oldbuild=$(echo "$old" | sed -E 's/^.*-([0-9]+)\.dmg$/\1/')
-              echo "pruning $old and its deltas"
-              gh release delete-asset "$CHANNEL_TAG" "$old" -y || true
-              gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
-                | grep -E '\.delta$' | grep -F -- "-$oldbuild" > staledeltas.txt || true
-              while read -r dl; do
-                [ -n "$dl" ] || continue
-                gh release delete-asset "$CHANNEL_TAG" "$dl" -y || true
-              done < staledeltas.txt
-            done < prune.txt
-          fi
+          # Prune the release to exactly this DMG and appcast.xml. Anything
+          # else — an old DMG this run replaced, or delta files left over from
+          # before this change — isn't referenced by the feed and goes.
+          gh release view "$CHANNEL_TAG" --json assets -q '.assets[].name' 2>/dev/null \
+            | grep -vxF -e "$dmg" -e appcast.xml > stale.txt || true
+          while read -r old; do
+            [ -n "$old" ] || continue
+            echo "pruning $old"
+            gh release delete-asset "$CHANNEL_TAG" "$old" -y || true
+          done < stale.txt
