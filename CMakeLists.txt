@@ -75,6 +75,8 @@ set(BRO_SRCS
     src/browser_registry.h
     src/radix_icons.h
     src/radix_icons.mm
+    src/tab_description_fetcher.cc
+    src/tab_description_fetcher.h
 )
 
 set(BRO_HELPER_SRCS
