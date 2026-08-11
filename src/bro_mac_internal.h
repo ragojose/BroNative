@@ -24,7 +24,7 @@
 @class BroTabBar;
 @class BroHoverButton;
 @class BroHoverHighlightGroup;
-@class BroTextMorphView;
+@class BroShimmerTextView;
 
 // Layout/timing constants shared across the split family. Each file gets
 // its own copy (harmless for compile-time constants); kWindowBorderAlpha is
@@ -32,6 +32,20 @@
 static const CGFloat kToolbarHeight = 52.0;
 static const CGFloat kButtonSize = 28.0;
 static const CGFloat kButtonSpacing = 4.0;
+static const CGFloat kToolbarTrailingInset = 12.0;
+// Radix's magnifier has 2pt more visible whitespace toward Downloads than
+// the Download/Desktop pair. Move the complete control—not only its glyph—
+// so its icon remains centered inside hover and focus feedback.
+static const CGFloat kTabSearchOpticalOffsetX = 2.0;
+
+// The trailing controls are indexed from the right: mobile = 0, desktop = 1,
+// downloads = 2, search = 3. Keeping their x positions on one equation makes
+// the 4pt rhythm survive every window and mobile-shell resize.
+static inline CGFloat BroTrailingControlX(CGFloat toolbarWidth,
+                                          NSUInteger indexFromRight) {
+  return toolbarWidth - kToolbarTrailingInset - kButtonSize -
+         indexFromRight * (kButtonSize + kButtonSpacing);
+}
 // Wide enough that the "Enter URL or search" placeholder reads in full.
 static const CGFloat kTabPillMaxWidth = 180.0;
 static const CGFloat kTabPillMinWidth = 110.0;
@@ -52,9 +66,11 @@ static const CGFloat kTabTextFontSize = 10.0;
 static const CGFloat kTabTextFrameHeight = 18.0;
 // A collapsed pill is exactly square.
 static const CGFloat kTabPillSquareWidth = kTabPillHeight;
+// A pinned inactive pill stays text-free but keeps separate favicon/select
+// and trailing unpin targets.
+static const CGFloat kPinnedTabPillWidth = 52.0;
 // The "+" button is half the pill's size, centered on the same midline.
 static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
-static const CGFloat kPillCornerRadius = kSurfaceCornerRadius;
 static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
 static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
@@ -63,7 +79,6 @@ static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
 // downloads button) still fits.
 static const CGFloat kMobileShellWidth = 512.0;
 static const NSTimeInterval kViewportAnimDuration = 0.28;
-static const CGFloat kWindowCornerRadiusFallback = 12.0;
 // Tab hover card: dwell time on a pill before the card appears (its width
 // tracks the hovered pill's). The grace period keeps the card up after the
 // mouse leaves the pill so it can travel onto the card's action buttons.
@@ -131,9 +146,11 @@ extern void BroFetchFaviconGuarded(NSString* urlString,
                                     void (^applyImage)(NSImage* image));
 
 // Downloads popover: toggle shows or hides it; hide is safe to call any
-// time. Defined with the popover class.
+// time. Defined with the popover class. The popover never opens while the
+// list is empty — gate menu validation on BroHasRecentDownloads.
 extern void BroHideDownloadsPopover(void);
 extern void BroToggleDownloadsPopover(void);
+extern BOOL BroHasRecentDownloads(void);
 
 // Blank pages (and browsers with no committed URL yet) keep their opaque CEF
 // view hidden so the black window backdrop shows through as the new-tab
@@ -148,8 +165,7 @@ extern NSString* BroResolveQueryToURL(NSString* query);
 
 // Display-only host for a URL: the host with any leading "www." removed.
 // Falls back to the raw string when the URL has no parseable host. Never used
-// for navigation; BroToolbar.fullURL / BroTabView.tabURL keep the canonical
-// URL.
+// for navigation; BroTabView.tabURL keeps the canonical URL.
 extern NSString* BroDisplayHostForURL(NSString* urlString);
 
 // Animates the window between its desktop frame and a shell that hugs the
@@ -170,6 +186,11 @@ extern void CreateNewBrowserTabWithURL(const std::string& url);
 // address-editing ring, the "+" button — and the window frame is the same
 // 1pt #111111 hairline.
 extern NSColor* BroControlBorderColor(void);
+
+// Shared tint for the template globe shown while a tab has no fetched
+// favicon. Kept darker than regular chrome icons so it stays defined when
+// glass lifts over a light desktop background.
+extern NSColor* BroPlaceholderFaviconColor(void);
 
 // True if the given tab has mobile emulation active.
 extern BOOL TabIsMobile(int browser_id);
@@ -230,7 +251,28 @@ extern NSDictionary* BroLayerTransitionActions(void);
 // Optional shared hover preview. Grouped buttons keep pressed/selected
 // feedback but let the group own hover fill and hover motion.
 @property (nonatomic, weak) BroHoverHighlightGroup* highlightGroup;
+// Canonical shortcut metadata for the native tooltip, VoiceOver help, and
+// focused contextual activation. Global commands use matching NSMenuItems.
+@property (nonatomic, copy) NSString* shortcutKeyEquivalent;
+@property (nonatomic, assign) NSEventModifierFlags shortcutModifierMask;
+// Used by compound controls to keep hover surfaces visible while keyboard
+// focus moves through them and to track contextual shortcut targets.
+@property (nonatomic, copy) void (^focusChangedHandler)(BroHoverButton* button,
+                                                        BOOL focused);
+@property (nonatomic, copy) void (^hoverChangedHandler)(BroHoverButton* button,
+                                                        BOOL hovered);
+- (void)configureActionLabel:(NSString*)label
+               keyEquivalent:(NSString*)keyEquivalent
+                modifierMask:(NSEventModifierFlags)modifierMask;
 @end
+
+// Shared shortcut formatting/matching keeps menu hints, tooltips, and
+// contextual event routing in agreement.
+extern NSString* BroShortcutDisplayString(NSString* keyEquivalent,
+                                          NSEventModifierFlags modifierMask);
+extern BOOL BroEventMatchesShortcut(NSEvent* event,
+                                    NSString* keyEquivalent,
+                                    NSEventModifierFlags modifierMask);
 
 // Builds a dimmed, non-editable NSTextField used by the hover card, the
 // downloads popover, and the tab search panel/rows.
@@ -243,27 +285,28 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 @interface BroAddressField : NSTextField
 @end
 
-// One tab pill in the tab strip. Its address field is re-parented onto the
-// active pill by the tab strip; the toolbar flips editingAddress when that
-// field gains/loses focus.
+// One tab pill in the tab strip. Each pill permanently owns its address field;
+// the active pill reveals it only while editing.
 @interface BroTabView : NSView
 @property (nonatomic, assign) int browserId;
 @property (nonatomic, strong) NSImageView* faviconView;
-@property (nonatomic, strong) NSProgressIndicator* loadingSpinner;
-@property (nonatomic, strong) BroTextMorphView* titleLabel;
-@property (nonatomic, strong) NSButton* closeButton;
+@property (nonatomic, strong) BroShimmerTextView* titleLabel;
+// Each pill owns its editor for its entire lifetime. Only the active pill may
+// reveal it, which avoids moving a live AppKit field editor between views.
+@property (nonatomic, strong) BroAddressField* addressField;
+@property (nonatomic, strong) BroHoverButton* closeButton;
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, assign) BOOL isLoading;
 // NO on a lone tab: closing it would close the window, so the pill hides ✕.
 @property (nonatomic, assign) BOOL closable;
-// YES while the hosted address field is being edited; keeps the focused
+// YES while the owned address field is being edited; keeps the focused
 // border through hover/layout appearance refreshes.
 @property (nonatomic, assign) BOOL editingAddress;
 // YES once the pill is too narrow for text: favicon only, centered.
 @property (nonatomic, assign) BOOL iconOnly;
-// Pinned pills sit as favicon-only squares at the left edge of the strip and
-// hide their ✕ (Cmd+W still closes them). The active pinned pill expands so
-// the hosted address field stays usable.
+// Pinned pills sit as compact favicon-only controls at the left edge of the
+// strip, with a separate hover-revealed unpin action. The active pinned pill
+// expands so the hosted address field stays usable; Cmd+W still closes it.
 @property (nonatomic, assign) BOOL pinned;
 // YES while this tab is the split screen's right pane; inactive pills get the
 // active-ish border so both halves read as "on screen".
@@ -292,7 +335,8 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 @property (nonatomic, copy) NSString* faviconURL;
 - (void)setLoading:(BOOL)loading;
 - (void)setTabURL:(NSString*)url;
-- (void)attachAddressField:(NSTextField*)field;
+- (void)focusAddressField;
+- (void)finishAddressEditing;
 @end
 
 #pragma mark - BroTabBar
@@ -335,6 +379,8 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 - (void)tabHoverEnded:(BroTabView*)tab;
 - (void)cardHoverBegan;
 - (void)cardHoverEnded;
+- (void)tabFocusBegan:(BroTabView*)tab;
+- (void)tabFocusEnded:(BroTabView*)tab;
 - (void)hideHoverCard;
 - (void)updateTabDescription:(int)browserId description:(NSString*)desc;
 // Toggles the tab's pinned state, moving it across the pinned/unpinned
@@ -347,6 +393,10 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 // Moves the split pair's pills next to each other so they can render as one
 // joined control; refreshes the joined styling either way.
 - (void)ensureSplitPairAdjacent;
+// Menu shortcuts act on the visible hover-card tab when there is one, keeping
+// their target identical to the icon whose tooltip advertises the shortcut.
+- (BOOL)performContextualPinShortcut;
+- (BOOL)performContextualSplitShortcut;
 @end
 
 // The tab bar; nil before the window exists. Defined with BroTabBar.
@@ -358,14 +408,12 @@ extern BroTabBar* g_tab_bar;
 @property (nonatomic, strong) BroHoverButton* backButton;
 @property (nonatomic, strong) BroHoverButton* forwardButton;
 @property (nonatomic, strong) BroHoverButton* refreshButton;
-@property (nonatomic, strong) NSTextField* addressField;
 @property (nonatomic, strong) BroHoverButton* desktopButton;
 @property (nonatomic, strong) BroHoverButton* mobileButton;
 @property (nonatomic, strong) BroHoverButton* downloadsButton;
-@property (nonatomic, copy) NSString* fullURL;
 @property (nonatomic, strong) BroHoverHighlightGroup* navigationHighlightGroup;
 @property (nonatomic, strong) BroHoverHighlightGroup* trailingHighlightGroup;
-- (void)addressFieldDidFocus;
+- (void)addressFieldDidFocus:(BroAddressField*)field;
 - (void)setViewportMode:(BOOL)mobile;
 - (void)updateURL:(NSString*)url;
 - (void)focusAddressField;
@@ -376,12 +424,21 @@ extern BroTabBar* g_tab_bar;
 // icons briefly (they hide at rest and show on hover; the toolbar owns the
 // shared hover zone). Called from bro_downloads.mm.
 - (void)pulseDownloadsButton;
+// Completes the four-control trailing cluster after BroTabBar exists.
+- (void)registerTabSearchButton:(BroHoverButton*)button;
 // Menu-action forwarders; called on g_toolbar from BroWindow/BroAppDelegate
 // and the UI-update bridge functions.
 - (void)goBack:(id)sender;
 - (void)goForward:(id)sender;
 - (void)refresh:(id)sender;
+- (void)toggleDownloads:(id)sender;
+- (void)selectDesktopMode:(id)sender;
+- (void)selectMobileMode:(id)sender;
 - (void)updateNavigationState:(BOOL)canGoBack canGoForward:(BOOL)canGoForward;
 @end
+
+// Handles ⌥⌘R only while the downloads popover has an unambiguous focused
+// or hovered magnifier target. Defined in bro_downloads.mm.
+extern BOOL BroPerformContextualDownloadsShortcut(NSEvent* event);
 
 #endif  // BRO_MAC_INTERNAL_H_

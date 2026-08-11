@@ -4,6 +4,21 @@
 
 #include <cmath>
 
+const CGFloat kBroGlassTintAlpha = 0.18;
+const CGFloat kBroGlassBorderWidth = 1.0;
+
+NSColor* BroGlassTintColor(void) {
+  return [NSColor colorWithWhite:0.0 alpha:kBroGlassTintAlpha];
+}
+
+NSColor* BroGlassBorderColor(void) {
+  return [NSColor colorWithWhite:1.0 alpha:0.12];
+}
+
+NSGlassEffectViewStyle BroGlassEffectStyle(void) {
+  return NSGlassEffectViewStyleClear;
+}
+
 namespace {
 
 struct BroSpringValues {
@@ -244,9 +259,8 @@ void BroApplyElevation(NSView* view, BroElevation elevation) {
     case BroElevationPanel:
       layer.backgroundColor =
           [NSColor colorWithWhite:0.18 alpha:0.96].CGColor;
-      layer.borderWidth = 1.0;
-      layer.borderColor =
-          [NSColor colorWithWhite:1.0 alpha:0.12].CGColor;
+      layer.borderWidth = kBroGlassBorderWidth;
+      layer.borderColor = BroGlassBorderColor().CGColor;
       layer.shadowOffset = elevation == BroElevationOverlay
                                ? CGSizeMake(0.0, -2.0)
                                : CGSizeMake(0.0, -4.0);
@@ -255,6 +269,66 @@ void BroApplyElevation(NSView* view, BroElevation elevation) {
       layer.shadowOpacity =
           elevation == BroElevationOverlay ? 0.35 : 0.45;
       break;
+  }
+}
+
+// Glass backdrop: the elevation's flat fill is replaced by glass under a
+// near-#000 tint; border and shadow stay on the panel's own layer. The
+// backdrop is added first so every control renders above it, and it clips to
+// the panel's corner radius itself (the panel layer can't mask — that would
+// clip the shadow). On macOS 26+ this is real Liquid Glass
+// (NSGlassEffectView, used as a plain backdrop sibling — the contentView
+// z-order caveat in its header doesn't apply since the panel's controls are
+// never its subviews); older systems get the NSVisualEffectView blur + tint
+// approximation.
+// Constraint-pinned rather than autoresized: panels are typically created at
+// NSZeroRect and sized on first show, and autoresizing from a zero-size
+// superview leaves the backdrop with stale geometry.
+static void BroPinBackdrop(NSView* backdrop, NSView* panel) {
+  backdrop.translatesAutoresizingMaskIntoConstraints = NO;
+  [panel addSubview:backdrop];
+  [NSLayoutConstraint activateConstraints:@[
+    [backdrop.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
+    [backdrop.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
+    [backdrop.topAnchor constraintEqualToAnchor:panel.topAnchor],
+    [backdrop.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor],
+  ]];
+}
+
+void BroInstallGlassBackdrop(NSView* panel, CGFloat cornerRadius) {
+  if (!panel) {
+    return;
+  }
+  panel.wantsLayer = YES;
+  panel.layer.backgroundColor = [NSColor clearColor].CGColor;
+  CGFloat backdropRadius = BroCornerRadiusForSize(
+      BroNestedCornerRadius(cornerRadius, 0.0), panel.bounds.size);
+  if (@available(macOS 26.0, *)) {
+    NSGlassEffectView* glass =
+        [[NSGlassEffectView alloc] initWithFrame:panel.bounds];
+    glass.cornerRadius = backdropRadius;
+    glass.style = BroGlassEffectStyle();
+    glass.tintColor = BroGlassTintColor();
+    glass.wantsLayer = YES;
+    glass.layer.masksToBounds = YES;
+    glass.layer.cornerCurve = kCACornerCurveContinuous;
+    BroPinBackdrop(glass, panel);
+  } else {
+    NSVisualEffectView* glass =
+        [[NSVisualEffectView alloc] initWithFrame:panel.bounds];
+    glass.material = NSVisualEffectMaterialHUDWindow;
+    glass.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    glass.state = NSVisualEffectStateActive;
+    glass.wantsLayer = YES;
+    glass.layer.cornerRadius = backdropRadius;
+    glass.layer.masksToBounds = YES;
+    BroPinBackdrop(glass, panel);
+    NSView* tint = [[NSView alloc] initWithFrame:panel.bounds];
+    tint.wantsLayer = YES;
+    tint.layer.backgroundColor = BroGlassTintColor().CGColor;
+    tint.layer.cornerRadius = backdropRadius;
+    tint.layer.masksToBounds = YES;
+    BroPinBackdrop(tint, panel);
   }
 }
 
@@ -367,7 +441,8 @@ void BroOverlayHide(NSView* view) {
     container.wantsLayer = YES;
     highlightLayer_ = [CALayer layer];
     highlightLayer_.anchorPoint = CGPointZero;
-    highlightLayer_.cornerRadius = kControlCornerRadius;
+    highlightLayer_.cornerRadius = BroCornerRadiusForSize(
+        BroControlCornerRadius(), highlightLayer_.bounds.size);
     highlightLayer_.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
     highlightLayer_.opacity = 0.0;
@@ -390,6 +465,12 @@ void BroOverlayHide(NSView* view) {
                     ((CALayer*)highlightLayer_.presentationLayer).opacity > 0.001;
   CGRect target = [container convertRect:view.bounds fromView:view];
   hoveredView_ = view;
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  highlightLayer_.cornerRadius = BroCornerRadiusForSize(
+      BroControlCornerRadius(), target.size);
+  [CATransaction commit];
 
   if (!animated || BroMotionReduced() || !wasVisible) {
     SetLayerFrameWithoutActions(highlightLayer_, target);

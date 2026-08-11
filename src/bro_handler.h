@@ -26,6 +26,10 @@ void OnTabFaviconChanged(int browser_id, const std::string& favicon_url);
 void OnTabClosed(int browser_id);
 void OnActiveTabChanged(int browser_id);
 void OnTabLoadingChanged(int browser_id, bool is_loading);
+void BroUpdateFindResult(int browser_id,
+                         int identifier,
+                         int count,
+                         int active_ordinal);
 void OpenLinkInNewTab(const std::string& url);
 // Detaches a tab's container view so CEF can finish destroying the browser.
 void DetachTabView(int browser_id);
@@ -55,6 +59,7 @@ std::string ResolveDownloadTargetPath(const std::string& suggested_name);
 
 class BroHandler : public CefClient,
                    public CefDisplayHandler,
+                   public CefFindHandler,
                    public CefLifeSpanHandler,
                    public CefLoadHandler,
                    public CefContextMenuHandler,
@@ -107,6 +112,7 @@ class BroHandler : public CefClient,
 
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
@@ -120,6 +126,14 @@ class BroHandler : public CefClient,
                        const CefString& url) override;
   void OnFaviconURLChange(CefRefPtr<CefBrowser> browser,
                           const std::vector<CefString>& icon_urls) override;
+
+  // CefFindHandler methods:
+  void OnFindResult(CefRefPtr<CefBrowser> browser,
+                    int identifier,
+                    int count,
+                    const CefRect& selectionRect,
+                    int activeMatchOrdinal,
+                    bool finalUpdate) override;
 
   // CefDevToolsMessageObserver methods:
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
