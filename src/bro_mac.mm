@@ -5189,14 +5189,6 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   devToolsF12.hidden = YES;  // Hide from menu but still active
   [viewMenu addItem:devToolsF12];
 
-  [viewMenu addItem:[NSMenuItem separatorItem]];
-  [viewMenu addItemWithTitle:@"WebAssembly Benchmark"
-                      action:@selector(openWasmBenchmark:)
-               keyEquivalent:@""];
-  [viewMenu addItemWithTitle:@"GPU Benchmark"
-                      action:@selector(openGpuBenchmark:)
-               keyEquivalent:@""];
-
   viewMenuItem.submenu = viewMenu;
   [mainMenu addItem:viewMenuItem];
 
@@ -5630,24 +5622,6 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
     return SplitActive() || (g_tab_bar && g_tab_bar.tabs.count > 1);
   }
   return YES;
-}
-
-- (void)openWasmBenchmark:(id)sender {
-  NSString* path = [[NSBundle mainBundle] pathForResource:@"wasm-bench"
-                                                   ofType:@"html"];
-  if (path) {
-    NSURL* url = [NSURL fileURLWithPath:path];
-    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
-  }
-}
-
-- (void)openGpuBenchmark:(id)sender {
-  NSString* path = [[NSBundle mainBundle] pathForResource:@"gpu-bench"
-                                                   ofType:@"html"];
-  if (path) {
-    NSURL* url = [NSURL fileURLWithPath:path];
-    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
-  }
 }
 
 - (void)focusAddressBar:(id)sender {

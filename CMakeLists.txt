@@ -69,8 +69,6 @@ set(BRO_HELPER_SRCS
 # Bundle resources
 set(BRO_RESOURCES
     src/mac/bro.icns
-    src/mac/wasm-bench.html
-    src/mac/gpu-bench.html
 )
 set_source_files_properties(${BRO_RESOURCES} PROPERTIES
     MACOSX_PACKAGE_LOCATION "Resources"
