@@ -87,6 +87,19 @@ void BroHandler::SetActiveBrowser(int browser_id) {
   }
 }
 
+void BroHandler::OnFindResult(CefRefPtr<CefBrowser> browser,
+                              int identifier,
+                              int count,
+                              const CefRect& selectionRect,
+                              int activeMatchOrdinal,
+                              bool finalUpdate) {
+  CEF_REQUIRE_UI_THREAD();
+  if (browser) {
+    BroUpdateFindResult(browser->GetIdentifier(), identifier, count,
+                        activeMatchOrdinal);
+  }
+}
+
 void BroHandler::SetBrowserHidden(int browser_id, bool hidden) {
   if (!CefCurrentlyOn(TID_UI)) {
     CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetBrowserHidden, this,

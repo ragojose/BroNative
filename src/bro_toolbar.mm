@@ -70,7 +70,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
 - (BOOL)becomeFirstResponder {
   BOOL ok = [super becomeFirstResponder];
   if (ok && [self.delegate isKindOfClass:[BroToolbar class]]) {
-    [(BroToolbar*)self.delegate addressFieldDidFocus];
+    [(BroToolbar*)self.delegate addressFieldDidFocus:self];
   }
   return ok;
 }
@@ -82,6 +82,9 @@ NSString* BroResolveQueryToURL(NSString* query) {
   // (alpha 0) until the pointer enters it.
   NSTrackingArea* revealTrackingArea_;
   BOOL revealZoneHovered_;
+  BOOL trailingGroupFocused_;
+  __weak BroHoverButton* tabSearchButton_;
+  NSArray<BroHoverButton*>* trailingButtons_;
   // Invalidates a pending auto-hide scheduled by pulseDownloadsButton.
   NSUInteger revealGeneration_;
 }
@@ -95,8 +98,6 @@ NSString* BroResolveQueryToURL(NSString* query) {
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
 
-    _fullURL = @"";
-
     // Navigation buttons, inline with the traffic lights.
     CGFloat x = kTrafficLightInset;
     CGFloat y = (frame.size.height - kButtonSize) / 2.0;
@@ -104,24 +105,27 @@ NSString* BroResolveQueryToURL(NSString* query) {
     _backButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
                                          icon:RadixIconArrowLeft
                                        action:@selector(goBack:)
-                                        label:@"Back"];
-    _backButton.toolTip = @"Back (⌘[)";
+                                        label:@"Back"
+                                keyEquivalent:[NSString stringWithFormat:@"%C", (unichar)NSLeftArrowFunctionKey]
+                                 modifierMask:NSEventModifierFlagCommand];
     [self addSubview:_backButton];
     x += kButtonSize + kButtonSpacing;
 
     _forwardButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
                                             icon:RadixIconArrowRight
                                           action:@selector(goForward:)
-                                           label:@"Forward"];
-    _forwardButton.toolTip = @"Forward (⌘])";
+                                           label:@"Forward"
+                                   keyEquivalent:[NSString stringWithFormat:@"%C", (unichar)NSRightArrowFunctionKey]
+                                    modifierMask:NSEventModifierFlagCommand];
     [self addSubview:_forwardButton];
     x += kButtonSize + kButtonSpacing;
 
     _refreshButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
                                             icon:RadixIconReload
                                           action:@selector(refresh:)
-                                           label:@"Reload page"];
-    _refreshButton.toolTip = @"Reload page (⌘R)";
+                                           label:@"Reload Page"
+                                   keyEquivalent:@"r"
+                                    modifierMask:NSEventModifierFlagCommand];
     [self addSubview:_refreshButton];
 
     _navigationHighlightGroup =
@@ -130,67 +134,41 @@ NSString* BroResolveQueryToURL(NSString* query) {
     _forwardButton.highlightGroup = _navigationHighlightGroup;
     _refreshButton.highlightGroup = _navigationHighlightGroup;
 
-    // The editable address field lives inside the ACTIVE tab pill (the tab
-    // strip re-parents it on tab switches); created here without a superview.
-    _addressField = [[BroAddressField alloc]
-        initWithFrame:NSMakeRect(0, 0, 100, kTabTextFrameHeight)];
-    _addressField.font = BroUIFont(kTabTextFontSize);
-    _addressField.bezeled = NO;
-    _addressField.bordered = NO;
-    _addressField.drawsBackground = NO;
-    _addressField.focusRingType = NSFocusRingTypeNone;
-    _addressField.textColor = [NSColor labelColor];
-    _addressField.delegate = self;
-    _addressField.cell.scrollable = YES;
-    _addressField.cell.usesSingleLineMode = YES;
-    // Long URLs/hosts show an ellipsis at rest; the field editor still
-    // scrolls while typing.
-    _addressField.cell.lineBreakMode = NSLineBreakByTruncatingTail;
-    _addressField.cell.truncatesLastVisibleLine = YES;
-    // AppKit draws an empty field's placeholder through NSTextFieldCell, not
-    // through the field editor. Its borderless-cell default sits at the
-    // bottom of our 18pt frame, 3pt below the centered tab baseline. Apply the
-    // missing half-leading explicitly so the placeholder occupies the exact
-    // same origin as resting and selected text.
-    CGFloat placeholderHeight =
-        [_addressField.cell cellSizeForBounds:_addressField.bounds].height;
-    CGFloat placeholderBaselineOffset = ceil(
-        MAX(0.0, (kTabTextFrameHeight - placeholderHeight) / 2.0));
-    _addressField.placeholderAttributedString = [[NSAttributedString alloc]
-        initWithString:@"Enter URL or search"
-            attributes:@{
-              NSFontAttributeName : BroUIFont(kTabTextFontSize),
-              NSForegroundColorAttributeName : [NSColor placeholderTextColor],
-              NSBaselineOffsetAttributeName : @(placeholderBaselineOffset),
-            }];
-    _addressField.accessibilityLabel = @"Address and search bar";
-
     // Viewport mode toggles pinned to the right edge. Exposed as a radio
     // group: exactly one of desktop/mobile is selected at a time.
-    CGFloat rightX = frame.size.width - 12.0 - kButtonSize;
+    CGFloat rightX = BroTrailingControlX(frame.size.width, 0);
     _mobileButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
                                            icon:RadixIconMobile
                                          action:@selector(selectMobileMode:)
-                                          label:@"Mobile viewport"];
+                                          label:@"Mobile Viewport"
+                                  keyEquivalent:@"m"
+                                   modifierMask:NSEventModifierFlagCommand |
+                                                NSEventModifierFlagShift];
     _mobileButton.autoresizingMask = NSViewMinXMargin;
     [_mobileButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
     [self addSubview:_mobileButton];
-    rightX -= kButtonSize + kButtonSpacing;
+    rightX = BroTrailingControlX(frame.size.width, 1);
     _desktopButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
                                             icon:RadixIconDesktop
                                           action:@selector(selectDesktopMode:)
-                                           label:@"Desktop viewport"];
+                                           label:@"Desktop Viewport"
+                                   keyEquivalent:@"d"
+                                    modifierMask:NSEventModifierFlagCommand |
+                                                 NSEventModifierFlagShift];
     _desktopButton.autoresizingMask = NSViewMinXMargin;
     [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
     [self addSubview:_desktopButton];
     // Downloads sits left of the viewport radio group at the same spacing —
     // the four trailing icons (search, downloads, desktop, mobile) read as
     // one evenly spaced cluster.
-    rightX -= kButtonSize + kButtonSpacing;
+    rightX = BroTrailingControlX(frame.size.width, 2);
     _downloadsButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
                                               icon:RadixIconDownload
                                             action:@selector(toggleDownloads:)
-                                             label:@"Downloads"];
+                                             label:@"Downloads"
+                                     keyEquivalent:@"j"
+                                      modifierMask:NSEventModifierFlagCommand |
+                                                   NSEventModifierFlagShift];
     _downloadsButton.autoresizingMask = NSViewMinXMargin;
     // Hidden until the pointer enters the shared reveal zone (see
     // updateTrackingAreas), together with the tab strip's search button.
@@ -201,10 +179,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
     _downloadsButton.highlightGroup = _trailingHighlightGroup;
     _desktopButton.highlightGroup = _trailingHighlightGroup;
     _mobileButton.highlightGroup = _trailingHighlightGroup;
-    // The selected toggle is disabled but must keep its bright tint, so don't
-    // let AppKit dim the icon.
-    ((NSButtonCell*)_mobileButton.cell).imageDimsWhenDisabled = NO;
-    ((NSButtonCell*)_desktopButton.cell).imageDimsWhenDisabled = NO;
+    trailingButtons_ = @[ _downloadsButton, _desktopButton, _mobileButton ];
     [self setViewportMode:NO];
 
     // Initial button states
@@ -217,7 +192,9 @@ NSString* BroResolveQueryToURL(NSString* query) {
 - (BroHoverButton*)createButtonWithFrame:(NSRect)frame
                                     icon:(RadixIcon)icon
                                   action:(SEL)action
-                                   label:(NSString*)label {
+                                   label:(NSString*)label
+                           keyEquivalent:(NSString*)keyEquivalent
+                            modifierMask:(NSEventModifierFlags)modifierMask {
   BroHoverButton* button = [[BroHoverButton alloc] initWithFrame:frame];
   button.bezelStyle = NSBezelStyleTexturedRounded;
   button.bordered = NO;
@@ -227,9 +204,71 @@ NSString* BroResolveQueryToURL(NSString* query) {
   button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
   button.target = self;
   button.action = action;
-  button.accessibilityLabel = label;
-  button.toolTip = label;
+  [button configureActionLabel:label
+                 keyEquivalent:keyEquivalent
+                  modifierMask:modifierMask];
   return button;
+}
+
+- (void)layoutTrailingControls {
+  CGFloat y = (NSHeight(self.bounds) - kButtonSize) / 2.0;
+  _mobileButton.frame = NSMakeRect(BroTrailingControlX(NSWidth(self.bounds), 0),
+                                   y, kButtonSize, kButtonSize);
+  _desktopButton.frame = NSMakeRect(BroTrailingControlX(NSWidth(self.bounds), 1),
+                                    y, kButtonSize, kButtonSize);
+  _downloadsButton.frame = NSMakeRect(BroTrailingControlX(NSWidth(self.bounds), 2),
+                                      y, kButtonSize, kButtonSize);
+}
+
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
+  [super resizeSubviewsWithOldSize:oldSize];
+  [self layoutTrailingControls];
+  [self updateTrackingAreas];
+}
+
+- (BOOL)isTrailingControlFirstResponder {
+  NSResponder* responder = self.window.firstResponder;
+  return [responder isKindOfClass:[BroHoverButton class]] &&
+         [trailingButtons_ containsObject:(BroHoverButton*)responder];
+}
+
+- (void)trailingButton:(BroHoverButton*)button focusChanged:(BOOL)focused {
+  revealGeneration_++;
+  if (focused) {
+    trailingGroupFocused_ = YES;
+    [self setSearchDownloadsRevealed:YES];
+    return;
+  }
+  __weak BroToolbar* weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    BroToolbar* toolbar = weakSelf;
+    if (!toolbar) {
+      return;
+    }
+    toolbar->trailingGroupFocused_ =
+        [toolbar isTrailingControlFirstResponder];
+    if (!toolbar->trailingGroupFocused_ && !toolbar->revealZoneHovered_) {
+      [toolbar setSearchDownloadsRevealed:NO];
+    }
+  });
+}
+
+- (void)registerTabSearchButton:(BroHoverButton*)button {
+  if (!button || tabSearchButton_ == button) {
+    return;
+  }
+  tabSearchButton_ = button;
+  button.highlightGroup = _trailingHighlightGroup;
+  trailingButtons_ =
+      @[ button, _downloadsButton, _desktopButton, _mobileButton ];
+  __weak BroToolbar* weakSelf = self;
+  for (BroHoverButton* trailingButton in trailingButtons_) {
+    trailingButton.focusChangedHandler =
+        ^(BroHoverButton* focusedButton, BOOL focused) {
+      [weakSelf trailingButton:focusedButton focusChanged:focused];
+    };
+  }
+  [self updateTrackingAreas];
 }
 
 #pragma mark - Search/downloads hover reveal
@@ -246,8 +285,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
     [self removeTrackingArea:revealTrackingArea_];
     revealTrackingArea_ = nil;
   }
-  NSRect zone = _downloadsButton.frame;
-  NSView* searchButton = g_tab_bar.tabSearchButton;
+  NSRect zone = NSUnionRect(_downloadsButton.frame, _mobileButton.frame);
+  NSView* searchButton = tabSearchButton_ ?: g_tab_bar.tabSearchButton;
   if (searchButton && searchButton.window == self.window) {
     zone = NSUnionRect(zone,
                        [self convertRect:searchButton.bounds
@@ -266,7 +305,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
 
 - (void)setSearchDownloadsRevealed:(BOOL)revealed {
   CGFloat alpha = revealed ? 1.0 : 0.0;
-  NSView* searchButton = g_tab_bar.tabSearchButton;
+  NSView* searchButton = tabSearchButton_ ?: g_tab_bar.tabSearchButton;
   if (BroMotionReduced()) {
     _downloadsButton.alphaValue = alpha;
     searchButton.alphaValue = alpha;
@@ -286,7 +325,9 @@ NSString* BroResolveQueryToURL(NSString* query) {
 
 - (void)mouseExited:(NSEvent*)event {
   revealZoneHovered_ = NO;
-  [self setSearchDownloadsRevealed:NO];
+  if (!trailingGroupFocused_) {
+    [self setSearchDownloadsRevealed:NO];
+  }
 }
 
 // Nudge when a download starts or finishes. With the icons hidden at rest,
@@ -297,7 +338,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
 - (void)pulseDownloadsButton {
   revealGeneration_++;
   NSUInteger generation = revealGeneration_;
-  if (revealZoneHovered_) {
+  if (revealZoneHovered_ || trailingGroupFocused_) {
     if (!BroMotionReduced()) {
       _downloadsButton.alphaValue = 0.25;
       [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
@@ -311,7 +352,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
   dispatch_after(
       dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
-        if (generation == revealGeneration_ && !revealZoneHovered_) {
+        if (generation == revealGeneration_ && !revealZoneHovered_ &&
+            !trailingGroupFocused_) {
           [self setSearchDownloadsRevealed:NO];
         }
       });
@@ -360,7 +402,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
     CefRefPtr<CefBrowser> browser = handler->GetBrowser();
     if (browser) {
       // Show the destination immediately; OnAddressChange confirms it later.
-      self.fullURL = target;
+      BroTabView* tab = [g_tab_bar tabWithBrowserId:browser->GetIdentifier()];
+      [tab setTabURL:target];
       browser->GetMainFrame()->LoadURL([target UTF8String]);
     }
   }
@@ -412,20 +455,16 @@ NSString* BroResolveQueryToURL(NSString* query) {
   _desktopButton.selectedState = !mobile;
   _mobileButton.selectedState = mobile;
 
-  // The mode already in effect is inert: no hover, no click, no tab stop.
-  BroHoverButton* selected = mobile ? _mobileButton : _desktopButton;
-  BroHoverButton* other = mobile ? _desktopButton : _mobileButton;
-  selected.enabled = NO;
-  other.enabled = YES;
-  if (self.window.firstResponder == selected) {
-    [self.window makeFirstResponder:other];
-  }
+  // Keep both radio buttons focusable so hover/focus motion is identical.
+  // applyViewportMode: already makes choosing the current mode a no-op.
+  _desktopButton.enabled = YES;
+  _mobileButton.enabled = YES;
 }
 
 #pragma mark - NSTextFieldDelegate
 
-- (BOOL)configureAddressFieldEditor {
-  NSTextView* editor = (NSTextView*)[_addressField currentEditor];
+- (BOOL)configureAddressFieldEditor:(BroAddressField*)field {
+  NSTextView* editor = (NSTextView*)[field currentEditor];
   if (![editor isKindOfClass:[NSTextView class]]) {
     return NO;
   }
@@ -442,7 +481,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
   // have the same frame. Remove every editor-owned inset explicitly.
   editor.textContainer.lineFragmentPadding = 0.0;
 
-  // Use the exact Core Text baseline equation from BroTextMorphView. AppKit's
+  // Use the exact Core Text baseline equation from BroShimmerTextView. AppKit's
   // cell reports a 13pt height for Geist 10 while Core Text's pixel-aligned
   // line box is 14pt; centering the cell therefore puts selected text 1pt
   // above the resting host. Deriving the editor inset from the same font
@@ -451,7 +490,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
       ceil(font.ascender - font.descender + font.leading);
   CGFloat baselineFromBottom = ceil(-font.descender);
   CGFloat baselineFromTop =
-      (_addressField.bounds.size.height + lineHeight) / 2.0 -
+      (field.bounds.size.height + lineHeight) / 2.0 -
       baselineFromBottom;
   editor.textContainerInset =
       NSMakeSize(0.0, MAX(0.0, baselineFromTop - font.ascender));
@@ -467,63 +506,63 @@ NSString* BroResolveQueryToURL(NSString* query) {
   return YES;
 }
 
-- (void)addressFieldDidFocus {
+- (void)addressFieldDidFocus:(BroAddressField*)field {
+  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
+                        ? (BroTabView*)field.superview
+                        : nil;
+  if (!tab || !tab.isActive) {
+    return;
+  }
   // Show the full URL for editing; the host pill shows the focused look
   // (gray hairline border, pure white text) from click-in through typing.
-  if (_fullURL.length > 0) {
-    _addressField.stringValue = _fullURL;
-  }
-  if ([_addressField.superview isKindOfClass:[BroTabView class]]) {
-    ((BroTabView*)_addressField.superview).editingAddress = YES;
-  }
-  _addressField.textColor = [NSColor whiteColor];
+  field.stringValue = BroURLIsBlank(tab.tabURL) ? @"" : tab.tabURL;
+  tab.editingAddress = YES;
+  field.textColor = [NSColor whiteColor];
   // Configure synchronously so AppKit never presents one frame with its
   // default font/insets before snapping to the shared tab metrics. Some
   // responder paths install the field editor just after becomeFirstResponder;
   // retain a one-turn fallback only for those paths.
-  if (![self configureAddressFieldEditor]) {
+  if (![self configureAddressFieldEditor:field]) {
+    __weak BroAddressField* weakField = field;
     dispatch_async(dispatch_get_main_queue(), ^{
-      [self configureAddressFieldEditor];
+      BroAddressField* strongField = weakField;
+      if (strongField) {
+        [self configureAddressFieldEditor:strongField];
+      }
     });
   }
 }
 
 - (void)controlTextDidBeginEditing:(NSNotification*)notification {
-  if (notification.object == _addressField) {
-    [self configureAddressFieldEditor];
+  if ([notification.object isKindOfClass:[BroAddressField class]]) {
+    [self configureAddressFieldEditor:(BroAddressField*)notification.object];
   }
 }
 
 - (void)controlTextDidEndEditing:(NSNotification*)notification {
-  NSTextField* textField = notification.object;
-  if (textField == _addressField) {
-    NSNumber* reason = notification.userInfo[@"NSTextMovement"];
-    if (reason && reason.integerValue == NSReturnTextMovement) {
-      [self navigateToURL:_addressField.stringValue];
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self.window makeFirstResponder:nil];
-      });
-    }
-    if ([_addressField.superview isKindOfClass:[BroTabView class]]) {
-      ((BroTabView*)_addressField.superview).editingAddress = NO;
-    }
-    _addressField.textColor = [NSColor labelColor];
-    [self displayCompactURL];
+  if (![notification.object isKindOfClass:[BroAddressField class]]) {
+    return;
   }
+  BroAddressField* field = (BroAddressField*)notification.object;
+  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
+                        ? (BroTabView*)field.superview
+                        : nil;
+  NSNumber* reason = notification.userInfo[@"NSTextMovement"];
+  if (tab.isActive && reason &&
+      reason.integerValue == NSReturnTextMovement) {
+    [self navigateToURL:field.stringValue];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self.window makeFirstResponder:nil];
+    });
+  }
+  tab.editingAddress = NO;
+  field.textColor = [NSColor labelColor];
 }
 
 - (void)focusAddressField {
-  if (_addressField.superview) {
-    BroTabView* tab = [_addressField.superview isKindOfClass:[BroTabView class]]
-                          ? (BroTabView*)_addressField.superview
-                          : nil;
-    // A hidden control cannot become first responder. Reveal the editor first;
-    // becomeFirstResponder then replaces the compact host with the full URL.
-    tab.editingAddress = YES;
-    if (![self.window makeFirstResponder:_addressField]) {
-      tab.editingAddress = NO;
-    }
-  }
+  BroHandler* handler = BroHandler::GetInstance();
+  int activeId = handler ? handler->GetActiveBrowserId() : -1;
+  [[g_tab_bar tabWithBrowserId:activeId] focusAddressField];
 }
 
 #pragma mark - State Updates
@@ -538,17 +577,9 @@ NSString* BroResolveQueryToURL(NSString* query) {
   if (BroURLIsBlank(url)) {
     url = @"";
   }
-  self.fullURL = url ?: @"";
-  // Don't clobber text the user is currently typing.
-  if ([_addressField currentEditor]) {
-    return;
-  }
-  [self displayCompactURL];
-}
-
-// Shows just the host (like the mockup); the full URL appears on focus.
-- (void)displayCompactURL {
-  _addressField.stringValue = BroDisplayHostForURL(_fullURL);
+  BroHandler* handler = BroHandler::GetInstance();
+  int activeId = handler ? handler->GetActiveBrowserId() : -1;
+  [[g_tab_bar tabWithBrowserId:activeId] setTabURL:url ?: @""];
 }
 
 @end

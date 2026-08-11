@@ -51,7 +51,6 @@ static const CGFloat kDownloadsPopoverWidth = 300.0;
 static const CGFloat kDownloadsRowHeight = 44.0;
 static const CGFloat kDownloadsHeaderHeight = 28.0;
 static const CGFloat kDownloadsFooterHeight = 36.0;
-static const CGFloat kDownloadsEmptyHeight = 52.0;
 
 @interface BroDownloadRow : NSView
 @property(nonatomic, assign) BOOL interactive;
@@ -61,17 +60,36 @@ static const CGFloat kDownloadsEmptyHeight = 52.0;
 @property(nonatomic, assign) NSUInteger downloadIndex;
 @end
 
-@implementation BroDownloadRow
+@implementation BroDownloadRow {
+  BOOL hovered_;
+  BOOL focused_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    self.wantsLayer = YES;
+    self.layer.cornerRadius =
+        BroCornerRadiusForSize(BroControlCornerRadius(), self.bounds.size);
+    self.layer.actions = BroLayerTransitionActions();
+    self.focusRingType = NSFocusRingTypeNone;
+  }
+  return self;
+}
 
 - (void)mouseEntered:(NSEvent*)event {
   if (_interactive) {
+    hovered_ = YES;
     [_highlightGroup hoverOnView:self];
   }
 }
 
 - (void)mouseExited:(NSEvent*)event {
   if (_interactive) {
-    [_highlightGroup hoverOffView:self];
+    hovered_ = NO;
+    if (!focused_) {
+      [_highlightGroup hoverOffView:self];
+    }
   }
 }
 
@@ -91,6 +109,56 @@ static const CGFloat kDownloadsEmptyHeight = 52.0;
   }
 }
 
+- (BOOL)acceptsFirstResponder {
+  return _interactive;
+}
+
+- (BOOL)canBecomeKeyView {
+  return _interactive && !self.hiddenOrHasHiddenAncestor;
+}
+
+- (BOOL)becomeFirstResponder {
+  BOOL ok = [super becomeFirstResponder];
+  if (ok) {
+    focused_ = YES;
+    self.layer.borderColor = BroControlBorderColor().CGColor;
+    self.layer.borderWidth = 1.0;
+    [_highlightGroup hoverOnView:self animated:NO];
+  }
+  return ok;
+}
+
+- (BOOL)resignFirstResponder {
+  BOOL ok = [super resignFirstResponder];
+  if (ok) {
+    focused_ = NO;
+    self.layer.borderWidth = 0.0;
+    if (!hovered_) {
+      [_highlightGroup hoverOffView:self];
+    }
+  }
+  return ok;
+}
+
+- (void)keyDown:(NSEvent*)event {
+  NSString* characters = event.charactersIgnoringModifiers;
+  unichar key = characters.length > 0 ? [characters characterAtIndex:0] : 0;
+  if (_interactive &&
+      (key == ' ' || key == '\r' || key == NSEnterCharacter)) {
+    [NSApp sendAction:_action to:_target from:self];
+    return;
+  }
+  [super keyDown:event];
+}
+
+- (BOOL)accessibilityPerformPress {
+  if (!_interactive) {
+    return NO;
+  }
+  [NSApp sendAction:_action to:_target from:self];
+  return YES;
+}
+
 @end
 
 @interface BroDownloadsPopover : NSView
@@ -104,12 +172,13 @@ static const CGFloat kDownloadsEmptyHeight = 52.0;
   BroHoverButton* clearButton_;
   BroHoverButton* viewAllButton_;
   NSView* separator_;
-  NSTextField* emptyLabel_;
   NSMutableArray<NSView*>* rowViews_;
   // Entries backing the visible rows; magnifier buttons index into this.
   NSMutableArray<BroDownloadEntry*>* rowEntries_;
   CGFloat lastMaxHeight_;
   BroHoverHighlightGroup* rowHighlightGroup_;
+  __weak BroHoverButton* focusedRevealButton_;
+  __weak BroHoverButton* hoveredRevealButton_;
 }
 
 static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
@@ -133,8 +202,14 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = kSurfaceCornerRadius;
+    self.layer.cornerRadius =
+        BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
     BroApplyElevation(self, BroElevationPanel);
+    BroInstallGlassBackdrop(self, self.layer.cornerRadius);
+
+    self.accessibilityRole = NSAccessibilityGroupRole;
+    self.accessibilityLabel = @"Recent downloads";
+
     rowHighlightGroup_ =
         [[BroHoverHighlightGroup alloc] initWithContainerView:self];
 
@@ -156,13 +231,9 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
         @"Clear", BroUIFont(11.0), 0.55, NSTextAlignmentCenter);
     clearButton_.target = self;
     clearButton_.action = @selector(clearDownloads:);
+    // Plain label only: a tooltip would just repeat the visible title.
     clearButton_.accessibilityLabel = @"Clear recent downloads";
     [self addSubview:clearButton_];
-
-    emptyLabel_ = BroHoverCardLabel(BroUIFont(12.0), 0.4);
-    emptyLabel_.stringValue = @"No recent downloads";
-    emptyLabel_.alignment = NSTextAlignmentCenter;
-    [self addSubview:emptyLabel_];
 
     separator_ = [[NSView alloc] initWithFrame:NSZeroRect];
     separator_.wantsLayer = YES;
@@ -199,6 +270,8 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   }
   [rowViews_ removeAllObjects];
   [rowEntries_ removeAllObjects];
+  focusedRevealButton_ = nil;
+  hoveredRevealButton_ = nil;
 
   NSArray<BroDownloadEntry*>* entries = BroDownloadsList();
   const CGFloat padTop = 8.0;
@@ -215,29 +288,21 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   }
 
   const CGFloat width = kDownloadsPopoverWidth;
-  CGFloat listHeight = rowCount > 0 ? rowCount * kDownloadsRowHeight
-                                    : kDownloadsEmptyHeight;
+  CGFloat listHeight = rowCount * kDownloadsRowHeight;
   CGFloat height = chromeHeight + listHeight;
 
   // Bottom-up (unflipped coords): footer, separator, rows oldest-first, then
   // the header at the top.
   viewAllButton_.frame = NSMakeRect(4.0, padBottom, width - 8.0,
                                     kDownloadsFooterHeight);
+  viewAllButton_.layer.cornerRadius = BroCornerRadiusForSize(
+      BroNestedCornerRadius(BroSurfaceCornerRadius(),
+                            NSMinX(viewAllButton_.frame)),
+      viewAllButton_.bounds.size);
   separator_.frame = NSMakeRect(0, padBottom + kDownloadsFooterHeight,
                                 width, 1.0);
 
   CGFloat listBottom = padBottom + kDownloadsFooterHeight + 1.0;
-  emptyLabel_.hidden = rowCount > 0;
-  if (rowCount == 0) {
-    CGFloat labelHeight =
-        ceil([emptyLabel_.cell cellSizeForBounds:NSMakeRect(0, 0, CGFLOAT_MAX,
-                                                            CGFLOAT_MAX)]
-                 .height);
-    emptyLabel_.frame = NSMakeRect(
-        12.0, listBottom + (kDownloadsEmptyHeight - labelHeight) / 2.0,
-        width - 24.0, labelHeight);
-  }
-
   for (NSUInteger i = 0; i < rowCount; i++) {
     BroDownloadEntry* entry = rowEntries_[i];
     // Row i is the i-th newest; stack from the top of the list area down.
@@ -279,6 +344,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     row.accessibilityRole = NSAccessibilityButtonRole;
     row.accessibilityLabel =
         [NSString stringWithFormat:@"Open %@", entry.name ?: @"download"];
+    row.accessibilityHelp = @"Press Return or Space to open.";
     NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
         initWithRect:NSZeroRect
              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
@@ -290,6 +356,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
 
   NSImageView* icon = [[NSImageView alloc]
       initWithFrame:NSMakeRect(12.0, 8.0, 28.0, 28.0)];
+  icon.accessibilityElement = NO;
   if (entry.state == BroDownloadStateComplete && fileExists) {
     icon.image = [[NSWorkspace sharedWorkspace] iconForFile:entry.path];
   } else {
@@ -306,11 +373,15 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   NSTextField* name = BroHoverCardLabel(BroUIFontBold(12.0), 1.0);
   name.stringValue = entry.name ?: @"";
   name.frame = NSMakeRect(textX, 22.0, textRight - textX, 15.0);
+  // The interactive row is the AX button ("Open <name>"); its labels would
+  // read as duplicate static-text children.
+  name.accessibilityElement = !row.interactive;
   [row addSubview:name];
 
   NSTextField* subtitle = BroHoverCardLabel(BroUIFont(11.0), 0.55);
   subtitle.stringValue = [self subtitleForEntry:entry fileExists:fileExists];
   subtitle.frame = NSMakeRect(textX, 7.0, textRight - textX, 13.0);
+  subtitle.accessibilityElement = !row.interactive;
   [row addSubview:subtitle];
 
   if (entry.state == BroDownloadStateInProgress) {
@@ -318,6 +389,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     NSView* track = [[NSView alloc]
         initWithFrame:NSMakeRect(textX, 4.0, barWidth, 2.0)];
     track.wantsLayer = YES;
+    track.accessibilityElement = NO;
     track.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(track.frame));
     track.layer.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
@@ -328,6 +400,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
       NSView* fill = [[NSView alloc]
           initWithFrame:NSMakeRect(textX, 4.0, barWidth * fraction, 2.0)];
       fill.wantsLayer = YES;
+      fill.accessibilityElement = NO;
       fill.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(fill.frame));
       fill.layer.backgroundColor =
           [NSColor colorWithWhite:1.0 alpha:0.85].CGColor;
@@ -344,12 +417,34 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     reveal.imagePosition = NSImageOnly;
     reveal.image = RadixIconImage(RadixIconMagnifyingGlass, 15.0);
     reveal.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
-    reveal.toolTip = @"Show in Finder";
-    reveal.accessibilityLabel =
-        [NSString stringWithFormat:@"Show %@ in Finder", entry.name];
+    [reveal configureActionLabel:
+                [NSString stringWithFormat:@"Show %@ in Finder", entry.name]
+                  keyEquivalent:@"r"
+                   modifierMask:NSEventModifierFlagCommand |
+                                NSEventModifierFlagOption];
     reveal.tag = (NSInteger)index;
     reveal.target = self;
     reveal.action = @selector(revealEntry:);
+    __weak BroDownloadsPopover* weakSelf = self;
+    __weak BroHoverButton* weakReveal = reveal;
+    reveal.focusChangedHandler = ^(BroHoverButton* button, BOOL focused) {
+      BroDownloadsPopover* popover = weakSelf;
+      if (!popover) return;
+      if (focused) {
+        popover->focusedRevealButton_ = button;
+      } else if (popover->focusedRevealButton_ == weakReveal) {
+        popover->focusedRevealButton_ = nil;
+      }
+    };
+    reveal.hoverChangedHandler = ^(BroHoverButton* button, BOOL hovered) {
+      BroDownloadsPopover* popover = weakSelf;
+      if (!popover) return;
+      if (hovered) {
+        popover->hoveredRevealButton_ = button;
+      } else if (popover->hoveredRevealButton_ == weakReveal) {
+        popover->hoveredRevealButton_ = nil;
+      }
+    };
     [row addSubview:reveal];
   }
 
@@ -421,6 +516,15 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   }
 }
 
+- (BOOL)performContextualRevealShortcut {
+  BroHoverButton* button = focusedRevealButton_ ?: hoveredRevealButton_;
+  if (!button || button.hiddenOrHasHiddenAncestor || !button.enabled) {
+    return NO;
+  }
+  [button performClick:nil];
+  return YES;
+}
+
 - (void)clearDownloads:(id)sender {
   // Drop settled entries only; active downloads stay until they finish.
   NSMutableArray<BroDownloadEntry*>* list = BroDownloadsList();
@@ -432,6 +536,10 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     }
   }
   BroSaveRecentDownloads();
+  if (list.count == 0) {
+    BroHideDownloadsPopover();
+    return;
+  }
   [self reloadWithMaxHeight:lastMaxHeight_];
 }
 
@@ -499,7 +607,9 @@ void BroHideDownloadsPopover(void) {
 
 static void BroShowDownloadsPopover(void) {
   NSView* container = BroBrowserContainerView();
-  if (!container) {
+  // Nothing to list — leave the popover closed rather than show an empty
+  // shell (the Downloads menu item is disabled to match).
+  if (!container || BroDownloadsList().count == 0) {
     return;
   }
   if (!g_downloads_popover) {
@@ -516,6 +626,7 @@ static void BroShowDownloadsPopover(void) {
   [g_downloads_popover reloadWithMaxHeight:NSHeight(container.bounds) - 12.0];
   BroPositionDownloadsPopover();
   BroOverlayShow(g_downloads_popover);
+  [g_downloads_popover.window recalculateKeyViewLoop];
 
   if (!g_downloads_click_monitor) {
     g_downloads_click_monitor = BroInstallOutsideDismissMonitor(
@@ -537,7 +648,12 @@ static void BroShowDownloadsPopover(void) {
   }
 }
 
-// BroToggleDownloadsPopover is declared extern in bro_mac_internal.h.
+// BroHasRecentDownloads and BroToggleDownloadsPopover are declared extern in
+// bro_mac_internal.h.
+BOOL BroHasRecentDownloads(void) {
+  return BroDownloadsList().count > 0;
+}
+
 void BroToggleDownloadsPopover(void) {
   if (BroDownloadsPopoverVisible()) {
     BroHideDownloadsPopover();
@@ -546,8 +662,20 @@ void BroToggleDownloadsPopover(void) {
   }
 }
 
+BOOL BroPerformContextualDownloadsShortcut(NSEvent* event) {
+  return BroDownloadsPopoverVisible() &&
+         BroEventMatchesShortcut(event, @"r",
+                                 NSEventModifierFlagCommand |
+                                     NSEventModifierFlagOption) &&
+         [g_downloads_popover performContextualRevealShortcut];
+}
+
 static void BroRefreshDownloadsPopover(void) {
   if (!BroDownloadsPopoverVisible()) {
+    return;
+  }
+  if (BroDownloadsList().count == 0) {
+    BroHideDownloadsPopover();
     return;
   }
   NSView* container = BroBrowserContainerView();

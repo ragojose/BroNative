@@ -20,6 +20,7 @@
 #import "radix_icons.h"
 #import "bro_mac_internal.h"
 #import "bro_closed_tabs.h"
+#import "bro_find.h"
 #import "bro_history.h"
 #import "bro_motion.h"
 #import "bro_persist.h"
@@ -53,6 +54,10 @@ NSColor* BroControlBorderColor(void) {
   return [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0];
 }
 
+NSColor* BroPlaceholderFaviconColor(void) {
+  return [NSColor colorWithWhite:0x24 / 255.0 alpha:1.0];
+}
+
 // Global references
 static BroWindow* g_main_window = nil;
 // g_toolbar is declared extern in bro_mac_internal.h; defined in
@@ -74,6 +79,11 @@ static NSMutableSet<NSNumber*>* g_blank_tab_ids = nil;
 // Containers created for incoming popup browsers, keyed by popup ID. Entries
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
+
+// Blank tabs created by the shell should be ready for typing as soon as CEF
+// adopts them. Track the exact container rather than a shared boolean: browser
+// creation is asynchronous, and several tabs may be in flight at once.
+static NSHashTable<NSView*>* g_pending_address_focus_containers = nil;
 
 // Downloads: BroDownloadEntry, BroDownloadsList, the popover, and the
 // bridge callbacks live in bro_downloads.mm. BroHideDownloadsPopover and
@@ -189,26 +199,30 @@ NSDictionary* BroLayerTransitionActions(void) {
 }
 @end
 
-// The system frame view already masks the full-size content (including the
-// CEF child views) to the window shape, so the hairline only has to trace the
-// same curve. The radius varies across macOS releases; probe the frame view.
-static CGFloat BroWindowCornerRadius(NSWindow* window) {
+// AppKit owns the outer shell shape. Cache its resolved radius as the root of
+// the app-wide corner hierarchy before constructing any nested chrome views.
+static CGFloat g_shell_corner_radius = BroNestedCornerRadius(
+    kShellCornerRadiusFallback, kShellCornerRadiusReduction);
+
+CGFloat BroShellCornerRadius(void) {
+  return g_shell_corner_radius;
+}
+
+static CGFloat BroResolveShellCornerRadius(NSWindow* window) {
   NSView* frameView = window.contentView.superview;  // NSThemeFrame
   if ([frameView respondsToSelector:@selector(cornerRadius)]) {
     CGFloat r = [[frameView valueForKey:@"cornerRadius"] doubleValue];
     if (r > 0.5) {
-      return r;
+      return BroNestedCornerRadius(r, kShellCornerRadiusReduction);
     }
   }
-  return kWindowCornerRadiusFallback;
+  return BroNestedCornerRadius(kShellCornerRadiusFallback,
+                               kShellCornerRadiusReduction);
 }
 
 // Dark-glass scrim over the behind-window blur (the contentView
-// NSVisualEffectView): the chrome row wears it permanently, and the
-// browser-area tint fades down to it when the active tab is blank. Matches
-// the command palette's 60% black glass tint (bro_palette.mm) so both glass
-// surfaces read as the same material.
-static const CGFloat kGlassBackdropScrimAlpha = 0.6;
+// NSVisualEffectView): the chrome row wears the same shared tint as every
+// glass surface, and the browser-area tint fades down to it when blank.
 static const CFTimeInterval kGlassBackdropFadeDuration = 0.30;
 
 @interface BroWindow : NSWindow {
@@ -261,6 +275,7 @@ NSView* BroBrowserContainerView(void) {
     content.state = NSVisualEffectStateActive;
     content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.contentView = content;
+    g_shell_corner_radius = BroResolveShellCornerRadius(self);
 
     // The window backdrop splits at the toolbar line. The chrome row keeps a
     // permanent partial scrim so it always reads as dark glass over the
@@ -280,8 +295,7 @@ NSView* BroBrowserContainerView(void) {
     NSView* chromeTint = [[NSView alloc]
         initWithFrame:NSMakeRect(0, chromeY, frame.size.width, kToolbarHeight)];
     chromeTint.wantsLayer = YES;
-    chromeTint.layer.backgroundColor = [NSColor blackColor].CGColor;
-    chromeTint.alphaValue = kGlassBackdropScrimAlpha;
+    chromeTint.layer.backgroundColor = BroGlassTintColor().CGColor;
     chromeTint.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [content addSubview:chromeTint];
 
@@ -296,14 +310,17 @@ NSView* BroBrowserContainerView(void) {
     // right-aligned viewport toggles.
     CGFloat stripX = kTrafficLightInset + 3 * (kButtonSize + kButtonSpacing) + 8.0;
     // The strip's right edge (where its pinned search button sits) keeps the
-    // same kButtonSpacing gap to the downloads/desktop/mobile buttons, so all
-    // four trailing icons are evenly spaced.
+    // shared button rhythm, with a small optical correction for the
+    // magnifier artwork. The complete control moves so its glyph stays
+    // centered inside hover/focus feedback.
     CGFloat stripRight =
-        frame.size.width - 12.0 - 3.0 * (kButtonSize + kButtonSpacing);
+        BroTrailingControlX(frame.size.width, 3) + kButtonSize +
+        kTabSearchOpticalOffsetX;
     _tabBar = [[BroTabBar alloc]
         initWithFrame:NSMakeRect(stripX, 0, stripRight - stripX, kToolbarHeight)];
     [_navToolbar addSubview:_tabBar];
     g_tab_bar = _tabBar;
+    [_navToolbar registerTabSearchButton:_tabBar.tabSearchButton];
     // The toolbar's search/downloads reveal zone spans a tab-bar subview, so
     // recompute it now that the tab bar exists.
     [_navToolbar updateTrackingAreas];
@@ -317,9 +334,9 @@ NSView* BroBrowserContainerView(void) {
     // CEF child views).
     BroWindowBorderView* border = [[BroWindowBorderView alloc] initWithFrame:frame];
     border.wantsLayer = YES;
-    border.layer.borderWidth = 1.0;
-    border.layer.borderColor = BroControlBorderColor().CGColor;
-    border.layer.cornerRadius = BroWindowCornerRadius(self);
+    border.layer.borderWidth = kBroGlassBorderWidth;
+    border.layer.borderColor = BroGlassBorderColor().CGColor;
+    border.layer.cornerRadius = BroShellCornerRadius();
     border.layer.cornerCurve = kCACornerCurveContinuous;
     border.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:border];
@@ -328,6 +345,7 @@ NSView* BroBrowserContainerView(void) {
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
     g_blank_tab_ids = [NSMutableSet set];
+    g_pending_address_focus_containers = [NSHashTable weakObjectsHashTable];
     // Closed-tab history lazily initializes itself on first use.
 
     // Keep the Tab-key loop current as pills and buttons come and go.
@@ -356,7 +374,7 @@ NSView* BroBrowserContainerView(void) {
     ctx.timingFunction = [CAMediaTimingFunction
         functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
     self.backdropTint.animator.alphaValue =
-        visible ? kGlassBackdropScrimAlpha : 1.0;
+        visible ? kBroGlassTintAlpha : 1.0;
   } completionHandler:nil];
 }
 
@@ -987,7 +1005,8 @@ static void ShowZoomHUD(int percent) {
   if (!g_zoom_hud) {
     g_zoom_hud = [[NSView alloc] initWithFrame:NSZeroRect];
     g_zoom_hud.wantsLayer = YES;
-    g_zoom_hud.layer.cornerRadius = kSurfaceCornerRadius;
+    g_zoom_hud.layer.cornerRadius = BroCornerRadiusForSize(
+        BroSurfaceCornerRadius(), g_zoom_hud.bounds.size);
     BroApplyElevation(g_zoom_hud, BroElevationOverlay);
     g_zoom_hud.hidden = YES;
 
@@ -1019,6 +1038,8 @@ static void ShowZoomHUD(int percent) {
   g_zoom_hud.frame = NSMakeRect(NSMaxX(bounds) - hudSize.width - 16.0,
                                 NSMaxY(bounds) - hudSize.height - 16.0,
                                 hudSize.width, hudSize.height);
+  g_zoom_hud.layer.cornerRadius = BroCornerRadiusForSize(
+      BroSurfaceCornerRadius(), g_zoom_hud.bounds.size);
   g_zoom_hud_label.frame =
       NSMakeRect(padX, padY, labelSize.width, labelSize.height);
 
@@ -1034,8 +1055,8 @@ static void ShowZoomHUD(int percent) {
       }];
 }
 
-// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
-void CreateNewBrowserTabWithURL(const std::string& url) {
+static void CreateNewBrowserTabWithURLAndFocus(const std::string& url,
+                                               BOOL focusAddressWhenReady) {
   BroHandler* handler = BroHandler::GetInstance();
   if (!handler) {
     return;
@@ -1060,13 +1081,26 @@ void CreateNewBrowserTabWithURL(const std::string& url) {
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  // Create the browser with the specified URL
-  CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
-                                nullptr, nullptr);
+  if (focusAddressWhenReady) {
+    [g_pending_address_focus_containers addObject:browserContainer];
+  }
+
+  // Create the browser with the specified URL. If creation is rejected
+  // synchronously, discard the pending focus request with the container.
+  if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
+                                     browser_settings, nullptr, nullptr)) {
+    [g_pending_address_focus_containers removeObject:browserContainer];
+    [browserContainer removeFromSuperview];
+  }
+}
+
+// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
+void CreateNewBrowserTabWithURL(const std::string& url) {
+  CreateNewBrowserTabWithURLAndFocus(url, NO);
 }
 
 void CreateNewBrowserTab(void) {
-  CreateNewBrowserTabWithURL("about:blank");
+  CreateNewBrowserTabWithURLAndFocus("about:blank", YES);
 }
 
 #pragma mark - BroAppDelegate
@@ -1134,22 +1168,73 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 - (void)sendEvent:(NSEvent*)event {
   CefScopedSendingEvent sendingEventScoper;
 
-  // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs. This cannot be a menu key
+  // A repeated downloads-row shortcut is only meaningful when one magnifier
+  // is focused or hovered. Resolve it before the normal menu/event pass so it
+  // can never reveal an arbitrary file.
+  if (event.window == g_main_window &&
+      BroPerformContextualDownloadsShortcut(event)) {
+    return;
+  }
+
+  // Route in-page Find before AppKit's field editor sees the event. Generic
+  // Find selectors are otherwise consumed as text-field operations while the
+  // native query field is focused instead of reaching the browser command.
+  if (event.type == NSEventTypeKeyDown && event.window == g_main_window) {
+    NSEventModifierFlags relevant =
+        NSEventModifierFlagCommand | NSEventModifierFlagShift |
+        NSEventModifierFlagControl | NSEventModifierFlagOption;
+    NSEventModifierFlags mods =
+        event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask &
+        relevant;
+    NSString* chars = event.charactersIgnoringModifiers.lowercaseString;
+    if ([chars isEqualToString:@"f"] &&
+        mods == NSEventModifierFlagCommand) {
+      BroShowFindBar();
+      return;
+    }
+    if ([chars isEqualToString:@"g"] &&
+        (mods == NSEventModifierFlagCommand ||
+         mods == (NSEventModifierFlagCommand | NSEventModifierFlagShift))) {
+      if (mods & NSEventModifierFlagShift) {
+        BroFindPrevious();
+      } else {
+        BroFindNext();
+      }
+      return;
+    }
+  }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab and Ctrl+PageDown / Ctrl+PageUp cycle tabs.
+  // Tab cannot be a menu key
   // equivalent: Tab is consumed for focus traversal before the menu pass
   // when the browser view is first responder. Only the main window cycles;
   // DevTools and other windows keep their native behavior.
-  if (event.type == NSEventTypeKeyDown && event.keyCode == 48 /* kVK_Tab */ &&
-      event.window == g_main_window && g_tab_bar) {
+  if (event.type == NSEventTypeKeyDown && event.window == g_main_window &&
+      g_tab_bar &&
+      (event.keyCode == 48 /* kVK_Tab */ ||
+       event.keyCode == 116 /* kVK_PageUp */ ||
+       event.keyCode == 121 /* kVK_PageDown */)) {
     NSEventModifierFlags mods =
         event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
     BOOL ctrlOnly =
         (mods & NSEventModifierFlagControl) != 0 &&
         (mods & (NSEventModifierFlagCommand | NSEventModifierFlagOption)) == 0;
     if (ctrlOnly) {
+      BOOL previous = event.keyCode == 116 ||
+                      (event.keyCode == 48 &&
+                       (mods & NSEventModifierFlagShift));
       [g_tab_bar activateTabRelativeToActiveWithOffset:
-                     (mods & NSEventModifierFlagShift) ? -1 : 1];
+                     previous ? -1 : 1];
       return;
     }
+  }
+
+  // Escape closes in-page Find even if keyboard focus has moved from its
+  // search field to one of the result-navigation buttons.
+  if (event.type == NSEventTypeKeyDown && event.keyCode == 53 &&
+      event.window == g_main_window && BroFindBarVisible()) {
+    BroHideFindBar();
+    return;
   }
 
   // Cmd+Left/Right = history back/forward. Handled here rather than as menu
@@ -1289,6 +1374,25 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
   [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
   [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+  [editMenu addItem:[NSMenuItem separatorItem]];
+  NSMenuItem* findMenuItem = [[NSMenuItem alloc] initWithTitle:@"Find"
+                                                       action:nil
+                                                keyEquivalent:@""];
+  NSMenu* findMenu = [[NSMenu alloc] initWithTitle:@"Find"];
+  [findMenu addItemWithTitle:@"Find…"
+                      action:@selector(showFindBar:)
+               keyEquivalent:@"f"];
+  [findMenu addItemWithTitle:@"Find Next"
+                      action:@selector(findNextInPage:)
+               keyEquivalent:@"g"];
+  NSMenuItem* findPreviousItem =
+      [findMenu addItemWithTitle:@"Find Previous"
+                          action:@selector(findPreviousInPage:)
+                   keyEquivalent:@"g"];
+  findPreviousItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  findMenuItem.submenu = findMenu;
+  [editMenu addItem:findMenuItem];
 
   editMenuItem.submenu = editMenu;
   [mainMenu addItem:editMenuItem];
@@ -1303,6 +1407,26 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
                                             keyEquivalent:@"r"];
   hardReloadItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [viewMenu addItemWithTitle:@"Stop" action:@selector(stopLoading:) keyEquivalent:@"."];
+  [viewMenu addItem:[NSMenuItem separatorItem]];
+
+  NSMenuItem* downloadsItem =
+      [viewMenu addItemWithTitle:@"Downloads"
+                          action:@selector(showDownloads:)
+                   keyEquivalent:@"j"];
+  downloadsItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  NSMenuItem* desktopItem =
+      [viewMenu addItemWithTitle:@"Desktop Viewport"
+                          action:@selector(selectDesktopViewport:)
+                   keyEquivalent:@"d"];
+  desktopItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  NSMenuItem* mobileItem =
+      [viewMenu addItemWithTitle:@"Mobile Viewport"
+                          action:@selector(selectMobileViewport:)
+                   keyEquivalent:@"m"];
+  mobileItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [viewMenu addItem:[NSMenuItem separatorItem]];
 
   // Zoom controls. Cmd+"=" is the unshifted "+" key; a "+" key equivalent
@@ -1344,11 +1468,32 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   NSMenu* historyMenu = [[NSMenu alloc] initWithTitle:@"History"];
   historyMenu.delegate = self;
 
-  NSMenuItem* backItem = [historyMenu addItemWithTitle:@"Back" action:@selector(goBack:) keyEquivalent:@"["];
+  NSString* leftArrow =
+      [NSString stringWithFormat:@"%C", (unichar)NSLeftArrowFunctionKey];
+  NSString* rightArrow =
+      [NSString stringWithFormat:@"%C", (unichar)NSRightArrowFunctionKey];
+  NSMenuItem* backItem = [historyMenu addItemWithTitle:@"Back"
+                                                action:@selector(goBack:)
+                                         keyEquivalent:leftArrow];
   backItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
 
-  NSMenuItem* forwardItem = [historyMenu addItemWithTitle:@"Forward" action:@selector(goForward:) keyEquivalent:@"]"];
+  NSMenuItem* forwardItem = [historyMenu addItemWithTitle:@"Forward"
+                                                   action:@selector(goForward:)
+                                            keyEquivalent:rightArrow];
   forwardItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+  // Keep the established bracket aliases active without advertising two
+  // different primary bindings in the menu or toolbar tooltip.
+  NSMenuItem* backBracket = [[NSMenuItem alloc] initWithTitle:@"Back"
+                                                       action:@selector(goBack:)
+                                                keyEquivalent:@"["];
+  backBracket.hidden = YES;
+  [historyMenu addItem:backBracket];
+  NSMenuItem* forwardBracket = [[NSMenuItem alloc] initWithTitle:@"Forward"
+                                                          action:@selector(goForward:)
+                                                   keyEquivalent:@"]"];
+  forwardBracket.hidden = YES;
+  [historyMenu addItem:forwardBracket];
 
   NSMenuItem* recentsSeparator = [NSMenuItem separatorItem];
   recentsSeparator.tag = kBroHistorySeparatorTag;
@@ -1361,10 +1506,12 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   NSMenuItem* fileMenuItem = [[NSMenuItem alloc] init];
   NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
 
-  // Single-window app: Cmd+N means new tab, not new window.
+  [fileMenu addItemWithTitle:@"New Window"
+                      action:@selector(newWindow:)
+               keyEquivalent:@"n"];
   [fileMenu addItemWithTitle:@"New Tab"
                       action:@selector(newTab:)
-               keyEquivalent:@"n"];
+               keyEquivalent:@"t"];
   [fileMenu addItem:[NSMenuItem separatorItem]];
   [fileMenu addItemWithTitle:@"Close Tab"
                       action:@selector(closeTab:)
@@ -1429,9 +1576,12 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 
   // Tab actions; validateMenuItem: retitles them to match the current state.
   [windowMenu addItem:[NSMenuItem separatorItem]];
-  [windowMenu addItemWithTitle:@"Pin Tab"
-                        action:@selector(togglePinActiveTab:)
-                 keyEquivalent:@""];
+  NSMenuItem* pinItem =
+      [windowMenu addItemWithTitle:@"Pin Tab"
+                            action:@selector(togglePinActiveTab:)
+                     keyEquivalent:@"p"];
+  pinItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagOption;
   NSMenuItem* splitItem = [windowMenu addItemWithTitle:@"Split Screen"
                                                 action:@selector(toggleSplitScreen:)
                                          keyEquivalent:@"s"];
@@ -1495,8 +1645,12 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 
   // Create the browser on a blank page; the address bar stays empty.
   std::string url = "about:blank";
-  CefBrowserHost::CreateBrowser(window_info, handler, url, browser_settings,
-                                nullptr, nullptr);
+  [g_pending_address_focus_containers addObject:browserContainer];
+  if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
+                                     browser_settings, nullptr, nullptr)) {
+    [g_pending_address_focus_containers removeObject:browserContainer];
+    [browserContainer removeFromSuperview];
+  }
 
   if (g_toolbar) {
     [g_toolbar updateURL:@""];
@@ -1654,6 +1808,48 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   CreateNewBrowserTab();
 }
 
+- (void)newWindow:(id)sender {
+  NSURL* applicationURL = NSBundle.mainBundle.bundleURL;
+  if (!applicationURL) {
+    return;
+  }
+
+  // CEF holds a process lock on its profile directory. This codebase's
+  // window state is intentionally single-window, so launch a second app
+  // instance with an isolated temporary profile instead of corrupting the
+  // live profile or relabeling a tab as a window.
+  NSString* profile = [NSTemporaryDirectory()
+      stringByAppendingPathComponent:[NSString
+          stringWithFormat:@"Bro-New-Window-%@", NSUUID.UUID.UUIDString]];
+  NSWorkspaceOpenConfiguration* configuration =
+      [NSWorkspaceOpenConfiguration configuration];
+  configuration.createsNewApplicationInstance = YES;
+  configuration.activates = YES;
+  configuration.addsToRecentItems = NO;
+  configuration.environment = @{ @"BRO_USER_DATA_DIR" : profile };
+  [[NSWorkspace sharedWorkspace]
+      openApplicationAtURL:applicationURL
+             configuration:configuration
+         completionHandler:^(NSRunningApplication* application,
+                             NSError* error) {
+    if (error) {
+      NSLog(@"Unable to open a new browser window: %@", error);
+    }
+  }];
+}
+
+- (void)showFindBar:(id)sender {
+  BroShowFindBar();
+}
+
+- (void)findNextInPage:(id)sender {
+  BroFindNext();
+}
+
+- (void)findPreviousInPage:(id)sender {
+  BroFindPrevious();
+}
+
 - (void)closeTab:(id)sender {
   BroHandler* handler = BroHandler::GetInstance();
   if (handler) {
@@ -1702,6 +1898,9 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)togglePinActiveTab:(id)sender {
+  if ([g_tab_bar performContextualPinShortcut]) {
+    return;
+  }
   BroDismissTransientOverlays();
   for (BroTabView* tab in g_tab_bar.tabs) {
     if (tab.browserId == g_tab_bar.activeTabId) {
@@ -1712,6 +1911,9 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)toggleSplitScreen:(id)sender {
+  if ([g_tab_bar performContextualSplitShortcut]) {
+    return;
+  }
   BroDismissTransientOverlays();
   if (SplitActive()) {
     ToggleSplitForTab(g_split_browser_id);
@@ -1722,6 +1924,21 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 
 - (void)showCommandPalette:(id)sender {
   ToggleCommandPalette(BroPaletteScopeAll);
+}
+
+- (void)showDownloads:(id)sender {
+  HideCommandPalette();
+  BroToggleDownloadsPopover();
+}
+
+- (void)selectDesktopViewport:(id)sender {
+  BroDismissTransientOverlays();
+  [g_toolbar selectDesktopMode:sender];
+}
+
+- (void)selectMobileViewport:(id)sender {
+  BroDismissTransientOverlays();
+  [g_toolbar selectMobileMode:sender];
 }
 
 // ⇧⌘A and the tab strip's chevron keep their tab-search identity; they open
@@ -1758,6 +1975,25 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   }
   if (action == @selector(reopenClosedTab:)) {
     return BroClosedTabsCount() > 0;
+  }
+  if (action == @selector(showDownloads:)) {
+    return g_toolbar != nil && BroHasRecentDownloads();
+  }
+  if (action == @selector(selectDesktopViewport:) ||
+      action == @selector(selectMobileViewport:)) {
+    BroHandler* handler = BroHandler::GetInstance();
+    int activeId = handler ? handler->GetActiveBrowserId() : -1;
+    if (!handler || activeId < 0) {
+      menuItem.state = NSControlStateValueOff;
+      return NO;
+    }
+    BOOL mobile = handler->IsTabMobile(activeId);
+    BOOL itemSelected = action == @selector(selectMobileViewport:)
+                            ? mobile
+                            : !mobile;
+    menuItem.state = itemSelected ? NSControlStateValueOn
+                                  : NSControlStateValueOff;
+    return YES;
   }
   if (action == @selector(togglePinActiveTab:)) {
     BroTabView* active = nil;
@@ -1848,9 +2084,11 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 
 - (void)windowWillClose:(NSNotification*)notification {
   HideCommandPalette();
+  BroHideFindBar();
   // The retained palette belongs to the dying window's view tree; rebuild it
   // fresh for any future window.
   TeardownCommandPalette();
+  BroTeardownFindBar();
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
@@ -1961,6 +2199,10 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
     return false;
   }
 
+  BOOL shouldFocusAddress =
+      [g_pending_address_focus_containers containsObject:container];
+  [g_pending_address_focus_containers removeObject:container];
+
   g_browser_views[@(browser_id)] = container;
 
   // If this was a popup's container, it is no longer pending.
@@ -1987,6 +2229,21 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   // A newly adopted tab becomes active without going through
   // OnActiveTabChanged; the shell follows its viewport mode (desktop).
   UpdateWindowForViewportMode(TabIsMobile(browser_id), YES);
+
+  if (shouldFocusAddress) {
+    // Let adoption and layout finish before asking AppKit for its field
+    // editor. The active-ID and blank-URL guards make multiple rapid new-tab
+    // requests deterministic: only the latest still-blank tab receives focus.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (!g_tab_bar || g_tab_bar.activeTabId != browser_id) {
+        return;
+      }
+      BroTabView* tab = [g_tab_bar tabWithBrowserId:browser_id];
+      if (tab && BroURLIsBlank(tab.tabURL)) {
+        [tab focusAddressField];
+      }
+    });
+  }
   return true;
 }
 

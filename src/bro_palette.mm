@@ -253,6 +253,10 @@ static NSImage* BroPaletteCommandIcon(SEL action) {
   RadixIcon icon = RadixIconMagnifyingGlass;
   if (action == @selector(newTab:)) {
     icon = RadixIconPlus;
+  } else if (action == @selector(showFindBar:) ||
+             action == @selector(findNextInPage:) ||
+             action == @selector(findPreviousInPage:)) {
+    icon = RadixIconMagnifyingGlass;
   } else if (action == @selector(closeTab:)) {
     icon = RadixIconCross2;
   } else if (action == @selector(reloadPage:) ||
@@ -264,6 +268,14 @@ static NSImage* BroPaletteCommandIcon(SEL action) {
     icon = RadixIconArrowRight;
   } else if (action == @selector(toggleSplitScreen:)) {
     icon = RadixIconViewVertical;
+  } else if (action == @selector(togglePinActiveTab:)) {
+    icon = RadixIconDrawingPin;
+  } else if (action == @selector(showDownloads:)) {
+    icon = RadixIconDownload;
+  } else if (action == @selector(selectDesktopViewport:)) {
+    icon = RadixIconDesktop;
+  } else if (action == @selector(selectMobileViewport:)) {
+    icon = RadixIconMobile;
   } else if (action == @selector(focusAddressBar:)) {
     icon = RadixIconGlobe;
   }
@@ -404,17 +416,22 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   // Same guard as BroTabView: a stale fetch must not overwrite the favicon
   // this row was last configured with. Main-thread only.
   NSUInteger faviconGeneration_;
+  BOOL focused_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = kControlCornerRadius;
+    self.layer.cornerRadius =
+        BroCornerRadiusForSize(BroControlCornerRadius(), self.bounds.size);
+    self.layer.actions = BroLayerTransitionActions();
+    self.focusRingType = NSFocusRingTypeNone;
 
     iconView_ = [[NSImageView alloc]
         initWithFrame:NSMakeRect(12, (frame.size.height - 15) / 2.0, 15, 15)];
     iconView_.imageScaling = NSImageScaleProportionallyUpOrDown;
+    iconView_.accessibilityElement = NO;
     [self addSubview:iconView_];
 
     titleLabel_ = BroHoverCardLabel(BroUIFont(13.0), 0.9);
@@ -440,7 +457,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
 
 - (void)showPlaceholderFavicon {
   iconView_.image = RadixIconImage(RadixIconGlobe, 15);
-  iconView_.contentTintColor = [NSColor colorWithWhite:0x33 / 255.0 alpha:1.0];
+  iconView_.contentTintColor = BroPlaceholderFaviconColor();
 }
 
 - (void)setFaviconURLString:(NSString*)urlString {
@@ -467,11 +484,20 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   _item = item;
   titleLabel_.stringValue = item.title ?: @"";
   subtitleLabel_.stringValue = item.subtitle ?: @"";
-  // VoiceOver reads the subtitle (host or shortcut hint) with the title.
-  self.accessibilityLabel =
-      item.subtitle.length > 0
-          ? [NSString stringWithFormat:@"%@, %@", item.title, item.subtitle]
-          : titleLabel_.stringValue;
+  // Command shortcuts are help, not part of the action's concise name. URL
+  // subtitles remain useful context for tab/history results.
+  if (item.kind == BroPaletteItemCommand) {
+    self.accessibilityLabel = titleLabel_.stringValue;
+    self.accessibilityHelp = item.subtitle.length > 0
+        ? [NSString stringWithFormat:@"Keyboard shortcut: %@.", item.subtitle]
+        : @"Press Return to run this command.";
+  } else {
+    self.accessibilityLabel =
+        item.subtitle.length > 0
+            ? [NSString stringWithFormat:@"%@, %@", item.title, item.subtitle]
+            : titleLabel_.stringValue;
+    self.accessibilityHelp = @"Press Return to activate.";
+  }
 
   faviconGeneration_++;
   if (item.icon) {
@@ -525,6 +551,48 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   if (NSPointInRect(point, self.bounds)) {
     [NSApp sendAction:_action to:_target from:self];
   }
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (BOOL)canBecomeKeyView {
+  return !self.hiddenOrHasHiddenAncestor;
+}
+
+- (BOOL)becomeFirstResponder {
+  BOOL ok = [super becomeFirstResponder];
+  if (ok) {
+    focused_ = YES;
+    self.layer.borderColor = BroControlBorderColor().CGColor;
+    self.layer.borderWidth = 1.0;
+  }
+  return ok;
+}
+
+- (BOOL)resignFirstResponder {
+  BOOL ok = [super resignFirstResponder];
+  if (ok) {
+    focused_ = NO;
+    self.layer.borderWidth = 0.0;
+  }
+  return ok;
+}
+
+- (void)keyDown:(NSEvent*)event {
+  NSString* characters = event.charactersIgnoringModifiers;
+  unichar key = characters.length > 0 ? [characters characterAtIndex:0] : 0;
+  if (key == ' ' || key == '\r' || key == NSEnterCharacter) {
+    [NSApp sendAction:_action to:_target from:self];
+    return;
+  }
+  [super keyDown:event];
+}
+
+- (BOOL)accessibilityPerformPress {
+  [NSApp sendAction:_action to:_target from:self];
+  return YES;
 }
 
 @end
@@ -581,53 +649,15 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
     self.accessibilityLabel = @"Command palette";
 
     self.wantsLayer = YES;
-    self.layer.cornerRadius = kSurfaceCornerRadius;
+    self.layer.cornerRadius =
+        BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
     BroApplyElevation(self, BroElevationPanel);
-    // Glass backdrop: the elevation's flat fill is replaced by glass under a
-    // near-#000 tint; border and shadow stay on the panel's own layer. The
-    // backdrop is added first so every control renders above it, and it
-    // clips to the panel's corner radius itself (the panel layer can't mask
-    // — that would clip the shadow). On macOS 26+ this is real Liquid Glass
-    // (NSGlassEffectView, used as a plain backdrop sibling — the contentView
-    // z-order caveat in its header doesn't apply since the palette's
-    // controls are never its subviews); older systems get the
-    // NSVisualEffectView blur + tint approximation.
-    self.layer.backgroundColor = [NSColor clearColor].CGColor;
-    if (@available(macOS 26.0, *)) {
-      NSGlassEffectView* glass =
-          [[NSGlassEffectView alloc] initWithFrame:self.bounds];
-      glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      glass.cornerRadius =
-          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
-      glass.style = NSGlassEffectViewStyleRegular;
-      glass.tintColor = [NSColor colorWithWhite:0.0 alpha:0.6];
-      [self addSubview:glass];
-    } else {
-      NSVisualEffectView* glass =
-          [[NSVisualEffectView alloc] initWithFrame:self.bounds];
-      glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      glass.material = NSVisualEffectMaterialHUDWindow;
-      glass.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-      glass.state = NSVisualEffectStateActive;
-      glass.wantsLayer = YES;
-      glass.layer.cornerRadius =
-          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
-      glass.layer.masksToBounds = YES;
-      [self addSubview:glass];
-      NSView* tint = [[NSView alloc] initWithFrame:self.bounds];
-      tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      tint.wantsLayer = YES;
-      tint.layer.backgroundColor =
-          [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
-      tint.layer.cornerRadius =
-          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
-      tint.layer.masksToBounds = YES;
-      [self addSubview:tint];
-    }
+    BroInstallGlassBackdrop(self, self.layer.cornerRadius);
 
     searchIcon_ = [[NSImageView alloc] initWithFrame:NSZeroRect];
     searchIcon_.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
     searchIcon_.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    searchIcon_.accessibilityElement = NO;
     [self addSubview:searchIcon_];
 
     searchField_ = [[NSTextField alloc] initWithFrame:NSZeroRect];

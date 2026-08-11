@@ -51,6 +51,20 @@ extern void BroRunLayoutSpring(void (^changes)(void),
                                void (^completion)(void));
 
 extern void BroApplyElevation(NSView* view, BroElevation elevation);
+
+// Shared material tokens for every glass surface: the window shell, active
+// browse input, and floating panels all use this tint/style/hairline recipe.
+extern const CGFloat kBroGlassTintAlpha;
+extern const CGFloat kBroGlassBorderWidth;
+extern NSColor* BroGlassTintColor(void);
+extern NSColor* BroGlassBorderColor(void);
+extern NSGlassEffectViewStyle BroGlassEffectStyle(void)
+    API_AVAILABLE(macos(26.0));
+
+// Replaces the elevation's flat fill with the shared Liquid Glass backdrop.
+// Call after BroApplyElevation and before adding any other subviews so the
+// backdrop stays the bottom sibling.
+extern void BroInstallGlassBackdrop(NSView* panel, CGFloat cornerRadius);
 extern void BroOverlayShow(NSView* view);
 extern void BroOverlayHide(NSView* view);
 
