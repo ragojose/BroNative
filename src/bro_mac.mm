@@ -1058,6 +1058,24 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 - (void)ensureSplitPairAdjacent;
 @end
 
+// Fetches `urlString`'s favicon and hands the result to `applyImage`, but
+// only if `stillCurrent` still says `generation` is current when the fetch
+// completes. Shared by BroTabView and BroTabSearchRow, which each bump their
+// own generation counter before calling this (a slow response for an
+// already-superseded favicon must not overwrite a newer one).
+static void BroFetchFaviconGuarded(NSString* urlString,
+                                    NSUInteger generation,
+                                    BOOL (^stillCurrent)(NSUInteger generation),
+                                    void (^applyImage)(NSImage* image)) {
+  [[BroFaviconLoader sharedLoader]
+      fetchFavicon:urlString
+        completion:^(NSImage* image) {
+    if (image && stillCurrent(generation)) {
+      applyImage(image);
+    }
+  }];
+}
+
 @implementation BroTabView {
   BOOL hovered_;
   BOOL focused_;
@@ -1164,17 +1182,17 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
 
   NSUInteger generation = ++faviconGeneration_;
   __weak BroTabView* weakSelf = self;
-  [[BroFaviconLoader sharedLoader]
-      fetchFavicon:urlString
-        completion:^(NSImage* image) {
-          BroTabView* strongSelf = weakSelf;
-          if (!strongSelf || !image ||
-              strongSelf->faviconGeneration_ != generation) {
-            return;
-          }
-          strongSelf.faviconView.image = image;
-          strongSelf.faviconView.contentTintColor = nil;
-        }];
+  BroFetchFaviconGuarded(
+      urlString, generation,
+      ^BOOL(NSUInteger g) {
+        BroTabView* strongSelf = weakSelf;
+        return strongSelf && strongSelf->faviconGeneration_ == g;
+      },
+      ^(NSImage* image) {
+        BroTabView* strongSelf = weakSelf;
+        strongSelf.faviconView.image = image;
+        strongSelf.faviconView.contentTintColor = nil;
+      });
 }
 
 - (void)setTabURL:(NSString*)url {
@@ -2178,17 +2196,17 @@ static const CGFloat kTabSearchPadX = 8.0;
     return;
   }
   __weak BroTabSearchRow* weakSelf = self;
-  [[BroFaviconLoader sharedLoader]
-      fetchFavicon:urlString
-        completion:^(NSImage* image) {
-          BroTabSearchRow* strongSelf = weakSelf;
-          if (!strongSelf || !image ||
-              strongSelf->faviconGeneration_ != generation) {
-            return;
-          }
-          strongSelf->faviconView_.image = image;
-          strongSelf->faviconView_.contentTintColor = nil;
-        }];
+  BroFetchFaviconGuarded(
+      urlString, generation,
+      ^BOOL(NSUInteger g) {
+        BroTabSearchRow* strongSelf = weakSelf;
+        return strongSelf && strongSelf->faviconGeneration_ == g;
+      },
+      ^(NSImage* image) {
+        BroTabSearchRow* strongSelf = weakSelf;
+        strongSelf->faviconView_.image = image;
+        strongSelf->faviconView_.contentTintColor = nil;
+      });
 }
 
 - (void)refreshBackground {
@@ -2579,6 +2597,53 @@ static const CGFloat kTabSearchPadX = 8.0;
 
 @end
 
+#pragma mark - Outside-click dismiss monitor
+
+// Installs a local mouse-down monitor that hides `panel` on any click
+// outside both `panel` and its owner button. Sees clicks headed for the
+// native CEF views too, which never bubble through the AppKit responder
+// chain, so an outside click anywhere in the window dismisses.
+//
+// `isVisible`, if non-nil, is checked first and short-circuits the rest when
+// it returns NO (only the tab search panel needs this extra guard today).
+// `ownerButton` is re-evaluated on every event rather than captured once, so
+// callers can pass a block reading a global that may not be set yet at
+// install time. Letting a click on the (visible) owner button through
+// avoids an immediate hide-then-reopen when its own action toggles the
+// panel. Returns the monitor token for the caller to store and later remove
+// with `-[NSEvent removeMonitor:]`.
+static id BroInstallOutsideDismissMonitor(NSView* panel,
+                                           BOOL (^isVisible)(void),
+                                           NSView* (^ownerButton)(void),
+                                           void (^hide)(void)) {
+  return [NSEvent
+      addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown |
+                                            NSEventMaskRightMouseDown |
+                                            NSEventMaskOtherMouseDown)
+                                   handler:^NSEvent*(NSEvent* event) {
+    if (isVisible && !isVisible()) {
+      return event;
+    }
+    if (event.window != panel.window) {
+      hide();
+      return event;
+    }
+    NSPoint inPanel = [panel convertPoint:event.locationInWindow fromView:nil];
+    if (NSPointInRect(inPanel, panel.bounds)) {
+      return event;
+    }
+    NSView* owner = ownerButton ? ownerButton() : nil;
+    if (owner && !owner.hiddenOrHasHiddenAncestor) {
+      NSPoint inOwner = [owner convertPoint:event.locationInWindow fromView:nil];
+      if (NSPointInRect(inOwner, owner.bounds)) {
+        return event;
+      }
+    }
+    hide();
+    return event;  // The click still lands wherever it was aimed.
+  }];
+}
+
 static BroTabSearchPanel* g_tab_search_panel = nil;
 // Local mouse-down monitor while the panel shows; sees clicks headed for the
 // native CEF views (which never bubble through the AppKit responder chain)
@@ -2619,37 +2684,11 @@ static void ShowTabSearchPanel(void) {
   [g_tab_search_panel focusSearchField];
 
   if (!g_tab_search_click_monitor) {
-    g_tab_search_click_monitor = [NSEvent
-        addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown |
-                                              NSEventMaskRightMouseDown |
-                                              NSEventMaskOtherMouseDown)
-                                     handler:^NSEvent*(NSEvent* event) {
-          if (!TabSearchPanelVisible()) {
-            return event;
-          }
-          if (event.window != g_tab_search_panel.window) {
-            HideTabSearchPanel();
-            return event;
-          }
-          NSPoint inPanel =
-              [g_tab_search_panel convertPoint:event.locationInWindow
-                                      fromView:nil];
-          if (NSPointInRect(inPanel, g_tab_search_panel.bounds)) {
-            return event;
-          }
-          // Let the chevron's own click through: its action toggles, and
-          // hiding here first would make the toggle immediately reopen.
-          BroHoverButton* chevron = g_tab_bar.tabSearchButton;
-          if (chevron && !chevron.hiddenOrHasHiddenAncestor) {
-            NSPoint inChevron = [chevron convertPoint:event.locationInWindow
-                                             fromView:nil];
-            if (NSPointInRect(inChevron, chevron.bounds)) {
-              return event;
-            }
-          }
-          HideTabSearchPanel();
-          return event;
-        }];
+    g_tab_search_click_monitor = BroInstallOutsideDismissMonitor(
+        g_tab_search_panel,
+        ^BOOL{ return TabSearchPanelVisible(); },
+        ^NSView*{ return g_tab_bar.tabSearchButton; },
+        ^{ HideTabSearchPanel(); });
   }
 }
 
@@ -4389,33 +4428,11 @@ static void BroShowDownloadsPopover(void) {
   g_downloads_popover.hidden = NO;
 
   if (!g_downloads_click_monitor) {
-    g_downloads_click_monitor = [NSEvent
-        addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown |
-                                              NSEventMaskRightMouseDown |
-                                              NSEventMaskOtherMouseDown)
-                                     handler:^NSEvent*(NSEvent* event) {
-      if (event.window != g_downloads_popover.window) {
-        BroHideDownloadsPopover();
-        return event;
-      }
-      NSPoint inPopover = [g_downloads_popover convertPoint:event.locationInWindow
-                                                   fromView:nil];
-      if (NSPointInRect(inPopover, g_downloads_popover.bounds)) {
-        return event;
-      }
-      // Let the downloads button's own action do the toggle-off, otherwise
-      // hide-then-toggle would re-show the panel on the same click.
-      BroHoverButton* button = g_toolbar.downloadsButton;
-      if (button && !button.hidden) {
-        NSPoint inButton = [button convertPoint:event.locationInWindow
-                                       fromView:nil];
-        if (NSPointInRect(inButton, button.bounds)) {
-          return event;
-        }
-      }
-      BroHideDownloadsPopover();
-      return event;  // The click still lands wherever it was aimed.
-    }];
+    g_downloads_click_monitor = BroInstallOutsideDismissMonitor(
+        g_downloads_popover,
+        nil,
+        ^NSView*{ return g_toolbar.downloadsButton; },
+        ^{ BroHideDownloadsPopover(); });
   }
   if (!g_downloads_key_monitor) {
     g_downloads_key_monitor = [NSEvent
