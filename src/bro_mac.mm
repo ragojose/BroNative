@@ -1182,7 +1182,7 @@ static void ToggleScreenshotMode(void) {
   // The card's own corner radius derives from the window's (bro_geometry's
   // concentric rule): normally browserContainer needs no rounding of its
   // own, since it fills edge-to-edge and the window's NSThemeFrame clips it
-  // to the window shape for free (see BroWindowCornerRadius above). Inset
+  // to the window shape for free (see BroShellCornerRadius above). Inset
   // from the edge by the gutter, it has to carry its own curve to read as a
   // card rather than a clipped rectangle.
   g_main_window.browserContainer.wantsLayer = YES;
@@ -1190,8 +1190,7 @@ static void ToggleScreenshotMode(void) {
   containerLayer.masksToBounds = YES;
   containerLayer.cornerCurve = kCACornerCurveContinuous;
   CGFloat cardRadius = active
-      ? BroNestedCornerRadius(BroWindowCornerRadius(g_main_window),
-                              kScreenshotModeGutter)
+      ? BroNestedCornerRadius(BroShellCornerRadius(), kScreenshotModeGutter)
       : 0.0;
 
   BroRunLayoutSpring(^{
