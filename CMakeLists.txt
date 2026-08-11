@@ -15,8 +15,13 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
 # Applied per-config so dead stripping also happens under multi-config generators
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto -Wl,-dead_strip")
 
+# CEF binary distribution version. Single source of truth for the pinned
+# build — CI and README both derive their copy from this line by grepping it,
+# so a bump here is a bump everywhere.
+set(BRO_CEF_VERSION "cef_binary_151.3.16+gbe1e15d+chromium-151.0.7922.109_macosarm64_minimal")
+
 # CEF binary distribution path
-set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal")
+set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/${BRO_CEF_VERSION}")
 
 # Use C++17
 set(CMAKE_CXX_STANDARD 17)
@@ -52,14 +57,26 @@ set(SPARKLE_FRAMEWORK "${sparkle_SOURCE_DIR}/Sparkle.framework")
 set(BRO_SRCS
     src/bro_app.cc
     src/bro_app.h
+    src/bro_closed_tabs.h
+    src/bro_closed_tabs.mm
+    src/bro_downloads.mm
+    src/bro_favicon.mm
     src/bro_handler.cc
     src/bro_handler.h
     src/bro_handler_mac.mm
     src/bro_mac.mm
+    src/bro_mac_internal.h
+    src/bro_tabsearch.mm
+    src/bro_tabstrip.mm
+    src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm
+    src/browser_registry.cc
+    src/browser_registry.h
     src/radix_icons.h
     src/radix_icons.mm
+    src/tab_description_fetcher.cc
+    src/tab_description_fetcher.h
 )
 
 set(BRO_HELPER_SRCS
@@ -83,6 +100,27 @@ set(BRO_FONT_RESOURCES
 )
 set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
     MACOSX_PACKAGE_LOCATION "Resources/Fonts"
+)
+
+# Toolbar/tab-strip icons, loaded at runtime by radix_icons.mm.
+set(BRO_ICON_RESOURCES
+    src/mac/icons/arrow-left.pdf
+    src/mac/icons/arrow-right.pdf
+    src/mac/icons/reload.pdf
+    src/mac/icons/plus.pdf
+    src/mac/icons/cross-2.pdf
+    src/mac/icons/desktop.pdf
+    src/mac/icons/mobile.pdf
+    src/mac/icons/globe.pdf
+    src/mac/icons/drawing-pin.pdf
+    src/mac/icons/drawing-pin-filled.pdf
+    src/mac/icons/view-vertical.pdf
+    src/mac/icons/download.pdf
+    src/mac/icons/magnifying-glass.pdf
+    src/mac/icons/chevron-down.pdf
+)
+set_source_files_properties(${BRO_ICON_RESOURCES} PROPERTIES
+    MACOSX_PACKAGE_LOCATION "Resources/Icons"
 )
 
 # App bundle info
@@ -131,7 +169,7 @@ configure_file(
 
 # Main executable
 add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS} ${BRO_RESOURCES}
-               ${BRO_FONT_RESOURCES})
+               ${BRO_FONT_RESOURCES} ${BRO_ICON_RESOURCES})
 
 # Include directories
 target_include_directories(${EXECUTABLE_NAME} PRIVATE
