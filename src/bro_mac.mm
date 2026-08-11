@@ -443,7 +443,7 @@ static BOOL g_split_divider_dragging = NO;
         initWithFrame:NSMakeRect((kSplitDividerGrabWidth - 4.0) / 2.0,
                                  (frame.size.height - 44.0) / 2.0, 4.0, 44.0)];
     grip_.wantsLayer = YES;
-    grip_.layer.cornerRadius = 2.0;
+    grip_.layer.cornerRadius = BroCapsuleCornerRadius(NSWidth(grip_.frame));
     grip_.layer.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.4].CGColor;
     grip_.layer.actions = BroLayerTransitionActions();
@@ -987,7 +987,7 @@ static void ShowZoomHUD(int percent) {
   if (!g_zoom_hud) {
     g_zoom_hud = [[NSView alloc] initWithFrame:NSZeroRect];
     g_zoom_hud.wantsLayer = YES;
-    g_zoom_hud.layer.cornerRadius = 8.0;
+    g_zoom_hud.layer.cornerRadius = kSurfaceCornerRadius;
     BroApplyElevation(g_zoom_hud, BroElevationOverlay);
     g_zoom_hud.hidden = YES;
 

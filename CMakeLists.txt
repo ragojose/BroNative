@@ -61,6 +61,7 @@ set(BRO_SRCS
     src/bro_closed_tabs.mm
     src/bro_downloads.mm
     src/bro_favicon.mm
+    src/bro_geometry.h
     src/bro_handler.cc
     src/bro_handler.h
     src/bro_handler_mac.mm

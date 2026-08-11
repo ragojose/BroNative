@@ -410,7 +410,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 6.0;
+    self.layer.cornerRadius = kControlCornerRadius;
 
     iconView_ = [[NSImageView alloc]
         initWithFrame:NSMakeRect(12, (frame.size.height - 15) / 2.0, 15, 15)];
@@ -581,7 +581,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
     self.accessibilityLabel = @"Command palette";
 
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 8.0;
+    self.layer.cornerRadius = kSurfaceCornerRadius;
     BroApplyElevation(self, BroElevationPanel);
     // Glass backdrop: the elevation's flat fill is replaced by glass under a
     // near-#000 tint; border and shadow stay on the panel's own layer. The
@@ -597,7 +597,8 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
       NSGlassEffectView* glass =
           [[NSGlassEffectView alloc] initWithFrame:self.bounds];
       glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      glass.cornerRadius = 8.0;
+      glass.cornerRadius =
+          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
       glass.style = NSGlassEffectViewStyleRegular;
       glass.tintColor = [NSColor colorWithWhite:0.0 alpha:0.6];
       [self addSubview:glass];
@@ -609,7 +610,8 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
       glass.blendingMode = NSVisualEffectBlendingModeWithinWindow;
       glass.state = NSVisualEffectStateActive;
       glass.wantsLayer = YES;
-      glass.layer.cornerRadius = 8.0;
+      glass.layer.cornerRadius =
+          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
       glass.layer.masksToBounds = YES;
       [self addSubview:glass];
       NSView* tint = [[NSView alloc] initWithFrame:self.bounds];
@@ -617,7 +619,8 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
       tint.wantsLayer = YES;
       tint.layer.backgroundColor =
           [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
-      tint.layer.cornerRadius = 8.0;
+      tint.layer.cornerRadius =
+          BroNestedCornerRadius(kSurfaceCornerRadius, 0.0);
       tint.layer.masksToBounds = YES;
       [self addSubview:tint];
     }

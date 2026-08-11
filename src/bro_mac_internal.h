@@ -15,6 +15,8 @@
 
 #import <Cocoa/Cocoa.h>
 
+#import "bro_geometry.h"
+
 #include <string>
 
 @class BroToolbar;
@@ -52,7 +54,7 @@ static const CGFloat kTabTextFrameHeight = 18.0;
 static const CGFloat kTabPillSquareWidth = kTabPillHeight;
 // The "+" button is half the pill's size, centered on the same midline.
 static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
-static const CGFloat kPillCornerRadius = 8.0;
+static const CGFloat kPillCornerRadius = kSurfaceCornerRadius;
 static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
 static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics

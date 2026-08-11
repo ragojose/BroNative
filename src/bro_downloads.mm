@@ -133,7 +133,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 8.0;
+    self.layer.cornerRadius = kSurfaceCornerRadius;
     BroApplyElevation(self, BroElevationPanel);
     rowHighlightGroup_ =
         [[BroHoverHighlightGroup alloc] initWithContainerView:self];
@@ -318,7 +318,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     NSView* track = [[NSView alloc]
         initWithFrame:NSMakeRect(textX, 4.0, barWidth, 2.0)];
     track.wantsLayer = YES;
-    track.layer.cornerRadius = 1.0;
+    track.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(track.frame));
     track.layer.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
     [row addSubview:track];
@@ -328,7 +328,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
       NSView* fill = [[NSView alloc]
           initWithFrame:NSMakeRect(textX, 4.0, barWidth * fraction, 2.0)];
       fill.wantsLayer = YES;
-      fill.layer.cornerRadius = 1.0;
+      fill.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(fill.frame));
       fill.layer.backgroundColor =
           [NSColor colorWithWhite:1.0 alpha:0.85].CGColor;
       [row addSubview:fill];

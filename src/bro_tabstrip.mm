@@ -43,7 +43,7 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 6.0;
+    self.layer.cornerRadius = kControlCornerRadius;
     self.layer.actions = BroLayerTransitionActions();
     // Keyboard focus shows as the same gray hairline the tab pills use, not
     // the system's accent-colored ring.
@@ -309,7 +309,13 @@ void BroFetchFaviconGuarded(NSString* urlString,
     closeButton.image = RadixIconImage(RadixIconCross2, 10);
     closeButton.imagePosition = NSImageOnly;
     closeButton.contentTintColor = [NSColor tertiaryLabelColor];
-    closeButton.layer.cornerRadius = 4.0;
+    // The close control is concentric with the pill: its 16pt square sits
+    // evenly inside the 28pt pill, leaving a 6pt gap on both horizontal
+    // edges. 8 - 6 = 2.
+    CGFloat closeButtonGap =
+        (kTabPillHeight - NSHeight(closeButton.frame)) / 2.0;
+    closeButton.layer.cornerRadius =
+        BroNestedCornerRadius(kPillCornerRadius, closeButtonGap);
     closeButton.target = self;
     closeButton.action = @selector(handleClose:);
     closeButton.autoresizingMask = NSViewMinXMargin;
@@ -847,7 +853,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 8.0;
+    self.layer.cornerRadius = kSurfaceCornerRadius;
     BroApplyElevation(self, BroElevationOverlay);
 
     titleLabel_ = [[BroTextMorphView alloc]
@@ -1004,7 +1010,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _addTabButton.image = RadixIconImage(RadixIconPlus, 10);
     _addTabButton.imagePosition = NSImageOnly;
     _addTabButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
-    _addTabButton.layer.cornerRadius = 4.0;
+    _addTabButton.layer.cornerRadius = kCompactControlCornerRadius;
     _addTabButton.baseBorderWidth = 1.0;
     _addTabButton.baseBorderColor = BroControlBorderColor();
     _addTabButton.target = self;
