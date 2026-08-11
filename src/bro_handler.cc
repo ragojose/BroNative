@@ -425,7 +425,11 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
 
   // If we closed the active browser, switch to another one
   if (browser_id == browser_registry_.active_id()) {
-    CefRefPtr<CefBrowser> new_active = browser_registry_.SelectNextActive();
+    // Only a browser with a live tab view can become the active tab (T1):
+    // skip past any entry that has no tab view instead of blindly taking
+    // the list front.
+    CefRefPtr<CefBrowser> new_active =
+        browser_registry_.SelectNextActive(&HasTabView);
     if (new_active) {
       OnActiveTabChanged(new_active->GetIdentifier());
     }

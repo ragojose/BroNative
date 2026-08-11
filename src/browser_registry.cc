@@ -50,13 +50,15 @@ CefRefPtr<CefBrowser> BrowserRegistry::SetActive(int browser_id) {
   return it->second;
 }
 
-CefRefPtr<CefBrowser> BrowserRegistry::SelectNextActive() {
-  if (browser_list_.empty()) {
-    return nullptr;
+CefRefPtr<CefBrowser> BrowserRegistry::SelectNextActive(
+    const std::function<bool(int)>& predicate) {
+  for (const auto& browser : browser_list_) {
+    if (predicate(browser->GetIdentifier())) {
+      active_browser_id_ = browser->GetIdentifier();
+      return browser;
+    }
   }
-  CefRefPtr<CefBrowser> browser = browser_list_.front();
-  active_browser_id_ = browser->GetIdentifier();
-  return browser;
+  return nullptr;
 }
 
 CefRefPtr<CefBrowser> BrowserRegistry::front() const {

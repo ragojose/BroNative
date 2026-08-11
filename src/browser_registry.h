@@ -7,6 +7,7 @@
 
 #include "include/cef_browser.h"
 
+#include <functional>
 #include <list>
 #include <map>
 
@@ -38,10 +39,13 @@ class BrowserRegistry {
 
   int active_id() const { return active_browser_id_; }
 
-  // Picks a new active browser: the first entry in list order. Sets it as
-  // active and returns it, or returns null (leaving the active id
-  // unchanged) if the registry is empty.
-  CefRefPtr<CefBrowser> SelectNextActive();
+  // Picks a new active browser: the first entry in list order for which
+  // |predicate| returns true (e.g. HasTabView, so a browser with no tab
+  // view can never become the active tab). Sets it as active and returns
+  // it, or returns null (leaving the active id unchanged) if the registry
+  // is empty or no entry qualifies.
+  CefRefPtr<CefBrowser> SelectNextActive(
+      const std::function<bool(int)>& predicate);
 
   bool empty() const { return browser_list_.empty(); }
   size_t size() const { return browser_list_.size(); }
