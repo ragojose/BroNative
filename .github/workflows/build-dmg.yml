@@ -30,8 +30,9 @@ env:
   # Deltas generated per build. Also how many previous DMGs get pulled down,
   # since building a delta needs both sides — keep it small, they are ~158 MB.
   MAX_DELTAS: "2"
-  # DMGs retained on the release. Must exceed MAX_DELTAS so delta sources survive.
-  KEEP_ARCHIVES: "4"
+  # DMGs retained on the release. Must equal MAX_DELTAS + 1 so delta sources
+  # survive and every retained DMG is still listed in the regenerated appcast.
+  KEEP_ARCHIVES: "3"
 
 jobs:
   build:
