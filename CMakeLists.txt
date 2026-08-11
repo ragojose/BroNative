@@ -90,6 +90,27 @@ set_source_files_properties(${BRO_FONT_RESOURCES} PROPERTIES
     MACOSX_PACKAGE_LOCATION "Resources/Fonts"
 )
 
+# Toolbar/tab-strip icons, loaded at runtime by radix_icons.mm.
+set(BRO_ICON_RESOURCES
+    src/mac/icons/arrow-left.pdf
+    src/mac/icons/arrow-right.pdf
+    src/mac/icons/reload.pdf
+    src/mac/icons/plus.pdf
+    src/mac/icons/cross-2.pdf
+    src/mac/icons/desktop.pdf
+    src/mac/icons/mobile.pdf
+    src/mac/icons/globe.pdf
+    src/mac/icons/drawing-pin.pdf
+    src/mac/icons/drawing-pin-filled.pdf
+    src/mac/icons/view-vertical.pdf
+    src/mac/icons/download.pdf
+    src/mac/icons/magnifying-glass.pdf
+    src/mac/icons/chevron-down.pdf
+)
+set_source_files_properties(${BRO_ICON_RESOURCES} PROPERTIES
+    MACOSX_PACKAGE_LOCATION "Resources/Icons"
+)
+
 # App bundle info
 # PRODUCT_NAME is the user-visible app/bundle name; EXECUTABLE_NAME stays
 # space-free because it doubles as the CMake target name.
@@ -136,7 +157,7 @@ configure_file(
 
 # Main executable
 add_executable(${EXECUTABLE_NAME} MACOSX_BUNDLE ${BRO_SRCS} ${BRO_RESOURCES}
-               ${BRO_FONT_RESOURCES})
+               ${BRO_FONT_RESOURCES} ${BRO_ICON_RESOURCES})
 
 # Include directories
 target_include_directories(${EXECUTABLE_NAME} PRIVATE
