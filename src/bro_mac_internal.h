@@ -5,7 +5,7 @@
 
 // Private shared header for the bro_mac.mm split family (bro_mac.mm,
 // bro_favicon.mm, bro_downloads.mm, bro_toolbar.mm, bro_closed_tabs.mm,
-// bro_tabsearch.mm, bro_tabstrip.mm). Declares the cross-file globals, the
+// bro_palette.mm, bro_tabstrip.mm). Declares the cross-file globals, the
 // cross-file free functions, and the @class/@interface declarations that
 // must be visible across the family. Not a public API -- nothing outside
 // this file family should include it.
@@ -15,12 +15,16 @@
 
 #import <Cocoa/Cocoa.h>
 
+#import "bro_geometry.h"
+
 #include <string>
 
 @class BroToolbar;
 @class BroTabView;
 @class BroTabBar;
 @class BroHoverButton;
+@class BroHoverHighlightGroup;
+@class BroTextMorphView;
 
 // Layout/timing constants shared across the split family. Each file gets
 // its own copy (harmless for compile-time constants); kWindowBorderAlpha is
@@ -41,11 +45,16 @@ static const CGFloat kTabPillTextMinWidth = 64.0;
 // favicon and title.
 static const CGFloat kTabPillCloseMinWidth = 80.0;
 static const CGFloat kTabPillHeight = 28.0;
+// Every tab-text state shares these metrics: inactive morph, active resting
+// morph, and the editable address field. Keeping them tokenized prevents a
+// tab switch from changing either font size or baseline geometry.
+static const CGFloat kTabTextFontSize = 10.0;
+static const CGFloat kTabTextFrameHeight = 18.0;
 // A collapsed pill is exactly square.
 static const CGFloat kTabPillSquareWidth = kTabPillHeight;
 // The "+" button is half the pill's size, centered on the same midline.
 static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
-static const CGFloat kPillCornerRadius = 8.0;
+static const CGFloat kPillCornerRadius = kSurfaceCornerRadius;
 static const CGFloat kTrafficLightInset = 100.0;
 static const CGFloat kMobileViewportWidth = 390.0;
 static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
@@ -104,8 +113,8 @@ extern NSView* BroBrowserContainerView(void);
 extern void BroRunOnMain(void (^block)(void));
 
 // Installs a local mouse-down monitor that hides `panel` on any click outside
-// both `panel` and its owner button. See bro_mac.mm's prior definition site
-// for the full contract; behavior is unchanged by the move.
+// both `panel` and its owner button. See the definition in bro_palette.mm
+// for the full contract.
 extern id BroInstallOutsideDismissMonitor(NSView* panel,
                                            BOOL (^isVisible)(void),
                                            NSView* (^ownerButton)(void),
@@ -113,7 +122,7 @@ extern id BroInstallOutsideDismissMonitor(NSView* panel,
 
 // Fetches `urlString`'s favicon and hands the result to `applyImage`, but
 // only if `stillCurrent` still says `generation` is current when the fetch
-// completes. Shared by BroTabView and BroTabSearchRow, which each bump their
+// completes. Shared by BroTabView and BroPaletteRow, which each bump their
 // own generation counter before calling this (a slow response for an
 // already-superseded favicon must not overwrite a newer one).
 extern void BroFetchFaviconGuarded(NSString* urlString,
@@ -130,6 +139,12 @@ extern void BroToggleDownloadsPopover(void);
 // view hidden so the black window backdrop shows through as the new-tab
 // state, and never show the raw "about:blank" in the chrome.
 extern BOOL BroURLIsBlank(NSString* url);
+
+// Resolves user input into a loadable URL: safe schemes and about: pass
+// through, a dotted word gets https://, anything else becomes a Google
+// search URL. |query| must be trimmed; returns nil when empty. Defined in
+// bro_toolbar.mm; shared with the command palette's fallback row.
+extern NSString* BroResolveQueryToURL(NSString* query);
 
 // Display-only host for a URL: the host with any leading "www." removed.
 // Falls back to the raw string when the URL has no parseable host. Never used
@@ -172,12 +187,17 @@ extern void ClearSplit(void);
 extern void JoinTabsInSplit(int dragged_id, int target_id);
 extern NSUInteger BroTabStripIndex(int browser_id);
 
-// Tab search panel (⇧⌘A / the tab strip's chevron): toggle shows or hides
-// the dropdown; hide is safe to call any time. Defined with the panel class.
-extern void ToggleTabSearchPanel(void);
-extern void HideTabSearchPanel(void);
-// Releases the retained panel; called when the main window is torn down.
-extern void TeardownTabSearchPanel(void);
+// Command palette (⌘K; ⇧⌘A and the tab strip's chevron open it scoped to
+// tabs): toggle shows or hides the centered panel; hide is safe to call any
+// time. Defined with the panel class in bro_palette.mm.
+typedef NS_ENUM(NSInteger, BroPaletteScope) {
+  BroPaletteScopeAll,   // tabs + history + commands + web-search fallback
+  BroPaletteScopeTabs,  // open + recently closed tabs only
+};
+extern void ToggleCommandPalette(BroPaletteScope scope);
+extern void HideCommandPalette(void);
+// Releases the retained palette; called when the main window is torn down.
+extern void TeardownCommandPalette(void);
 
 // Implicit-animation actions so state changes (hover/focus/active) fade
 // instead of snapping. Backing layers suppress implicit animations by
@@ -207,6 +227,9 @@ extern NSDictionary* BroLayerTransitionActions(void);
 // Resting border, restored when the white keyboard-focus ring goes away.
 @property (nonatomic, assign) CGFloat baseBorderWidth;
 @property (nonatomic, strong) NSColor* baseBorderColor;
+// Optional shared hover preview. Grouped buttons keep pressed/selected
+// feedback but let the group own hover fill and hover motion.
+@property (nonatomic, weak) BroHoverHighlightGroup* highlightGroup;
 @end
 
 // Builds a dimmed, non-editable NSTextField used by the hover card, the
@@ -227,7 +250,7 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 @property (nonatomic, assign) int browserId;
 @property (nonatomic, strong) NSImageView* faviconView;
 @property (nonatomic, strong) NSProgressIndicator* loadingSpinner;
-@property (nonatomic, strong) NSTextField* titleLabel;
+@property (nonatomic, strong) BroTextMorphView* titleLabel;
 @property (nonatomic, strong) NSButton* closeButton;
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, assign) BOOL isLoading;
@@ -340,10 +363,19 @@ extern BroTabBar* g_tab_bar;
 @property (nonatomic, strong) BroHoverButton* mobileButton;
 @property (nonatomic, strong) BroHoverButton* downloadsButton;
 @property (nonatomic, copy) NSString* fullURL;
+@property (nonatomic, strong) BroHoverHighlightGroup* navigationHighlightGroup;
+@property (nonatomic, strong) BroHoverHighlightGroup* trailingHighlightGroup;
 - (void)addressFieldDidFocus;
 - (void)setViewportMode:(BOOL)mobile;
 - (void)updateURL:(NSString*)url;
 - (void)focusAddressField;
+// Resolves |urlString| via BroResolveQueryToURL and loads it in the active
+// browser; also used by the command palette's fallback row.
+- (void)navigateToURL:(NSString*)urlString;
+// Download started/finished nudge: reveals the hidden search + downloads
+// icons briefly (they hide at rest and show on hover; the toolbar owns the
+// shared hover zone). Called from bro_downloads.mm.
+- (void)pulseDownloadsButton;
 // Menu-action forwarders; called on g_toolbar from BroWindow/BroAppDelegate
 // and the UI-update bridge functions.
 - (void)goBack:(id)sender;

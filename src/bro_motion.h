@@ -6,6 +6,8 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 
+#import "bro_geometry.h"
+
 typedef NS_ENUM(NSInteger, BroSpringPreset) {
   BroSpringText,
   BroSpringTextTight,

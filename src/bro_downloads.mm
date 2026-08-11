@@ -7,6 +7,7 @@
 
 #include "bro_handler.h"
 #import "bro_mac_internal.h"
+#import "bro_motion.h"
 #import "radix_icons.h"
 
 #pragma mark - BroDownloadEntry
@@ -52,6 +53,46 @@ static const CGFloat kDownloadsHeaderHeight = 28.0;
 static const CGFloat kDownloadsFooterHeight = 36.0;
 static const CGFloat kDownloadsEmptyHeight = 52.0;
 
+@interface BroDownloadRow : NSView
+@property(nonatomic, assign) BOOL interactive;
+@property(nonatomic, weak) BroHoverHighlightGroup* highlightGroup;
+@property(nonatomic, weak) id target;
+@property(nonatomic, assign) SEL action;
+@property(nonatomic, assign) NSUInteger downloadIndex;
+@end
+
+@implementation BroDownloadRow
+
+- (void)mouseEntered:(NSEvent*)event {
+  if (_interactive) {
+    [_highlightGroup hoverOnView:self];
+  }
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  if (_interactive) {
+    [_highlightGroup hoverOffView:self];
+  }
+}
+
+- (void)resetCursorRects {
+  if (_interactive) {
+    [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+  }
+}
+
+- (void)mouseDown:(NSEvent*)event {
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+  if (_interactive && NSPointInRect(point, self.bounds)) {
+    [NSApp sendAction:_action to:_target from:self];
+  }
+}
+
+@end
+
 @interface BroDownloadsPopover : NSView
 // Rebuilds the rows from the downloads list and resizes self to fit, showing
 // at most as many rows as fit in |maxHeight| (newest kept, oldest dropped).
@@ -68,6 +109,7 @@ static const CGFloat kDownloadsEmptyHeight = 52.0;
   // Entries backing the visible rows; magnifier buttons index into this.
   NSMutableArray<BroDownloadEntry*>* rowEntries_;
   CGFloat lastMaxHeight_;
+  BroHoverHighlightGroup* rowHighlightGroup_;
 }
 
 static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
@@ -91,12 +133,10 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   self = [super initWithFrame:frame];
   if (self) {
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 8.0;
-    self.layer.backgroundColor =
-        [NSColor colorWithWhite:0.18 alpha:0.96].CGColor;
-    self.layer.borderWidth = 1.0;
-    self.layer.borderColor =
-        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
+    self.layer.cornerRadius = kSurfaceCornerRadius;
+    BroApplyElevation(self, BroElevationPanel);
+    rowHighlightGroup_ =
+        [[BroHoverHighlightGroup alloc] initWithContainerView:self];
 
     headerLabel_ = BroHoverCardLabel(BroUIFontBold(10.0), 0.55);
     headerLabel_.attributedStringValue = [[NSAttributedString alloc]
@@ -153,6 +193,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
 
 - (void)reloadWithMaxHeight:(CGFloat)maxHeight {
   lastMaxHeight_ = maxHeight;
+  [rowHighlightGroup_ dismissImmediately];
   for (NSView* row in rowViews_) {
     [row removeFromSuperview];
   }
@@ -224,10 +265,28 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
 }
 
 - (NSView*)makeRowForEntry:(BroDownloadEntry*)entry index:(NSUInteger)index {
-  NSView* row = [[NSView alloc] initWithFrame:NSZeroRect];
+  BroDownloadRow* row = [[BroDownloadRow alloc] initWithFrame:NSZeroRect];
 
   BOOL fileExists = entry.path.length > 0 &&
       [[NSFileManager defaultManager] fileExistsAtPath:entry.path];
+  row.interactive = entry.state == BroDownloadStateComplete && fileExists;
+  row.highlightGroup = rowHighlightGroup_;
+  row.target = self;
+  row.action = @selector(openEntry:);
+  row.downloadIndex = index;
+  if (row.interactive) {
+    row.accessibilityElement = YES;
+    row.accessibilityRole = NSAccessibilityButtonRole;
+    row.accessibilityLabel =
+        [NSString stringWithFormat:@"Open %@", entry.name ?: @"download"];
+    NSTrackingArea* trackingArea = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:row
+            userInfo:nil];
+    [row addTrackingArea:trackingArea];
+  }
 
   NSImageView* icon = [[NSImageView alloc]
       initWithFrame:NSMakeRect(12.0, 8.0, 28.0, 28.0)];
@@ -259,7 +318,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
     NSView* track = [[NSView alloc]
         initWithFrame:NSMakeRect(textX, 4.0, barWidth, 2.0)];
     track.wantsLayer = YES;
-    track.layer.cornerRadius = 1.0;
+    track.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(track.frame));
     track.layer.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.15].CGColor;
     [row addSubview:track];
@@ -269,7 +328,7 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
       NSView* fill = [[NSView alloc]
           initWithFrame:NSMakeRect(textX, 4.0, barWidth * fraction, 2.0)];
       fill.wantsLayer = YES;
-      fill.layer.cornerRadius = 1.0;
+      fill.layer.cornerRadius = BroCapsuleCornerRadius(NSHeight(fill.frame));
       fill.layer.backgroundColor =
           [NSColor colorWithWhite:1.0 alpha:0.85].CGColor;
       [row addSubview:fill];
@@ -295,6 +354,20 @@ static NSAttributedString* BroDownloadsButtonTitle(NSString* text,
   }
 
   return row;
+}
+
+- (void)openEntry:(BroDownloadRow*)sender {
+  NSUInteger index = sender.downloadIndex;
+  if (index >= rowEntries_.count) {
+    return;
+  }
+  BroDownloadEntry* entry = rowEntries_[index];
+  if (entry.state == BroDownloadStateComplete && entry.path.length > 0 &&
+      [[NSFileManager defaultManager] fileExistsAtPath:entry.path]) {
+    [[NSWorkspace sharedWorkspace] openURL:
+        [NSURL fileURLWithPath:entry.path]];
+    BroHideDownloadsPopover();
+  }
 }
 
 - (NSString*)subtitleForEntry:(BroDownloadEntry*)entry
@@ -421,7 +494,7 @@ static void BroRemoveDownloadsMonitors(void) {
 // BroHideDownloadsPopover is declared extern in bro_mac_internal.h.
 void BroHideDownloadsPopover(void) {
   BroRemoveDownloadsMonitors();
-  g_downloads_popover.hidden = YES;
+  BroOverlayHide(g_downloads_popover);
 }
 
 static void BroShowDownloadsPopover(void) {
@@ -432,6 +505,7 @@ static void BroShowDownloadsPopover(void) {
   if (!g_downloads_popover) {
     g_downloads_popover =
         [[BroDownloadsPopover alloc] initWithFrame:NSZeroRect];
+    g_downloads_popover.hidden = YES;
     // Tracks the top-right corner across window resizes.
     g_downloads_popover.autoresizingMask =
         NSViewMinXMargin | NSViewMinYMargin;
@@ -441,7 +515,7 @@ static void BroShowDownloadsPopover(void) {
   [container addSubview:g_downloads_popover];
   [g_downloads_popover reloadWithMaxHeight:NSHeight(container.bounds) - 12.0];
   BroPositionDownloadsPopover();
-  g_downloads_popover.hidden = NO;
+  BroOverlayShow(g_downloads_popover);
 
   if (!g_downloads_click_monitor) {
     g_downloads_click_monitor = BroInstallOutsideDismissMonitor(
@@ -483,22 +557,12 @@ static void BroRefreshDownloadsPopover(void) {
   BroPositionDownloadsPopover();
 }
 
-// Brief dip-and-restore of the button's opacity when a download starts or
-// finishes; enough of a nudge without stealing the pointer like an auto-shown
-// panel would.
+// Nudge when a download starts or finishes; enough without stealing the
+// pointer like an auto-shown panel would. The toolbar owns the animation:
+// the button hides at rest, so the pulse is a brief reveal (or an opacity
+// dip when already revealed by hover).
 static void BroPulseDownloadsButton(void) {
-  BroHoverButton* button = g_toolbar.downloadsButton;
-  if (!button) {
-    return;
-  }
-  if ([NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
-    return;
-  }
-  button.alphaValue = 0.25;
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = 0.5;
-    button.animator.alphaValue = 1.0;
-  }];
+  [g_toolbar pulseDownloadsButton];
 }
 
 #pragma mark - Downloads model

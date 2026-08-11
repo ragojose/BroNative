@@ -61,6 +61,7 @@ set(BRO_SRCS
     src/bro_closed_tabs.mm
     src/bro_downloads.mm
     src/bro_favicon.mm
+    src/bro_geometry.h
     src/bro_handler.cc
     src/bro_handler.h
     src/bro_handler_mac.mm
@@ -72,8 +73,10 @@ set(BRO_SRCS
     src/bro_motion.mm
     src/bro_persist.h
     src/bro_persist.mm
-    src/bro_tabsearch.mm
+    src/bro_palette.mm
     src/bro_tabstrip.mm
+    src/bro_text_morph.h
+    src/bro_text_morph.mm
     src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm

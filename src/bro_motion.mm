@@ -367,7 +367,7 @@ void BroOverlayHide(NSView* view) {
     container.wantsLayer = YES;
     highlightLayer_ = [CALayer layer];
     highlightLayer_.anchorPoint = CGPointZero;
-    highlightLayer_.cornerRadius = 6.0;
+    highlightLayer_.cornerRadius = kControlCornerRadius;
     highlightLayer_.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.08].CGColor;
     highlightLayer_.opacity = 0.0;
