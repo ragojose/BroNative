@@ -15,8 +15,12 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <string>
+
 @class BroToolbar;
 @class BroTabView;
+@class BroTabBar;
+@class BroHoverButton;
 
 // Layout/timing constants shared across the split family. Each file gets
 // its own copy (harmless for compile-time constants); kWindowBorderAlpha is
@@ -64,6 +68,10 @@ static const CGFloat kIconHoverScale = 1.07;
 static const CGFloat kIconPressScale = 0.95;
 static const NSTimeInterval kCloseButtonFadeDuration = 0.15;
 
+// What a blank tab is called everywhere it surfaces: pill label, hover card,
+// accessibility label, and the window title AppKit shows in the Window menu.
+static NSString* const kBroBlankTabTitle = @"New Tab";
+
 // Window chrome: solid #000 backdrop with a #111 hairline frame. The hover
 // card keeps its own lighter border (kWindowBorderAlpha over its gray fill).
 extern const CGFloat kWindowBorderAlpha;
@@ -94,6 +102,16 @@ extern id BroInstallOutsideDismissMonitor(NSView* panel,
                                            NSView* (^ownerButton)(void),
                                            void (^hide)(void));
 
+// Fetches `urlString`'s favicon and hands the result to `applyImage`, but
+// only if `stillCurrent` still says `generation` is current when the fetch
+// completes. Shared by BroTabView and BroTabSearchRow, which each bump their
+// own generation counter before calling this (a slow response for an
+// already-superseded favicon must not overwrite a newer one).
+extern void BroFetchFaviconGuarded(NSString* urlString,
+                                    NSUInteger generation,
+                                    BOOL (^stillCurrent)(NSUInteger generation),
+                                    void (^applyImage)(NSImage* image));
+
 // Downloads popover: toggle shows or hides it; hide is safe to call any
 // time. Defined with the popover class.
 extern void BroHideDownloadsPopover(void);
@@ -118,6 +136,23 @@ extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate);
 // path, including early returns, invokes it exactly once).
 extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
                                         void (^completion)(void));
+
+// Forward declaration of tab creation functions; implemented after
+// BroWindow (hub).
+extern void CreateNewBrowserTab(void);
+extern void CreateNewBrowserTabWithURL(const std::string& url);
+
+// Tab search panel (⇧⌘A / the tab strip's chevron): toggle shows or hides
+// the dropdown; hide is safe to call any time. Defined with the panel class.
+extern void ToggleTabSearchPanel(void);
+extern void HideTabSearchPanel(void);
+// Releases the retained panel; called when the main window is torn down.
+extern void TeardownTabSearchPanel(void);
+
+// Implicit-animation actions so state changes (hover/focus/active) fade
+// instead of snapping. Backing layers suppress implicit animations by
+// default; installing explicit actions re-enables them for these keys.
+extern NSDictionary* BroLayerTransitionActions(void);
 
 #pragma mark - BroFaviconLoader
 
@@ -206,6 +241,61 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 - (void)setTabURL:(NSString*)url;
 - (void)attachAddressField:(NSTextField*)field;
 @end
+
+#pragma mark - BroTabBar
+
+// The tab strip lives INSIDE the toolbar row: each tab is a pill (favicon +
+// host + close), the active pill hosts the editable address field, and the
+// "+" button trails the last pill.
+@interface BroTabBar : NSView
+@property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
+@property (nonatomic, strong) BroHoverButton* addTabButton;
+// Chevron pinned at the strip's right edge; opens the tab search panel.
+@property (nonatomic, strong) BroHoverButton* tabSearchButton;
+@property (nonatomic, assign) int activeTabId;
+- (void)addTabWithBrowserId:(int)browserId title:(NSString*)title;
+- (void)removeTabWithBrowserId:(int)browserId;
+- (void)setActiveTab:(int)browserId;
+- (void)updateTabTitle:(int)browserId title:(NSString*)title;
+- (void)updateTabURL:(int)browserId url:(NSString*)url;
+- (void)updateTabFavicon:(int)browserId faviconURL:(NSString*)url;
+- (void)updateTabLoading:(int)browserId loading:(BOOL)loading;
+// Moves keyboard focus to the pill `offset` positions from `tab`.
+- (void)focusTabRelativeTo:(BroTabView*)tab offset:(NSInteger)offset;
+// Activates the tab `offset` slots from the active one, wrapping around.
+// Unlike focusTabRelativeTo:offset: (keyboard focus, clamped at the ends),
+// this switches the active browser.
+- (void)activateTabRelativeToActiveWithOffset:(NSInteger)offset;
+// Drag-to-reorder: a pill arms on mouse-down, starts dragging once the mouse
+// moves past a small threshold, and reports on mouse-up whether a drag
+// actually happened (a plain click if not).
+- (void)beginPotentialDragForTab:(BroTabView*)tab withEvent:(NSEvent*)event;
+- (void)dragTab:(BroTabView*)tab withEvent:(NSEvent*)event;
+- (BOOL)endDragForTab:(BroTabView*)tab;
+// Hover card: pills report enter/leave; the bar debounces the dwell, shows
+// the card, and hides it on click/drag/close/switch/resize. Leaving the pill
+// only schedules the hide (kHoverCardHideGrace) so the mouse can travel onto
+// the card's buttons; the card reports its own hover to cancel/re-arm it.
+- (void)tabHoverBegan:(BroTabView*)tab;
+- (void)tabHoverEnded:(BroTabView*)tab;
+- (void)cardHoverBegan;
+- (void)cardHoverEnded;
+- (void)hideHoverCard;
+- (void)updateTabDescription:(int)browserId description:(NSString*)desc;
+// Toggles the tab's pinned state, moving it across the pinned/unpinned
+// boundary (pinned pills are a strict prefix of the strip).
+- (void)togglePinForTab:(BroTabView*)tab;
+// Splits the active tab with the next tab in strip order (wrapping); no-op
+// on a lone tab. Shared by the active tab's hover-card split button and the
+// Window menu item.
+- (void)splitActiveTabWithNextTab;
+// Moves the split pair's pills next to each other so they can render as one
+// joined control; refreshes the joined styling either way.
+- (void)ensureSplitPairAdjacent;
+@end
+
+// The tab bar; nil before the window exists. Defined with BroTabBar.
+extern BroTabBar* g_tab_bar;
 
 #pragma mark - BroToolbar
 
