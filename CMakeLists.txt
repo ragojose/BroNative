@@ -15,8 +15,13 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto")
 # Applied per-config so dead stripping also happens under multi-config generators
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto -Wl,-dead_strip")
 
+# CEF binary distribution version. Single source of truth for the pinned
+# build — CI and README both derive their copy from this line by grepping it,
+# so a bump here is a bump everywhere.
+set(BRO_CEF_VERSION "cef_binary_151.3.16+gbe1e15d+chromium-151.0.7922.109_macosarm64_minimal")
+
 # CEF binary distribution path
-set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/cef_binary_151.3.14+g5d67476+chromium-151.0.7922.72_macosarm64_minimal")
+set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/cef-project/third_party/cef/${BRO_CEF_VERSION}")
 
 # Use C++17
 set(CMAKE_CXX_STANDARD 17)

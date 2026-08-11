@@ -41,9 +41,10 @@ from the build after that.
 Download the exact CEF binary distribution pinned in `CMakeLists.txt` (one-time, ~250 MB):
 
 ```bash
+CEF_VERSION=$(sed -n 's/^set(BRO_CEF_VERSION "\(.*\)")$/\1/p' CMakeLists.txt)
 mkdir -p cef-project/third_party/cef
 cd cef-project/third_party/cef
-curl -L -o cef.tar.bz2 "https://cef-builds.spotifycdn.com/cef_binary_151.3.14%2Bg5d67476%2Bchromium-151.0.7922.72_macosarm64_minimal.tar.bz2"
+curl -L -o cef.tar.bz2 "https://cef-builds.spotifycdn.com/$(printf '%s' "$CEF_VERSION" | sed 's/+/%2B/g').tar.bz2"
 tar xjf cef.tar.bz2 && rm cef.tar.bz2
 cd ../../..
 ```
