@@ -35,3 +35,12 @@ void BroHandler::PlatformShowWindow(CefRefPtr<CefBrowser> browser) {
   NSWindow* window = GetNSWindowForBrowser(browser);
   [window makeKeyAndOrderFront:window];
 }
+
+void BroHandler::PlatformCopyToClipboard(const std::string& text) {
+  NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+  [pasteboard clearContents];
+  // Nil-coalesce like every other conversion site in this handler:
+  // setString:forType: raises on nil.
+  NSString* str = [NSString stringWithUTF8String:text.c_str()] ?: @"";
+  [pasteboard setString:str forType:NSPasteboardTypeString];
+}

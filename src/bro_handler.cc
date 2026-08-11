@@ -360,6 +360,11 @@ bool BroHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
                                bool* no_javascript_access) {
   CEF_REQUIRE_UI_THREAD();
 
+  // *no_javascript_access is intentionally left untouched (defaults to
+  // false/allowed): popups are hosted as tabs that keep sharing
+  // window.opener with their opener, so restricting JS access here would
+  // break that relationship for no benefit.
+
   // Host the popup browser in a new tab instead of a bare native window.
   // Keeping the original popup navigation (rather than cancel-and-reopen)
   // preserves POST bodies, window.opener, and the window.open() return value.
@@ -389,8 +394,10 @@ void BroHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   browser_list_.push_back(browser);
   browser_map_[browser_id] = browser;
 
-  // Adopt as a tab if the browser's view lives in the tab container.
-  // Browsers hosted elsewhere (e.g. DevTools) are tracked but get no tab.
+  // Adopt as a tab if the browser's view lives in the tab container. Every
+  // browser that reaches this handler was created with this CefClient (tabs
+  // and popups-becoming-tabs); DevTools browsers are opened with a null
+  // client (see ShowDevTools) and never arrive here at all.
   bool adopted =
       OnTabCreated(browser_id, browser->GetMainFrame()->GetURL().ToString(),
                    browser->GetHost()->GetWindowHandle());
@@ -625,10 +632,11 @@ bool BroHandler::OnContextMenuCommand(CefRefPtr<CefBrowser> browser,
       return true;
     }
     case MENU_ID_COPY_LINK: {
-      // Copy link to clipboard
-      CefString url = params->GetLinkUrl();
-      // Use native clipboard
-      return false;  // Let default handler copy
+      // The menu is rebuilt from scratch with custom IDs, so there is no CEF
+      // default handler to fall through to; copy it ourselves.
+      std::string url = params->GetLinkUrl().ToString();
+      PlatformCopyToClipboard(url);
+      return true;
     }
     case MENU_ID_BACK:
       if (browser->CanGoBack()) {
