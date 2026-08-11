@@ -16,6 +16,53 @@
 #import <Cocoa/Cocoa.h>
 
 @class BroToolbar;
+@class BroTabView;
+
+// Layout/timing constants shared across the split family. Each file gets
+// its own copy (harmless for compile-time constants); kWindowBorderAlpha is
+// the one exception with a single non-static definition, below.
+static const CGFloat kToolbarHeight = 52.0;
+static const CGFloat kButtonSize = 28.0;
+static const CGFloat kButtonSpacing = 4.0;
+// Wide enough that the "Enter URL or search" placeholder reads in full.
+static const CGFloat kTabPillMaxWidth = 180.0;
+static const CGFloat kTabPillMinWidth = 110.0;
+// In narrow windows (mobile shell) pills may shrink below the comfortable
+// minimum rather than overlap the controls to the right of the strip.
+// Below kTabPillTextMinWidth there is no room for readable text beside the
+// favicon, so pills collapse to squares — favicon only, as wide as they are
+// tall — and the active pill alone opens back up so its URL stays typable.
+static const CGFloat kTabPillTextMinWidth = 64.0;
+// Pills narrower than this drop their close button so it doesn't crowd the
+// favicon and title.
+static const CGFloat kTabPillCloseMinWidth = 80.0;
+static const CGFloat kTabPillHeight = 28.0;
+// A collapsed pill is exactly square.
+static const CGFloat kTabPillSquareWidth = kTabPillHeight;
+// The "+" button is half the pill's size, centered on the same midline.
+static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
+static const CGFloat kPillCornerRadius = 8.0;
+static const CGFloat kTrafficLightInset = 100.0;
+static const CGFloat kMobileViewportWidth = 390.0;
+static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
+// Shell width while the window hugs the mobile viewport: the 390pt column
+// plus bezels wide enough that the chrome row (~496pt minimum with the
+// downloads button) still fits.
+static const CGFloat kMobileShellWidth = 512.0;
+static const NSTimeInterval kViewportAnimDuration = 0.28;
+static const CGFloat kWindowCornerRadiusFallback = 12.0;
+// Tab hover card: dwell time on a pill before the card appears (its width
+// tracks the hovered pill's). The grace period keeps the card up after the
+// mouse leaves the pill so it can travel onto the card's action buttons.
+static const NSTimeInterval kHoverCardDelay = 1.0;
+static const NSTimeInterval kHoverCardHideGrace = 0.3;
+static const CGFloat kHoverCardButtonSize = 24.0;
+// Hover/press icon feedback: the whole button scales about its center,
+// animated by the shared 0.15s ease-out layer actions. Kept subtle so the
+// chrome stays calm; skipped entirely under Reduce Motion.
+static const CGFloat kIconHoverScale = 1.07;
+static const CGFloat kIconPressScale = 0.95;
+static const NSTimeInterval kCloseButtonFadeDuration = 0.15;
 
 // Window chrome: solid #000 backdrop with a #111 hairline frame. The hover
 // card keeps its own lighter border (kWindowBorderAlpha over its gray fill).
@@ -52,6 +99,26 @@ extern id BroInstallOutsideDismissMonitor(NSView* panel,
 extern void BroHideDownloadsPopover(void);
 extern void BroToggleDownloadsPopover(void);
 
+// Blank pages (and browsers with no committed URL yet) keep their opaque CEF
+// view hidden so the black window backdrop shows through as the new-tab
+// state, and never show the raw "about:blank" in the chrome.
+extern BOOL BroURLIsBlank(NSString* url);
+
+// Display-only host for a URL: the host with any leading "www." removed.
+// Falls back to the raw string when the URL has no parseable host. Never used
+// for navigation; BroToolbar.fullURL / BroTabView.tabURL keep the canonical
+// URL.
+extern NSString* BroDisplayHostForURL(NSString* urlString);
+
+// Animates the window between its desktop frame and a shell that hugs the
+// mobile viewport, tracking the active tab's viewport mode. Stays in the hub
+// (bro_mac.mm) -- one of the two functions every subsystem calls into.
+extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate);
+// Variant that runs |completion| once the layout change has settled (every
+// path, including early returns, invokes it exactly once).
+extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
+                                        void (^completion)(void));
+
 #pragma mark - BroFaviconLoader
 
 // Fetches and caches favicons off the main thread. Replaces the previous
@@ -81,6 +148,65 @@ extern void BroToggleDownloadsPopover(void);
 // downloads popover, and the tab search panel/rows.
 extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 
+#pragma mark - BroTabView
+
+// NSTextField subclass that tells the toolbar when it gains focus, so the
+// pill can swap from host-only display to the full editable URL.
+@interface BroAddressField : NSTextField
+@end
+
+// One tab pill in the tab strip. Its address field is re-parented onto the
+// active pill by the tab strip; the toolbar flips editingAddress when that
+// field gains/loses focus.
+@interface BroTabView : NSView
+@property (nonatomic, assign) int browserId;
+@property (nonatomic, strong) NSImageView* faviconView;
+@property (nonatomic, strong) NSProgressIndicator* loadingSpinner;
+@property (nonatomic, strong) NSTextField* titleLabel;
+@property (nonatomic, strong) NSButton* closeButton;
+@property (nonatomic, assign) BOOL isActive;
+@property (nonatomic, assign) BOOL isLoading;
+// NO on a lone tab: closing it would close the window, so the pill hides ✕.
+@property (nonatomic, assign) BOOL closable;
+// YES while the hosted address field is being edited; keeps the focused
+// border through hover/layout appearance refreshes.
+@property (nonatomic, assign) BOOL editingAddress;
+// YES once the pill is too narrow for text: favicon only, centered.
+@property (nonatomic, assign) BOOL iconOnly;
+// Pinned pills sit as favicon-only squares at the left edge of the strip and
+// hide their ✕ (Cmd+W still closes them). The active pinned pill expands so
+// the hosted address field stays usable.
+@property (nonatomic, assign) BOOL pinned;
+// YES while this tab is the split screen's right pane; inactive pills get the
+// active-ish border so both halves read as "on screen".
+@property (nonatomic, assign) BOOL isSplitPane;
+// While split, the two pane pills sit adjacent and read as one joined control
+// (mirroring the panes below): 1 = left half of the pair (right corners
+// squared), 2 = right half (left corners squared), 0 = normal lone pill.
+@property (nonatomic, assign) NSInteger joinedSide;
+// YES while a dragged pill hovers this one (drop would split the two tabs);
+// the pill lights up as the drop target.
+@property (nonatomic, assign) BOOL dropTarget;
+@property (nonatomic, copy) NSString* tabURL;
+// Page title for the hover card and accessibility. Not a native toolTip:
+// the glass hover card replaces the system tooltip, and setting both would
+// show two overlapping popups.
+@property (nonatomic, copy) NSString* pageTitle;
+// <meta name=description> content fetched via DevTools for the hover card;
+// nil until fetched (empty string = fetched, page has none). Cleared whenever
+// tabURL changes.
+@property (nonatomic, copy) NSString* pageDescription;
+@property (nonatomic, weak) id target;
+@property (nonatomic, assign) SEL selectAction;
+@property (nonatomic, assign) SEL closeAction;
+// Setting kicks off an async fetch into faviconView; the URL is retained so
+// a closing tab's favicon can follow it into the recently-closed list.
+@property (nonatomic, copy) NSString* faviconURL;
+- (void)setLoading:(BOOL)loading;
+- (void)setTabURL:(NSString*)url;
+- (void)attachAddressField:(NSTextField*)field;
+@end
+
 #pragma mark - BroToolbar
 
 @interface BroToolbar : NSView <NSTextFieldDelegate>
@@ -96,6 +222,12 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 - (void)setViewportMode:(BOOL)mobile;
 - (void)updateURL:(NSString*)url;
 - (void)focusAddressField;
+// Menu-action forwarders; called on g_toolbar from BroWindow/BroAppDelegate
+// and the UI-update bridge functions.
+- (void)goBack:(id)sender;
+- (void)goForward:(id)sender;
+- (void)refresh:(id)sender;
+- (void)updateNavigationState:(BOOL)canGoBack canGoForward:(BOOL)canGoForward;
 @end
 
 #endif  // BRO_MAC_INTERNAL_H_

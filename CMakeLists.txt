@@ -64,6 +64,7 @@ set(BRO_SRCS
     src/bro_handler_mac.mm
     src/bro_mac.mm
     src/bro_mac_internal.h
+    src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm
     src/radix_icons.h

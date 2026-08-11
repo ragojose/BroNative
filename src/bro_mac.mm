@@ -26,52 +26,12 @@
 @class BroTabBar;
 @class BroTabView;
 
-// Constants
-static const CGFloat kToolbarHeight = 52.0;
-static const CGFloat kButtonSize = 28.0;
-static const CGFloat kButtonSpacing = 4.0;
-// Wide enough that the "Enter URL or search" placeholder reads in full.
-static const CGFloat kTabPillMaxWidth = 180.0;
-static const CGFloat kTabPillMinWidth = 110.0;
-// In narrow windows (mobile shell) pills may shrink below the comfortable
-// minimum rather than overlap the controls to the right of the strip.
-// Below kTabPillTextMinWidth there is no room for readable text beside the
-// favicon, so pills collapse to squares — favicon only, as wide as they are
-// tall — and the active pill alone opens back up so its URL stays typable.
-static const CGFloat kTabPillTextMinWidth = 64.0;
-// Pills narrower than this drop their close button so it doesn't crowd the
-// favicon and title.
-static const CGFloat kTabPillCloseMinWidth = 80.0;
-static const CGFloat kTabPillHeight = 28.0;
-// A collapsed pill is exactly square.
-static const CGFloat kTabPillSquareWidth = kTabPillHeight;
-// The "+" button is half the pill's size, centered on the same midline.
-static const CGFloat kAddTabButtonSize = kTabPillHeight / 2.0;
-static const CGFloat kPillCornerRadius = 8.0;
-static const CGFloat kTrafficLightInset = 100.0;
-static const CGFloat kMobileViewportWidth = 390.0;
-static const CGFloat kMobileViewportHeight = 844.0;  // matches CDP metrics
-// Shell width while the window hugs the mobile viewport: the 390pt column
-// plus bezels wide enough that the chrome row (~496pt minimum with the
-// downloads button) still fits.
-static const CGFloat kMobileShellWidth = 512.0;
-static const NSTimeInterval kViewportAnimDuration = 0.28;
-// kWindowBorderAlpha is declared in bro_mac_internal.h (shared with the
-// downloads popover and tab search panel).
+// Layout/timing constants shared across the split family (toolbar, tab
+// strip, hover card, tab search, downloads popover) are declared in
+// bro_mac_internal.h.
+// kWindowBorderAlpha is declared there too but keeps its single definition
+// here (the rest are compile-time constants safe to duplicate per file).
 const CGFloat kWindowBorderAlpha = 0.12;
-static const CGFloat kWindowCornerRadiusFallback = 12.0;
-// Tab hover card: dwell time on a pill before the card appears (its width
-// tracks the hovered pill's). The grace period keeps the card up after the
-// mouse leaves the pill so it can travel onto the card's action buttons.
-static const NSTimeInterval kHoverCardDelay = 1.0;
-static const NSTimeInterval kHoverCardHideGrace = 0.3;
-static const CGFloat kHoverCardButtonSize = 24.0;
-// Hover/press icon feedback: the whole button scales about its center,
-// animated by the shared 0.15s ease-out layer actions. Kept subtle so the
-// chrome stays calm; skipped entirely under Reduce Motion.
-static const CGFloat kIconHoverScale = 1.07;
-static const CGFloat kIconPressScale = 0.95;
-static const NSTimeInterval kCloseButtonFadeDuration = 0.15;
 
 // BroUIFont/BroUIFontBold are declared in bro_mac_internal.h.
 NSFont* BroUIFont(CGFloat size) {
@@ -93,8 +53,8 @@ static NSColor* BroControlBorderColor(void) {
 
 // Global references
 static BroWindow* g_main_window = nil;
-// g_toolbar is declared extern in bro_mac_internal.h.
-BroToolbar* g_toolbar = nil;
+// g_toolbar is declared extern in bro_mac_internal.h; defined in
+// bro_toolbar.mm.
 static BroTabBar* g_tab_bar = nil;
 
 // Map browser IDs to their container views
@@ -166,21 +126,12 @@ static void BroDismissTransientOverlays(void) {
 // BroBrowserContainerView is declared extern in bro_mac_internal.h;
 // implemented after BroWindow below.
 
-// Implemented with the closed-tab-history helpers; declared here for the tab
-// strip's hover card.
-static BOOL BroURLIsBlank(NSString* url);
-
 // Reframes every per-tab container for its own viewport mode (mobile
 // emulation is per-tab).
 static void UpdateChromeLayout(void);
 
-// Animates the window between its desktop frame and a shell that hugs the
-// mobile viewport, tracking the active tab's viewport mode.
-static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate);
-// Variant that runs |completion| once the layout change has settled (every
-// path, including early returns, invokes it exactly once).
-static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
-                                        void (^completion)(void));
+// UpdateWindowForViewportMode (both overloads) and BroURLIsBlank are
+// declared extern in bro_mac_internal.h.
 
 // Desktop frame to restore when leaving mobile layout; NSZeroRect = none
 // saved. Saved only when empty and cleared only when a desktop restore
@@ -208,18 +159,13 @@ static BOOL TabIsMobile(int browser_id) {
 // accessibility label, and the window title AppKit shows in the Window menu.
 static NSString* const kBroBlankTabTitle = @"New Tab";
 
-// Blank pages (and browsers with no committed URL yet) keep their opaque CEF
-// view hidden so the black window backdrop shows through as the new-tab
-// state, and never show the raw "about:blank" in the chrome.
-static BOOL BroURLIsBlank(NSString* url) {
+// BroURLIsBlank is declared extern in bro_mac_internal.h.
+BOOL BroURLIsBlank(NSString* url) {
   return url.length == 0 || [url isEqualToString:@"about:blank"];
 }
 
-// Display-only host for a URL: the host with any leading "www." removed.
-// Falls back to the raw string when the URL has no parseable host. Never used
-// for navigation; BroToolbar.fullURL / BroTabView.tabURL keep the canonical
-// URL.
-static NSString* BroDisplayHostForURL(NSString* urlString) {
+// BroDisplayHostForURL is declared extern in bro_mac_internal.h.
+NSString* BroDisplayHostForURL(NSString* urlString) {
   NSString* host = [NSURL URLWithString:urlString ?: @""].host;
   if (host.length == 0) {
     return urlString ?: @"";
@@ -441,418 +387,6 @@ static CATransform3D BroCenteredScale(NSView* view, CGFloat scale) {
     return;
   }
   [super keyDown:event];
-}
-
-@end
-
-#pragma mark - BroToolbar
-
-// NSTextField subclass that tells the toolbar when it gains focus, so the
-// pill can swap from host-only display to the full editable URL.
-@interface BroAddressField : NSTextField
-@end
-
-// Declared ahead of BroToolbar so the toolbar can flip the host pill's
-// editingAddress flag when the address field gains/loses its editor.
-@interface BroTabView : NSView
-@property (nonatomic, assign) int browserId;
-@property (nonatomic, strong) NSImageView* faviconView;
-@property (nonatomic, strong) NSProgressIndicator* loadingSpinner;
-@property (nonatomic, strong) NSTextField* titleLabel;
-@property (nonatomic, strong) NSButton* closeButton;
-@property (nonatomic, assign) BOOL isActive;
-@property (nonatomic, assign) BOOL isLoading;
-// NO on a lone tab: closing it would close the window, so the pill hides ✕.
-@property (nonatomic, assign) BOOL closable;
-// YES while the hosted address field is being edited; keeps the focused
-// border through hover/layout appearance refreshes.
-@property (nonatomic, assign) BOOL editingAddress;
-// YES once the pill is too narrow for text: favicon only, centered.
-@property (nonatomic, assign) BOOL iconOnly;
-// Pinned pills sit as favicon-only squares at the left edge of the strip and
-// hide their ✕ (Cmd+W still closes them). The active pinned pill expands so
-// the hosted address field stays usable.
-@property (nonatomic, assign) BOOL pinned;
-// YES while this tab is the split screen's right pane; inactive pills get the
-// active-ish border so both halves read as "on screen".
-@property (nonatomic, assign) BOOL isSplitPane;
-// While split, the two pane pills sit adjacent and read as one joined control
-// (mirroring the panes below): 1 = left half of the pair (right corners
-// squared), 2 = right half (left corners squared), 0 = normal lone pill.
-@property (nonatomic, assign) NSInteger joinedSide;
-// YES while a dragged pill hovers this one (drop would split the two tabs);
-// the pill lights up as the drop target.
-@property (nonatomic, assign) BOOL dropTarget;
-@property (nonatomic, copy) NSString* tabURL;
-// Page title for the hover card and accessibility. Not a native toolTip:
-// the glass hover card replaces the system tooltip, and setting both would
-// show two overlapping popups.
-@property (nonatomic, copy) NSString* pageTitle;
-// <meta name=description> content fetched via DevTools for the hover card;
-// nil until fetched (empty string = fetched, page has none). Cleared whenever
-// tabURL changes.
-@property (nonatomic, copy) NSString* pageDescription;
-@property (nonatomic, weak) id target;
-@property (nonatomic, assign) SEL selectAction;
-@property (nonatomic, assign) SEL closeAction;
-// Setting kicks off an async fetch into faviconView; the URL is retained so
-// a closing tab's favicon can follow it into the recently-closed list.
-@property (nonatomic, copy) NSString* faviconURL;
-- (void)setLoading:(BOOL)loading;
-- (void)setTabURL:(NSString*)url;
-- (void)attachAddressField:(NSTextField*)field;
-@end
-
-// BroToolbar's @interface is declared in bro_mac_internal.h (shared with
-// bro_downloads.mm, which reads .downloadsButton).
-
-@implementation BroAddressField
-
-// While idle the field is click-through: the pill underneath owns the mouse,
-// so the active tab can be dragged to reorder from anywhere on its surface,
-// and a plain click focuses the field on mouse-up (selecting the whole URL,
-// like other browsers). Once editing starts, the field editor takes over and
-// the mouse behaves like a normal text field.
-- (NSView*)hitTest:(NSPoint)point {
-  if (!self.currentEditor) {
-    return nil;
-  }
-  return [super hitTest:point];
-}
-
-- (BOOL)becomeFirstResponder {
-  BOOL ok = [super becomeFirstResponder];
-  if (ok && [self.delegate isKindOfClass:[BroToolbar class]]) {
-    [(BroToolbar*)self.delegate addressFieldDidFocus];
-  }
-  return ok;
-}
-
-@end
-
-@implementation BroToolbar
-
-- (instancetype)initWithFrame:(NSRect)frame {
-  self = [super initWithFrame:frame];
-  if (self) {
-    self.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-
-    // Performance: Enable layer-backing for GPU compositing
-    self.wantsLayer = YES;
-    self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
-
-    _fullURL = @"";
-
-    // Navigation buttons, inline with the traffic lights.
-    CGFloat x = kTrafficLightInset;
-    CGFloat y = (frame.size.height - kButtonSize) / 2.0;
-
-    _backButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                         icon:RadixIconArrowLeft
-                                       action:@selector(goBack:)
-                                        label:@"Back"];
-    _backButton.toolTip = @"Back (⌘[)";
-    [self addSubview:_backButton];
-    x += kButtonSize + kButtonSpacing;
-
-    _forwardButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                            icon:RadixIconArrowRight
-                                          action:@selector(goForward:)
-                                           label:@"Forward"];
-    _forwardButton.toolTip = @"Forward (⌘])";
-    [self addSubview:_forwardButton];
-    x += kButtonSize + kButtonSpacing;
-
-    _refreshButton = [self createButtonWithFrame:NSMakeRect(x, y, kButtonSize, kButtonSize)
-                                            icon:RadixIconReload
-                                          action:@selector(refresh:)
-                                           label:@"Reload page"];
-    _refreshButton.toolTip = @"Reload page (⌘R)";
-    [self addSubview:_refreshButton];
-
-    // The editable address field lives inside the ACTIVE tab pill (the tab
-    // strip re-parents it on tab switches); created here without a superview.
-    _addressField = [[BroAddressField alloc] initWithFrame:NSMakeRect(0, 0, 100, 18)];
-    _addressField.font = BroUIFont(12.0);
-    _addressField.bezeled = NO;
-    _addressField.bordered = NO;
-    _addressField.drawsBackground = NO;
-    _addressField.focusRingType = NSFocusRingTypeNone;
-    _addressField.textColor = [NSColor labelColor];
-    _addressField.placeholderString = @"Enter URL or search";
-    _addressField.delegate = self;
-    _addressField.cell.scrollable = YES;
-    _addressField.cell.usesSingleLineMode = YES;
-    // Long URLs/hosts show an ellipsis at rest; the field editor still
-    // scrolls while typing.
-    _addressField.cell.lineBreakMode = NSLineBreakByTruncatingTail;
-    _addressField.cell.truncatesLastVisibleLine = YES;
-    _addressField.accessibilityLabel = @"Address and search bar";
-
-    // Viewport mode toggles pinned to the right edge. Exposed as a radio
-    // group: exactly one of desktop/mobile is selected at a time.
-    CGFloat rightX = frame.size.width - 12.0 - kButtonSize;
-    _mobileButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
-                                           icon:RadixIconMobile
-                                         action:@selector(selectMobileMode:)
-                                          label:@"Mobile viewport"];
-    _mobileButton.autoresizingMask = NSViewMinXMargin;
-    [_mobileButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
-    [self addSubview:_mobileButton];
-    rightX -= kButtonSize + kButtonSpacing;
-    _desktopButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
-                                            icon:RadixIconDesktop
-                                          action:@selector(selectDesktopMode:)
-                                           label:@"Desktop viewport"];
-    _desktopButton.autoresizingMask = NSViewMinXMargin;
-    [_desktopButton setAccessibilityRole:NSAccessibilityRadioButtonRole];
-    [self addSubview:_desktopButton];
-    // Downloads sits left of the viewport radio group, set off by a wider
-    // gap so it doesn't read as a third mode.
-    rightX -= kButtonSize + kButtonSpacing + 8.0;
-    _downloadsButton = [self createButtonWithFrame:NSMakeRect(rightX, y, kButtonSize, kButtonSize)
-                                              icon:RadixIconDownload
-                                            action:@selector(toggleDownloads:)
-                                             label:@"Downloads"];
-    _downloadsButton.autoresizingMask = NSViewMinXMargin;
-    [self addSubview:_downloadsButton];
-    // The selected toggle is disabled but must keep its bright tint, so don't
-    // let AppKit dim the icon.
-    ((NSButtonCell*)_mobileButton.cell).imageDimsWhenDisabled = NO;
-    ((NSButtonCell*)_desktopButton.cell).imageDimsWhenDisabled = NO;
-    [self setViewportMode:NO];
-
-    // Initial button states
-    _backButton.enabled = NO;
-    _forwardButton.enabled = NO;
-  }
-  return self;
-}
-
-- (BroHoverButton*)createButtonWithFrame:(NSRect)frame
-                                    icon:(RadixIcon)icon
-                                  action:(SEL)action
-                                   label:(NSString*)label {
-  BroHoverButton* button = [[BroHoverButton alloc] initWithFrame:frame];
-  button.bezelStyle = NSBezelStyleTexturedRounded;
-  button.bordered = NO;
-  button.title = @"";
-  button.image = RadixIconImage(icon, 15);
-  button.imagePosition = NSImageOnly;
-  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
-  button.target = self;
-  button.action = action;
-  button.accessibilityLabel = label;
-  button.toolTip = label;
-  return button;
-}
-
-#pragma mark - Navigation Actions
-
-- (void)goBack:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser && browser->CanGoBack()) {
-      browser->GoBack();
-    }
-  }
-}
-
-- (void)goForward:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser && browser->CanGoForward()) {
-      browser->GoForward();
-    }
-  }
-}
-
-- (void)refresh:(id)sender {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser) {
-      browser->Reload();
-    }
-  }
-}
-
-- (void)navigateToURL:(NSString*)urlString {
-  urlString = [urlString stringByTrimmingCharactersInSet:
-      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-  if (urlString.length == 0) return;
-
-  NSString* lower = urlString.lowercaseString;
-  NSString* target = nil;
-
-  if ([urlString containsString:@"://"]) {
-    // Only navigate to safe schemes; anything else (javascript:, data:, ...)
-    // falls through to search.
-    if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"] ||
-        [lower hasPrefix:@"file://"]) {
-      target = urlString;
-    }
-  } else if ([lower hasPrefix:@"about:"]) {
-    target = urlString;
-  } else if ([urlString containsString:@"."] && ![urlString containsString:@" "]) {
-    target = [@"https://" stringByAppendingString:urlString];
-  }
-
-  if (!target) {
-    // Treat as search query. Encode everything outside the unreserved set so
-    // characters like & and + can't alter the query string.
-    NSMutableCharacterSet* allowed = [NSMutableCharacterSet alphanumericCharacterSet];
-    [allowed addCharactersInString:@"-._~"];
-    NSString* encoded = [urlString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-    target = [NSString stringWithFormat:@"https://www.google.com/search?q=%@", encoded ?: @""];
-  }
-
-  BroHandler* handler = BroHandler::GetInstance();
-  if (handler) {
-    CefRefPtr<CefBrowser> browser = handler->GetBrowser();
-    if (browser) {
-      // Show the destination immediately; OnAddressChange confirms it later.
-      self.fullURL = target;
-      browser->GetMainFrame()->LoadURL([target UTF8String]);
-    }
-  }
-}
-
-#pragma mark - Toolbar Actions
-
-- (void)toggleDownloads:(id)sender {
-  BroToggleDownloadsPopover();
-}
-
-- (void)selectMobileMode:(id)sender {
-  [self applyViewportMode:YES];
-}
-
-- (void)selectDesktopMode:(id)sender {
-  [self applyViewportMode:NO];
-}
-
-// Applies the viewport mode to the ACTIVE tab only.
-- (void)applyViewportMode:(BOOL)mobile {
-  BroHandler* handler = BroHandler::GetInstance();
-  if (!handler) {
-    return;
-  }
-  int activeId = handler->GetActiveBrowserId();
-  if (activeId < 0 || handler->IsTabMobile(activeId) == (bool)mobile) {
-    return;
-  }
-  handler->SetTabMobileEmulation(activeId, mobile);  // CDP overrides only
-  [self setViewportMode:mobile];
-  // Reload (needed for the user agent override to take effect) only after the
-  // animation settles, so the page load doesn't stutter the transition. A
-  // superseded animation drops its completion, coalescing rapid toggles into
-  // a single reload with the final state.
-  UpdateWindowForViewportMode(mobile, YES, ^{
-    BroHandler* h = BroHandler::GetInstance();
-    if (h) {
-      h->ReloadTab(activeId);
-    }
-  });
-}
-
-- (void)setViewportMode:(BOOL)mobile {
-  NSColor* active = [NSColor whiteColor];
-  NSColor* inactive = [NSColor colorWithWhite:1.0 alpha:0.35];
-  _desktopButton.contentTintColor = mobile ? inactive : active;
-  _mobileButton.contentTintColor = mobile ? active : inactive;
-  _desktopButton.selectedState = !mobile;
-  _mobileButton.selectedState = mobile;
-
-  // The mode already in effect is inert: no hover, no click, no tab stop.
-  BroHoverButton* selected = mobile ? _mobileButton : _desktopButton;
-  BroHoverButton* other = mobile ? _desktopButton : _mobileButton;
-  selected.enabled = NO;
-  other.enabled = YES;
-  if (self.window.firstResponder == selected) {
-    [self.window makeFirstResponder:other];
-  }
-}
-
-#pragma mark - NSTextFieldDelegate
-
-- (void)addressFieldDidFocus {
-  // Show the full URL for editing; the host pill shows the focused look
-  // (gray hairline border, pure white text) from click-in through typing.
-  if (_fullURL.length > 0) {
-    _addressField.stringValue = _fullURL;
-  }
-  if ([_addressField.superview isKindOfClass:[BroTabView class]]) {
-    ((BroTabView*)_addressField.superview).editingAddress = YES;
-  }
-  _addressField.textColor = [NSColor whiteColor];
-  dispatch_async(dispatch_get_main_queue(), ^{
-    NSTextView* editor = (NSTextView*)[self.addressField currentEditor];
-    if ([editor isKindOfClass:[NSTextView class]]) {
-      editor.insertionPointColor = [NSColor whiteColor];
-      editor.textColor = [NSColor whiteColor];
-      editor.drawsBackground = NO;
-      // Selection inverts against the dark chrome: a white highlight with
-      // near-black glyphs, instead of the system's blue-on-white.
-      editor.selectedTextAttributes = @{
-        NSBackgroundColorAttributeName : [NSColor whiteColor],
-        NSForegroundColorAttributeName :
-            [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0],
-      };
-      [editor selectAll:nil];
-    }
-  });
-}
-
-- (void)controlTextDidEndEditing:(NSNotification*)notification {
-  NSTextField* textField = notification.object;
-  if (textField == _addressField) {
-    NSNumber* reason = notification.userInfo[@"NSTextMovement"];
-    if (reason && reason.integerValue == NSReturnTextMovement) {
-      [self navigateToURL:_addressField.stringValue];
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [self.window makeFirstResponder:nil];
-      });
-    }
-    if ([_addressField.superview isKindOfClass:[BroTabView class]]) {
-      ((BroTabView*)_addressField.superview).editingAddress = NO;
-    }
-    _addressField.textColor = [NSColor labelColor];
-    [self displayCompactURL];
-  }
-}
-
-- (void)focusAddressField {
-  if (_addressField.superview) {
-    [self.window makeFirstResponder:_addressField];
-  }
-}
-
-#pragma mark - State Updates
-
-- (void)updateNavigationState:(BOOL)canGoBack canGoForward:(BOOL)canGoForward {
-  _backButton.enabled = canGoBack;
-  _forwardButton.enabled = canGoForward;
-}
-
-- (void)updateURL:(NSString*)url {
-  // Blank pages keep the field empty rather than showing "about:blank".
-  if (BroURLIsBlank(url)) {
-    url = @"";
-  }
-  self.fullURL = url ?: @"";
-  // Don't clobber text the user is currently typing.
-  if ([_addressField currentEditor]) {
-    return;
-  }
-  [self displayCompactURL];
-}
-
-// Shows just the host (like the mockup); the full URL appears on focus.
-- (void)displayCompactURL {
-  _addressField.stringValue = BroDisplayHostForURL(_fullURL);
 }
 
 @end
@@ -3583,12 +3117,13 @@ static void UpdateChromeLayout(void) {
 
 // Resizes the shell to hug the mobile viewport (or back to the saved desktop
 // frame), animating the window and the active tab's container as one motion.
-static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
+// Declared extern in bro_mac_internal.h.
+void UpdateWindowForViewportMode(BOOL mobile, BOOL animate) {
   UpdateWindowForViewportMode(mobile, animate, nil);
 }
 
-static void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
-                                        void (^completion)(void)) {
+void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
+                                 void (^completion)(void)) {
   if (!g_main_window) {
     if (completion) {
       completion();
