@@ -31,12 +31,20 @@ void BroApp::OnBeforeCommandLineProcessing(
   command_line->AppendSwitch("ignore-gpu-blocklist");
 
   // Chrome's Reading Mode ships in CEF without the profile plumbing it
-  // expects: its ReadAnythingSoftNavigationObserver dereferences a null
-  // coordinator the moment any page performs a soft navigation (History API /
-  // same-document), taking the whole browser process down. Symbolicated from
-  // a field crash on wakawaka.world, 2026-08-11 (build 85). Disabling the
-  // feature removes the observer; merge with any existing list rather than
-  // clobbering the features CEF disables on its own.
+  // expects: its page-load-metrics observer dereferences a null side-panel
+  // coordinator on ordinary page loads and soft navigations, taking the whole
+  // browser process down. Field crashes on wakawaka.world (build 85) and
+  // basement.studio (build 88).
+  //
+  // The gate is ImmersiveReadAnything, which is enabled by default. An earlier
+  // attempt disabled "ReadAnything", which is not a base::Feature at all in CEF
+  // 151 -- verified by scanning every feature struct in the shipped framework;
+  // the only "ReadAnything" string there is a SidePanelEntry::Id name. Chromium
+  // ignores unknown names in disable-features, so that switch was a no-op. If
+  // this name ever needs changing, verify it against the CEF binary first.
+  //
+  // Merge with any existing list rather than clobbering the features CEF
+  // disables on its own.
   const char kDisableFeatures[] = "disable-features";
   std::string disabled =
       command_line->HasSwitch(kDisableFeatures)
@@ -45,7 +53,7 @@ void BroApp::OnBeforeCommandLineProcessing(
   if (!disabled.empty()) {
     disabled += ",";
   }
-  disabled += "ReadAnything";
+  disabled += "ImmersiveReadAnything";
   command_line->AppendSwitchWithValue(kDisableFeatures, disabled);
 }
 

@@ -1610,8 +1610,29 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   g_main_window.delegate = self;
   g_main_window.title = @"Bro Computer";
 
-  // Show the window
+  // Order the window while transparent so the behind-window material can
+  // attach and AppKit can commit the complete shell before any pixels become
+  // visible. Cold launches from a DMG otherwise expose the window server's
+  // black initial backing store for a frame before the glass surface resolves.
+  g_main_window.alphaValue = 0.0;
   [g_main_window makeKeyAndOrderFront:nil];
+  [g_main_window.contentView layoutSubtreeIfNeeded];
+  [g_main_window displayIfNeeded];
+  [CATransaction flush];
+
+  // Reveal without animation on the next main-queue turn, after the initial
+  // layer transaction has been submitted. Keep this independent of CEF's
+  // asynchronous browser creation so a slow or failed browser startup cannot
+  // leave the native window invisible.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (!g_main_window) {
+      return;
+    }
+    [g_main_window.contentView layoutSubtreeIfNeeded];
+    [g_main_window displayIfNeeded];
+    [CATransaction flush];
+    g_main_window.alphaValue = 1.0;
+  });
 
   // Create the CEF browser in our window
   [self performSelectorOnMainThread:@selector(createBrowserInWindow)
@@ -2528,6 +2549,23 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
     [g_blank_tab_ids addObject:@(browser_id)];
   }
 
+  // A tab opened while a mobile-emulated tab is active inherits that mode.
+  // The shell hugs the mobile viewport for as long as such a tab is active,
+  // so a desktop-mode new tab would snap the window back to the desktop frame
+  // and re-lay the chrome on every ⌘T / + click. The outgoing tab is still
+  // the active one here: OnAfterCreated promotes this browser only after
+  // adoption returns. Applied before the tab bar work below so the toolbar's
+  // viewport toggles (updated from setActiveTab:) show the inherited mode.
+  // The DevTools overrides themselves land a turn later -- see
+  // AdoptTabMobileEmulation; issuing them from inside OnAfterCreated crashes.
+  BroHandler* creating_handler = BroHandler::GetInstance();
+  int outgoing_id =
+      creating_handler ? creating_handler->GetActiveBrowserId() : -1;
+  if (creating_handler && outgoing_id >= 0 && outgoing_id != browser_id &&
+      creating_handler->IsTabMobile(outgoing_id)) {
+    creating_handler->AdoptTabMobileEmulation(browser_id);
+  }
+
   // Add tab to tab bar
   if (g_tab_bar) {
     [g_tab_bar addTabWithBrowserId:browser_id title:kBroBlankTabTitle];
@@ -2538,8 +2576,11 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   UpdateTabContainerVisibility(browser_id);
 
   // A newly adopted tab becomes active without going through
-  // OnActiveTabChanged; the shell follows its viewport mode (desktop).
-  UpdateWindowForViewportMode(TabIsMobile(browser_id), YES);
+  // OnActiveTabChanged; the shell follows its viewport mode (inherited from
+  // the tab it replaced, above). While split the shell stays desktop-shaped,
+  // as it does on every other tab switch.
+  UpdateWindowForViewportMode(SplitActive() ? NO : TabIsMobile(browser_id),
+                              YES);
 
   if (shouldFocusAddress) {
     // Let adoption and layout finish before asking AppKit for its field

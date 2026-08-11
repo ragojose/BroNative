@@ -510,7 +510,11 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _addressField.bordered = NO;
     _addressField.drawsBackground = NO;
     _addressField.focusRingType = NSFocusRingTypeNone;
-    _addressField.textColor = [NSColor labelColor];
+    // The window-owned NSTextView is transparent, so a visible cell value
+    // would remain underneath it and draw every URL twice. The cell owns only
+    // the explicitly colored placeholder; live text is colored on the field
+    // editor in configureAddressFieldEditor:.
+    _addressField.textColor = [NSColor clearColor];
     _addressField.delegate = g_toolbar;
     _addressField.cell.scrollable = YES;
     _addressField.cell.usesSingleLineMode = YES;
@@ -969,21 +973,21 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (!_isActive) {
     [self performSelect];
   }
-  if ([self.superview isKindOfClass:[BroTabBar class]]) {
-    [(BroTabBar*)self.superview beginPotentialDragForTab:self withEvent:event];
+  if (_owningTabBar) {
+    [_owningTabBar beginPotentialDragForTab:self withEvent:event];
   }
 }
 
 - (void)mouseDragged:(NSEvent*)event {
-  if ([self.superview isKindOfClass:[BroTabBar class]]) {
-    [(BroTabBar*)self.superview dragTab:self withEvent:event];
+  if (_owningTabBar) {
+    [_owningTabBar dragTab:self withEvent:event];
   }
 }
 
 - (void)mouseUp:(NSEvent*)event {
   BOOL dragged = NO;
-  if ([self.superview isKindOfClass:[BroTabBar class]]) {
-    dragged = [(BroTabBar*)self.superview endDragForTab:self];
+  if (_owningTabBar) {
+    dragged = [_owningTabBar endDragForTab:self];
   }
   if (!dragged && wasActiveAtMouseDown_) {
     [self performSelect];
@@ -1016,16 +1020,16 @@ void BroFetchFaviconGuarded(NSString* urlString,
 - (void)mouseEntered:(NSEvent*)event {
   hovered_ = YES;
   [self updateAppearance];
-  if ([self.superview isKindOfClass:[BroTabBar class]]) {
-    [(BroTabBar*)self.superview tabHoverBegan:self];
+  if (_owningTabBar) {
+    [_owningTabBar tabHoverBegan:self];
   }
 }
 
 - (void)mouseExited:(NSEvent*)event {
   hovered_ = NO;
   [self updateAppearance];
-  if ([self.superview isKindOfClass:[BroTabBar class]]) {
-    [(BroTabBar*)self.superview tabHoverEnded:self];
+  if (_owningTabBar) {
+    [_owningTabBar tabHoverEnded:self];
   }
 }
 
@@ -1044,9 +1048,8 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (ok) {
     focused_ = YES;
     [self updateAppearance];
-    if (!BroCurrentEventIsPointerActivation() &&
-        [self.superview isKindOfClass:[BroTabBar class]]) {
-      [(BroTabBar*)self.superview tabFocusBegan:self];
+    if (!BroCurrentEventIsPointerActivation() && _owningTabBar) {
+      [_owningTabBar tabFocusBegan:self];
     }
   }
   return ok;
@@ -1057,8 +1060,8 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (ok) {
     focused_ = NO;
     [self updateAppearance];
-    if ([self.superview isKindOfClass:[BroTabBar class]]) {
-      [(BroTabBar*)self.superview tabFocusEnded:self];
+    if (_owningTabBar) {
+      [_owningTabBar tabFocusEnded:self];
     }
   }
   return ok;
@@ -1072,10 +1075,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
     return;
   }
   if (c == NSLeftArrowFunctionKey || c == NSRightArrowFunctionKey) {
-    if ([self.superview isKindOfClass:[BroTabBar class]]) {
-      [(BroTabBar*)self.superview
-          focusTabRelativeTo:self
-                      offset:(c == NSRightArrowFunctionKey ? 1 : -1)];
+    if (_owningTabBar) {
+      [_owningTabBar focusTabRelativeTo:self
+                                 offset:(c == NSRightArrowFunctionKey ? 1 : -1)];
       return;
     }
   }
@@ -1145,8 +1147,8 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 - (void)handleUnpin:(id)sender {
-  if (_pinned && [self.superview isKindOfClass:[BroTabBar class]]) {
-    [(BroTabBar*)self.superview togglePinForTab:self];
+  if (_pinned && _owningTabBar) {
+    [_owningTabBar togglePinForTab:self];
   }
 }
 
@@ -1334,7 +1336,40 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 #pragma mark - BroTabBar
 
+// Scrolls only the pill document. The fixed New Tab and Search Tabs controls
+// remain siblings in BroTabBar, so no amount of overflow can cover them.
+@interface BroHorizontalTabScrollView : NSScrollView
+@property (nonatomic, weak) BroTabBar* tabBar;
+@end
+
+@implementation BroHorizontalTabScrollView
+
+- (void)scrollWheel:(NSEvent*)event {
+  [_tabBar hideHoverCard];
+
+  // Precision devices provide deltaX directly. Traditional mouse wheels do
+  // not, so Shift+wheel maps their vertical delta onto the horizontal axis.
+  if ((event.modifierFlags & NSEventModifierFlagShift) != 0 &&
+      fabs(event.scrollingDeltaX) < fabs(event.scrollingDeltaY)) {
+    NSClipView* clip = self.contentView;
+    NSPoint origin = clip.bounds.origin;
+    CGFloat multiplier = event.hasPreciseScrollingDeltas ? 1.0 : 12.0;
+    origin.x -= event.scrollingDeltaY * multiplier;
+    CGFloat maxX = MAX(0.0, NSWidth(self.documentView.frame) -
+                                NSWidth(clip.bounds));
+    origin.x = MIN(MAX(0.0, origin.x), maxX);
+    [clip scrollToPoint:origin];
+    [self reflectScrolledClipView:clip];
+    return;
+  }
+  [super scrollWheel:event];
+}
+
+@end
+
 @implementation BroTabBar {
+  BroHorizontalTabScrollView* tabScrollView_;
+  NSView* tabContentView_;
   BroTabView* draggingTab_;
   BOOL dragging_;
   CGFloat dragStartX_;
@@ -1368,13 +1403,29 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     // Performance: Enable layer-backing for GPU compositing
     self.wantsLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawOnSetNeedsDisplay;
-    // Pills that still don't fit at their hard minimum width are clipped
-    // rather than drawn over the controls to the right of the strip.
     self.layer.masksToBounds = YES;
 
-    // Borderless "+" control, repositioned after the last pill. It keeps the
-    // compact hit area and icon size, but uses the same hover/press treatment
-    // as the rest of the toolbar icons.
+    // Only the pills scroll. The document is widened by applyTabLayout: when
+    // compact pills overflow, while the two controls below remain fixed.
+    tabScrollView_ = [[BroHorizontalTabScrollView alloc]
+        initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
+    tabScrollView_.tabBar = self;
+    tabScrollView_.drawsBackground = NO;
+    tabScrollView_.borderType = NSNoBorder;
+    tabScrollView_.hasHorizontalScroller = NO;
+    tabScrollView_.hasVerticalScroller = NO;
+    tabScrollView_.horizontalScrollElasticity = NSScrollElasticityAutomatic;
+    tabScrollView_.verticalScrollElasticity = NSScrollElasticityNone;
+    tabScrollView_.automaticallyAdjustsContentInsets = NO;
+    tabScrollView_.contentView.drawsBackground = NO;
+    tabContentView_ =
+        [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
+    tabContentView_.wantsLayer = YES;
+    tabScrollView_.documentView = tabContentView_;
+    [self addSubview:tabScrollView_];
+
+    // Borderless "+" control, pinned between the scroll viewport and Search.
+    // It keeps the compact hit area and icon size used by the original strip.
     CGFloat addY = (frame.size.height - kAddTabButtonSize) / 2.0;
     _addTabButton = [[BroHoverButton alloc]
         initWithFrame:NSMakeRect(0, addY, kAddTabButtonSize, kAddTabButtonSize)];
@@ -1392,9 +1443,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
                            modifierMask:NSEventModifierFlagCommand];
     [self addSubview:_addTabButton];
 
-    // Palette search button, pinned at the strip's right edge (the "+"
-    // button trails the last pill; this one never moves). Sized and styled
-    // like the toolbar buttons to its right — it reads as part of that
+    // Palette search button, pinned at the strip's right edge. Sized and
+    // styled like the toolbar buttons to its right — it reads as part of that
     // trailing cluster, and hides/reveals with the downloads button (the
     // toolbar owns the shared hover zone).
     _tabSearchButton = [[BroHoverButton alloc]
@@ -1414,6 +1464,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
                                            NSEventModifierFlagShift];
     _tabSearchButton.alphaValue = 0.0;
     [self addSubview:_tabSearchButton];
+
+    [self applyTabLayout:NO];
   }
   return self;
 }
@@ -1445,18 +1497,25 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   BroTabView* tab = [[BroTabView alloc]
       initWithFrame:NSMakeRect(0, pillY, kTabPillMaxWidth, kTabPillHeight)
           browserId:browserId];
+  tab.owningTabBar = self;
   tab.pageTitle = BroURLIsBlank(title) ? kBroBlankTabTitle : title;
   tab.target = self;
   tab.selectAction = @selector(tabSelected:);
   tab.closeAction = @selector(tabClosed:);
   [_tabs addObject:tab];
-  [self addSubview:tab];
+  [tabContentView_ addSubview:tab];
 
-  // The new pill starts at its final slot fully transparent and fades in
-  // while its neighbors and the "+" button slide over to make room.
-  CGFloat tabWidth = [self fittedTabWidth];
-  tab.frame = NSMakeRect((_tabs.count - 1) * (tabWidth + kTabGap), pillY,
-                         tabWidth, kTabPillHeight);
+  // The new pill starts at its final slot fully transparent and fades in while
+  // its neighbors slide over to make room.
+  NSArray<NSNumber*>* widths = [self tabWidths];
+  CGFloat tabX = 0.0;
+  for (NSUInteger i = 0; i + 1 < _tabs.count; i++) {
+    BroTabView* preceding = _tabs[i];
+    tabX += widths[i].doubleValue -
+            (preceding.joinedSide == 1 ? kSplitJoinedOverlap : -kTabGap);
+  }
+  CGFloat tabWidth = widths.lastObject.doubleValue;
+  tab.frame = NSMakeRect(tabX, pillY, tabWidth, kTabPillHeight);
   tab.alphaValue = 0.0;
   BroRunLayoutSpring(^{
     [self applyTabLayout:YES];
@@ -1487,7 +1546,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 - (void)beginPotentialDragForTab:(BroTabView*)tab withEvent:(NSEvent*)event {
   [self hideHoverCard];
-  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  NSPoint p = [tabContentView_ convertPoint:event.locationInWindow fromView:nil];
   draggingTab_ = tab;
   dragging_ = NO;
   dragStartX_ = p.x;
@@ -1498,7 +1557,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (tab != draggingTab_) {
     return;
   }
-  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  NSPoint p = [tabContentView_ convertPoint:event.locationInWindow fromView:nil];
   if (!dragging_) {
     // A few points of slop separates a click from a drag.
     if (fabs(p.x - dragStartX_) < 4.0) {
@@ -1512,6 +1571,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     [self.window disableCursorRects];
     [[NSCursor closedHandCursor] push];
   }
+  // NSView's native edge autoscroll keeps distant slots reachable without a
+  // separate timer. Convert again after it runs because the document origin
+  // may have changed.
+  [tabContentView_ autoscroll:event];
+  p = [tabContentView_ convertPoint:event.locationInWindow fromView:nil];
   // AppKit still resets the cursor as the pointer crosses tracking areas, so
   // reassert it on every drag event.
   [[NSCursor closedHandCursor] set];
@@ -1636,6 +1700,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (next < 0 || next >= (NSInteger)_tabs.count) {
     return;
   }
+  [self scrollTabToVisible:_tabs[next]];
   [self.window makeFirstResponder:_tabs[next]];
 }
 
@@ -1774,6 +1839,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
       [self applyTabLayout:YES];
     }, nil);
   }
+  [self revealActiveTab];
 }
 
 - (void)updateTabTitle:(int)browserId title:(NSString*)title {
@@ -1816,10 +1882,10 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 }
 
 - (CGFloat)availableStripWidth {
-  // The right edge reserves the trailing "+" button and the pinned search
-  // button (toolbar-button sized).
-  return self.frame.size.width - (kAddTabButtonSize + 8.0) -
-         (kButtonSize + 8.0);
+  // The right edge reserves the pinned "+" and Search Tabs controls. This is
+  // the visible width of the pill document, not its potentially wider content.
+  return MAX(0.0, NSWidth(self.bounds) - (kAddTabButtonSize + 8.0) -
+                      (kButtonSize + 8.0));
 }
 
 // Pinned pills are kept as a strict prefix of _tabs; every layout and drag
@@ -1852,9 +1918,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 // Strip width left for expandable pills once compact pinned tabs took theirs.
 - (CGFloat)expandableStripWidth {
-  return [self availableStripWidth] -
-         (CGFloat)[self compactPinnedCount] *
-             (kPinnedTabPillWidth + kTabGap);
+  return MAX(0.0, [self availableStripWidth] -
+                      (CGFloat)[self compactPinnedCount] *
+                          (kPinnedTabPillWidth + kTabGap));
 }
 
 // Fits expandable pills to the remaining strip width (minus the "+" button
@@ -1869,11 +1935,13 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   return MIN(MAX(fitWidth, kTabPillSquareWidth), kTabPillMaxWidth);
 }
 
-// YES once an even split would leave no room for text: pills become squares.
+// YES once equal pills would make the active URL narrower than its comfortable
+// minimum. In that state inactive pills become compact and the document may
+// scroll so the active pill never has to collapse.
 - (BOOL)isCollapsed {
   NSUInteger count =
       MAX(_tabs.count - [self compactPinnedCount], (NSUInteger)1);
-  return [self expandableStripWidth] / count - kTabGap < kTabPillTextMinWidth;
+  return [self expandableStripWidth] / count - kTabGap < kTabPillMinWidth;
 }
 
 // Width of one drag slot for `tab`. Pinned pills only travel their compact
@@ -1910,16 +1978,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
           (tab.pinned ? kPinnedTabPillWidth : kTabPillSquareWidth) + kTabGap;
     }
   }
-  CGFloat slack =
-      [self availableStripWidth] - fixedInactiveWidth - kTabGap;
-  // Open the active pill to the full pill width when the slack allows, so the
-  // URL has as much room to be typed as it would in a roomy strip. Below the
-  // comfortable minimum expanding buys nothing readable, so it stays square.
-  CGFloat compactActiveWidth =
-      activeTab.pinned ? kPinnedTabPillWidth : kTabPillSquareWidth;
-  CGFloat activeWidth = slack >= kTabPillMinWidth
-                            ? MIN(kTabPillMaxWidth, slack)
-                            : compactActiveWidth;
+  CGFloat slack = [self availableStripWidth] - fixedInactiveWidth - kTabGap;
+  // When slack runs out, overflow belongs to the scroll document—not to the
+  // active address pill. Keep it readable even with dozens of tabs.
+  CGFloat activeWidth =
+      MIN(kTabPillMaxWidth, MAX(kTabPillMinWidth, slack));
   for (BroTabView* tab in _tabs) {
     CGFloat compactWidth =
         tab.pinned ? kPinnedTabPillWidth : kTabPillSquareWidth;
@@ -1928,10 +1991,58 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   return widths;
 }
 
-// Positions pills and the "+" button. When `animated`, frames move through
-// the animator proxy, so this must run inside an NSAnimationContext group.
-- (void)applyTabLayout:(BOOL)animated {
-  CGFloat pillY = (self.frame.size.height - kTabPillHeight) / 2.0;
+// Keeps the current scroll offset inside the document after tabs close or the
+// window widens enough that overflow disappears.
+- (void)clampScrollOffset {
+  NSClipView* clip = tabScrollView_.contentView;
+  NSPoint origin = clip.bounds.origin;
+  CGFloat maxX = MAX(0.0, NSWidth(tabContentView_.frame) -
+                              NSWidth(clip.bounds));
+  origin.x = MIN(MAX(0.0, origin.x), maxX);
+  origin.y = 0.0;
+  [clip scrollToPoint:origin];
+  [tabScrollView_ reflectScrolledClipView:clip];
+}
+
+// Reveals only when needed, preserving the user's position when the complete
+// pill is already visible.
+- (void)scrollTabToVisible:(BroTabView*)tab {
+  if (!tab || ![_tabs containsObject:tab] || dragging_) {
+    return;
+  }
+  NSClipView* clip = tabScrollView_.contentView;
+  NSRect visible = clip.bounds;
+  NSRect target = NSInsetRect(tab.frame, -4.0, 0.0);
+  if (NSContainsRect(visible, target)) {
+    return;
+  }
+  CGFloat x = NSMinX(visible);
+  if (NSMinX(target) < NSMinX(visible)) {
+    x = NSMinX(target);
+  } else if (NSMaxX(target) > NSMaxX(visible)) {
+    x = NSMaxX(target) - NSWidth(visible);
+  }
+  CGFloat maxX = MAX(0.0, NSWidth(tabContentView_.frame) - NSWidth(visible));
+  NSPoint origin = NSMakePoint(MIN(MAX(0.0, x), maxX), 0.0);
+  [clip scrollToPoint:origin];
+  [tabScrollView_ reflectScrolledClipView:clip];
+}
+
+- (void)revealActiveTab {
+  [self scrollTabToVisible:[self tabWithBrowserId:_activeTabId]];
+}
+
+// Positions pills and sizes their scroll document. Pill frames and the
+// trailing "+" always move through the animator proxy: inside an animated
+// caller's group they spring to their slots, and inside applyTabLayout:'s
+// zero-duration group they land immediately AND cancel any spring still in
+// flight. The search button never participates.
+- (void)layOutTabsThroughAnimator {
+  CGFloat height = NSHeight(self.bounds);
+  CGFloat viewportWidth = [self availableStripWidth];
+  tabScrollView_.frame = NSMakeRect(0, 0, viewportWidth, height);
+
+  CGFloat pillY = (height - kTabPillHeight) / 2.0;
   NSArray<NSNumber*>* widths = [self tabWidths];
 
   CGFloat x = 0.0;
@@ -1947,10 +2058,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     NSRect target = NSMakeRect(x, pillY, tabWidth, kTabPillHeight);
     if (dragging_ && tab == draggingTab_) {
       // The dragged pill follows the mouse; its slot stays reserved.
-    } else if (animated) {
-      tab.animator.frame = target;
     } else {
-      tab.frame = target;
+      tab.animator.frame = target;
     }
     // The split pair overlaps by 1pt so the two borders coincide and the
     // pair reads as one continuous pill; every other neighbor keeps the
@@ -1958,21 +2067,45 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     x += tabWidth - (tab.joinedSide == 1 ? kSplitJoinedOverlap : -kTabGap);
   }
 
+  CGFloat documentWidth = MAX(viewportWidth, x);
+  tabContentView_.frame = NSMakeRect(0, 0, documentWidth, height);
+  [self clampScrollOffset];
+
+  // The "+" trails the last pill by one gap (`x` already carries it) so it
+  // reads as part of the strip. Once the pills overflow it stops advancing and
+  // parks at the viewport's clipped edge, where it stays put while scrolling.
   NSRect addTarget =
-      NSMakeRect(x, (self.frame.size.height - kAddTabButtonSize) / 2.0,
+      NSMakeRect(MIN(x, viewportWidth), (height - kAddTabButtonSize) / 2.0,
                  kAddTabButtonSize, kAddTabButtonSize);
-  if (animated) {
-    _addTabButton.animator.frame = addTarget;
-  } else {
-    _addTabButton.frame = addTarget;
-  }
+  _addTabButton.animator.frame = addTarget;
 
   // The search button never trails the pills; it stays pinned at the right
   // edge.
   _tabSearchButton.frame =
-      NSMakeRect(self.frame.size.width - kButtonSize,
-                 (self.frame.size.height - kButtonSize) / 2.0,
+      NSMakeRect(NSWidth(self.bounds) - kButtonSize,
+                 (height - kButtonSize) / 2.0,
                  kButtonSize, kButtonSize);
+
+  [self revealActiveTab];
+}
+
+// An unanimated layout must WIN over any spring still animating a pill --
+// otherwise the spring keeps ticking and lands that pill back on the target
+// it was given for the old strip width, overlapping its neighbors. (Seen when
+// activating a desktop tab from the mobile shell: the activation spring and
+// the window's resize-driven relayout ran together, and only the pills whose
+// slot happened not to move came out right.) Assigning through the animator
+// inside a zero-duration group both sets the frame now and cancels the
+// in-flight animation; a plain `frame` set does not.
+- (void)applyTabLayout:(BOOL)animated {
+  if (animated) {
+    [self layOutTabsThroughAnimator];
+    return;
+  }
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
+    context.duration = 0.0;
+    [self layOutTabsThroughAnimator];
+  }];
 }
 
 - (void)layoutTabs {
@@ -2046,7 +2179,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
         BroTabBar* bar = weakSelf;
         BroTabView* hoveredTab = weakTab;
         if (!bar || timer != bar->hoverCardTimer_ || !hoveredTab ||
-            hoveredTab.superview != bar) {
+            ![bar.tabs containsObject:hoveredTab]) {
           return;
         }
         bar->hoverCardTimer_ = nil;
@@ -2111,6 +2244,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (hidingHoverCard_) {
     return;
   }
+  [self scrollTabToVisible:tab];
   [hoverCardTimer_ invalidate];
   hoverCardTimer_ = nil;
   [hoverCardHideTimer_ invalidate];
@@ -2155,7 +2289,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   BroOverlayHide(hoverCard_);
   hoverCardTabId_ = -1;
   [self.window recalculateKeyViewLoop];
-  if (cardHadFocus && sourceTab && sourceTab.superview == self) {
+  if (cardHadFocus && sourceTab && [_tabs containsObject:sourceTab]) {
     [self.window makeFirstResponder:sourceTab];
   }
   hidingHoverCard_ = NO;
@@ -2347,7 +2481,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 // to the container edges.
 - (void)positionHoverCardForTab:(BroTabView*)tab animated:(BOOL)animated {
   NSView* container = hoverCard_.superview;
-  if (!container || tab.superview != self) {
+  if (!container || ![_tabs containsObject:tab]) {
     return;
   }
   NSRect pill = [container convertRect:tab.bounds fromView:tab];

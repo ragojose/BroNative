@@ -99,6 +99,13 @@ class BroHandler : public CefClient,
     return mobile_tab_ids_.count(browser_id) > 0;
   }
 
+  // Marks a just-created tab as mobile so the shell can lay it out
+  // immediately, and applies the DevTools overrides on a later UI-thread
+  // turn. Used by the adoption path, which runs inside OnAfterCreated --
+  // ExecuteDevToolsMethod on a browser still inside its creation callback
+  // dereferences null in CEF 151 (SIGSEGV on CrBrowserMain).
+  void AdoptTabMobileEmulation(int browser_id);
+
   // Reload a tab. Used to apply a pending user agent override once the
   // viewport toggle animation has finished (the UA only takes effect on the
   // next navigation).
@@ -226,6 +233,10 @@ class BroHandler : public CefClient,
   void ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
                                bool mobile,
                                bool reload);
+
+  // Deferred half of AdoptTabMobileEmulation: applies the overrides unless the
+  // tab was closed or switched back to desktop in the meantime.
+  void ApplyPendingMobileEmulation(int browser_id);
 
   // True if using Alloy style (native windows)
   const bool is_alloy_style_;
