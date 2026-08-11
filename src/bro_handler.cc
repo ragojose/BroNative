@@ -329,22 +329,26 @@ bool BroHandler::DoClose(CefRefPtr<CefBrowser> browser) {
 
   int browser_id = browser->GetIdentifier();
 
-  // Individual tab close (tab X button, Cmd+W, window.close(), DevTools
-  // protocol): detach the tab's container view so CEF destroys the browser,
-  // without sending a close to the shared window (which would close every
-  // tab). The whole-window path is used when tearing everything down or for
-  // the last remaining browser.
-  if (!closing_all_ && browser_registry_.size() > 1 && HasTabView(browser_id)) {
-    DetachTabView(browser_id);
-    return true;
-  }
-
-  // Closing the main window requires special handling.
+  // The last browser closing means the app is going down; windowShouldClose
+  // consults this to let the window go.
   if (browser_registry_.size() == 1) {
     is_closing_ = true;
   }
 
-  // Allow the close.
+  // Every tab close — individual (tab X button, Cmd+W, window.close(),
+  // DevTools protocol) or teardown — detaches the tab's container view so
+  // CEF destroys the browser directly, never sending a close to the shared
+  // window (which would close every tab). This includes the LAST browser:
+  // as of CEF 151.3.16, returning false for a child-view browser no longer
+  // closes its host window, so routing the last close through the window
+  // stalled quit forever. When the final browser dies, OnBeforeClose quits
+  // the message loop and the process exits without a formal window close.
+  if (HasTabView(browser_id)) {
+    DetachTabView(browser_id);
+    return true;
+  }
+
+  // Non-tab browsers (e.g. DevTools windows) keep the default close path.
   return false;
 }
 

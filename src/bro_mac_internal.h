@@ -67,6 +67,15 @@ static const CGFloat kHoverCardButtonSize = 24.0;
 static const CGFloat kIconHoverScale = 1.07;
 static const CGFloat kIconPressScale = 0.95;
 static const NSTimeInterval kCloseButtonFadeDuration = 0.15;
+// Gap between tab pills in the strip.
+static const CGFloat kTabGap = 8.0;
+// A joined split pair overlaps by 1pt so the two 1pt borders coincide: the
+// pair reads as one continuous pill with a single interior hairline.
+static const CGFloat kSplitJoinedOverlap = 1.0;
+// Divider drag clamps: neither pane may shrink past this share / width.
+static const CGFloat kSplitRatioMin = 0.15;
+static const CGFloat kSplitRatioMax = 0.85;
+static const CGFloat kSplitPaneMinWidth = 120.0;
 
 // What a blank tab is called everywhere it surfaces: pill label, hover card,
 // accessibility label, and the window title AppKit shows in the Window menu.
@@ -277,6 +286,8 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 - (void)addTabWithBrowserId:(int)browserId title:(NSString*)title;
 - (void)removeTabWithBrowserId:(int)browserId;
 - (void)setActiveTab:(int)browserId;
+// The pill for a browser id, or nil if the tab is gone.
+- (BroTabView*)tabWithBrowserId:(int)browserId;
 - (void)updateTabTitle:(int)browserId title:(NSString*)title;
 - (void)updateTabURL:(int)browserId url:(NSString*)url;
 - (void)updateTabFavicon:(int)browserId faviconURL:(NSString*)url;

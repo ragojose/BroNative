@@ -20,6 +20,8 @@
 #import "radix_icons.h"
 #import "bro_mac_internal.h"
 #import "bro_closed_tabs.h"
+#import "bro_history.h"
+#import "bro_persist.h"
 
 // Forward declarations
 @class BroWindow;
@@ -84,6 +86,9 @@ static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil
 int g_split_browser_id = -1;
 // Fraction of the browser area the left pane owns; the divider drags it.
 static CGFloat g_split_ratio = 0.5;
+// The balance the last split ended with; re-splitting starts from it instead
+// of resetting to 50/50. Session-only.
+static CGFloat g_last_split_ratio = 0.5;
 
 // CreateNewBrowserTab(WithURL), ToggleTabSearchPanel, and HideTabSearchPanel
 // are declared extern in bro_mac_internal.h.
@@ -343,10 +348,10 @@ NSUInteger BroTabStripIndex(int browser_id) {
 // far enough from the edges that neither pane collapses.
 static CGFloat SplitDividerX(CGFloat totalWidth) {
   CGFloat x = floor(totalWidth * g_split_ratio);
-  if (totalWidth < 240.0) {
+  if (totalWidth < 2.0 * kSplitPaneMinWidth) {
     return floor(totalWidth / 2.0);
   }
-  return MAX(120.0, MIN(totalWidth - 120.0, x));
+  return MAX(kSplitPaneMinWidth, MIN(totalWidth - kSplitPaneMinWidth, x));
 }
 
 #pragma mark - BroSplitDivider
@@ -361,19 +366,22 @@ static BOOL g_split_divider_dragging = NO;
 @end
 
 @implementation BroSplitDivider {
+  NSView* line_;
   NSView* grip_;
+  BOOL hovered_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
   self = [super initWithFrame:frame];
   if (self) {
-    NSView* line = [[NSView alloc]
+    line_ = [[NSView alloc]
         initWithFrame:NSMakeRect((kSplitDividerGrabWidth - 1.0) / 2.0, 0, 1.0,
                                  frame.size.height)];
-    line.wantsLayer = YES;
-    line.layer.backgroundColor = BroControlBorderColor().CGColor;
-    line.autoresizingMask = NSViewHeightSizable;
-    [self addSubview:line];
+    line_.wantsLayer = YES;
+    line_.layer.backgroundColor = BroControlBorderColor().CGColor;
+    line_.layer.actions = BroLayerTransitionActions();
+    line_.autoresizingMask = NSViewHeightSizable;
+    [self addSubview:line_];
 
     // The grip: a small rounded bar centered on the line, the visual
     // affordance that the boundary is draggable.
@@ -384,10 +392,47 @@ static BOOL g_split_divider_dragging = NO;
     grip_.layer.cornerRadius = 2.0;
     grip_.layer.backgroundColor =
         [NSColor colorWithWhite:1.0 alpha:0.4].CGColor;
+    grip_.layer.actions = BroLayerTransitionActions();
     grip_.autoresizingMask = NSViewMinYMargin | NSViewMaxYMargin;
     [self addSubview:grip_];
+
+    // Hover feedback: the resting divider is a #111 hairline that all but
+    // vanishes against dark page content, so brighten it under the mouse to
+    // advertise the drag affordance.
+    [self addTrackingArea:[[NSTrackingArea alloc]
+                              initWithRect:NSZeroRect
+                                   options:NSTrackingMouseEnteredAndExited |
+                                           NSTrackingActiveInKeyWindow |
+                                           NSTrackingInVisibleRect
+                                     owner:self
+                                  userInfo:nil]];
+
+    self.accessibilityElement = YES;
+    self.accessibilityRole = NSAccessibilitySplitterRole;
+    self.accessibilityLabel = @"Split screen divider";
   }
   return self;
+}
+
+// Lit while hovered or mid-drag (the mouse can leave the 9pt strip during a
+// drag without ending it).
+- (void)updateHighlight {
+  BOOL lit = hovered_ || g_split_divider_dragging;
+  line_.layer.backgroundColor =
+      lit ? [NSColor colorWithWhite:1.0 alpha:0.25].CGColor
+          : BroControlBorderColor().CGColor;
+  grip_.layer.backgroundColor =
+      [NSColor colorWithWhite:1.0 alpha:lit ? 0.7 : 0.4].CGColor;
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+  hovered_ = YES;
+  [self updateHighlight];
+}
+
+- (void)mouseExited:(NSEvent*)event {
+  hovered_ = NO;
+  [self updateHighlight];
 }
 
 // The divider sits in the full-size-content title-bar-free window; without
@@ -401,7 +446,21 @@ static BOOL g_split_divider_dragging = NO;
 }
 
 - (void)mouseDown:(NSEvent*)event {
+  // Double-click re-centers the split; no drag follows, so skip the drag
+  // state and cursor push entirely.
+  if (event.clickCount == 2) {
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+      ctx.duration = 0.18;
+      ctx.timingFunction = [CAMediaTimingFunction
+          functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+      ctx.allowsImplicitAnimation = YES;
+      g_split_ratio = 0.5;
+      UpdateChromeLayout();
+    } completionHandler:nil];
+    return;
+  }
   g_split_divider_dragging = YES;
+  [self updateHighlight];
   [[NSCursor resizeLeftRightCursor] push];
 }
 
@@ -413,12 +472,13 @@ static BOOL g_split_divider_dragging = NO;
   }
   [[NSCursor resizeLeftRightCursor] set];
   NSPoint p = [parent convertPoint:event.locationInWindow fromView:nil];
-  g_split_ratio = MAX(0.15, MIN(0.85, p.x / width));
+  g_split_ratio = MAX(kSplitRatioMin, MIN(kSplitRatioMax, p.x / width));
   UpdateChromeLayout();
 }
 
 - (void)mouseUp:(NSEvent*)event {
   g_split_divider_dragging = NO;
+  [self updateHighlight];
   [NSCursor pop];
 }
 
@@ -527,6 +587,7 @@ void RefreshSplitPaneStyling(void) {
 // bro_mac_internal.h.
 void ClearSplit(void) {
   g_split_browser_id = -1;
+  g_last_split_ratio = g_split_ratio;
   g_split_ratio = 0.5;
   RefreshSplitPaneStyling();
 }
@@ -783,6 +844,7 @@ void ToggleSplitForTab(int browser_id) {
   } else if (browser_id != active_id &&
              g_browser_views[@(browser_id)] != nil) {
     g_split_browser_id = browser_id;
+    g_split_ratio = g_last_split_ratio;
   } else {
     return;
   }
@@ -958,7 +1020,44 @@ void CreateNewBrowserTab(void) {
 
 #pragma mark - BroAppDelegate
 
-@interface BroAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+// Quit-time capture for Reopen Closed Tab: snapshot every open tab into the
+// closed-tab list synchronously, before CloseAllBrowsers starts. The per-tab
+// OnTabClosed records can't be relied on here — they arrive via
+// dispatch_async and race window teardown — so OnTabClosed skips recording
+// while the handler reports a teardown and this snapshot stands alone.
+static void BroSnapshotOpenTabsForReopen(void) {
+  if (!g_tab_bar) {
+    return;
+  }
+  for (BroTabView* tab in g_tab_bar.tabs) {
+    if (tab.tabURL.length > 0 && !BroURLIsBlank(tab.tabURL)) {
+      BroRecordClosedTab(tab.tabURL, tab.pageTitle, tab.faviconURL);
+    }
+  }
+  // The quit paths are also the last chance to flush a debounced history
+  // write — the pending dispatch_after never fires once the loop stops.
+  BroHistorySaveNow();
+}
+
+// History menu: everything after the item with this tag is rebuilt from the
+// history store each time the menu opens.
+static const NSInteger kBroHistorySeparatorTag = 0xB40;
+static const NSUInteger kBroHistoryMenuMaxItems = 15;
+
+// Menu titles get a middle ellipsis so the distinguishing tail of long page
+// titles/URLs (the part that differs between similar pages) stays visible.
+static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
+  if (title.length <= maxLength) {
+    return title;
+  }
+  NSUInteger head = maxLength / 2;
+  NSUInteger tail = maxLength - head - 1;
+  return [NSString stringWithFormat:@"%@…%@", [title substringToIndex:head],
+                                    [title substringFromIndex:title.length - tail]];
+}
+
+@interface BroAppDelegate
+    : NSObject <NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate>
 - (void)createApplication:(id)object;
 - (void)tryToTerminateApplication:(NSApplication*)app;
 - (void)createBrowserInWindow;
@@ -1184,26 +1283,25 @@ void CreateNewBrowserTab(void) {
   devToolsF12.hidden = YES;  // Hide from menu but still active
   [viewMenu addItem:devToolsF12];
 
-  [viewMenu addItem:[NSMenuItem separatorItem]];
-  [viewMenu addItemWithTitle:@"WebAssembly Benchmark"
-                      action:@selector(openWasmBenchmark:)
-               keyEquivalent:@""];
-  [viewMenu addItemWithTitle:@"GPU Benchmark"
-                      action:@selector(openGpuBenchmark:)
-               keyEquivalent:@""];
-
   viewMenuItem.submenu = viewMenu;
   [mainMenu addItem:viewMenuItem];
 
-  // History menu
+  // History menu: Back/Forward stay fixed; everything after the tagged
+  // separator is rebuilt from the history store each time the menu opens
+  // (menuNeedsUpdate:).
   NSMenuItem* historyMenuItem = [[NSMenuItem alloc] init];
   NSMenu* historyMenu = [[NSMenu alloc] initWithTitle:@"History"];
+  historyMenu.delegate = self;
 
   NSMenuItem* backItem = [historyMenu addItemWithTitle:@"Back" action:@selector(goBack:) keyEquivalent:@"["];
   backItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
 
   NSMenuItem* forwardItem = [historyMenu addItemWithTitle:@"Forward" action:@selector(goForward:) keyEquivalent:@"]"];
   forwardItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+  NSMenuItem* recentsSeparator = [NSMenuItem separatorItem];
+  recentsSeparator.tag = kBroHistorySeparatorTag;
+  [historyMenu addItem:recentsSeparator];
 
   historyMenuItem.submenu = historyMenu;
   [mainMenu addItem:historyMenuItem];
@@ -1280,9 +1378,11 @@ void CreateNewBrowserTab(void) {
   [windowMenu addItemWithTitle:@"Pin Tab"
                         action:@selector(togglePinActiveTab:)
                  keyEquivalent:@""];
-  [windowMenu addItemWithTitle:@"Split Screen"
-                        action:@selector(toggleSplitScreen:)
-                 keyEquivalent:@""];
+  NSMenuItem* splitItem = [windowMenu addItemWithTitle:@"Split Screen"
+                                                action:@selector(toggleSplitScreen:)
+                                         keyEquivalent:@"s"];
+  splitItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
   NSMenuItem* tabSearchItem = [windowMenu addItemWithTitle:@"Search Tabs…"
                                                     action:@selector(showTabSearch:)
                                              keyEquivalent:@"a"];
@@ -1351,7 +1451,10 @@ void CreateNewBrowserTab(void) {
 
 - (void)tryToTerminateApplication:(NSApplication*)app {
   BroHandler* handler = BroHandler::GetInstance();
-  if (handler && !handler->IsClosing()) {
+  if (handler && !handler->IsClosing() && !handler->IsClosingAll()) {
+    // ⌘Q comes through here (BroApplication.terminate:), not
+    // windowShouldClose:, so the quit snapshot must happen in both paths.
+    BroSnapshotOpenTabsForReopen();
     handler->CloseAllBrowsers(false);
   }
 }
@@ -1387,6 +1490,81 @@ void CreateNewBrowserTab(void) {
   BroDismissTransientOverlays();
   if (g_toolbar) {
     [g_toolbar goForward:sender];
+  }
+}
+
+#pragma mark - History menu
+
+// Rebuilds the dynamic tail of the History menu (recents + Clear History…)
+// from the store each time the menu opens. Only the History menu sets this
+// delegate.
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+  NSInteger anchor = [menu indexOfItemWithTag:kBroHistorySeparatorTag];
+  if (anchor < 0) {
+    return;
+  }
+  while (menu.numberOfItems > anchor + 1) {
+    [menu removeItemAtIndex:menu.numberOfItems - 1];
+  }
+
+  NSArray<BroHistoryEntry*>* history = BroHistoryEntries();
+  if (history.count == 0) {
+    NSMenuItem* empty = [[NSMenuItem alloc] initWithTitle:@"No History"
+                                                   action:nil
+                                            keyEquivalent:@""];
+    empty.enabled = NO;
+    [menu addItem:empty];
+  } else {
+    NSUInteger added = 0;
+    for (BroHistoryEntry* entry in history.reverseObjectEnumerator) {
+      NSString* title = entry.title.length > 0
+                            ? entry.title
+                            : BroDisplayHostForURL(entry.url);
+      NSMenuItem* item =
+          [[NSMenuItem alloc] initWithTitle:BroTruncateMenuTitle(title, 50)
+                                     action:@selector(historyItemSelected:)
+                              keyEquivalent:@""];
+      item.representedObject = entry.url;
+      item.toolTip = entry.url;
+      [menu addItem:item];
+      if (++added >= kBroHistoryMenuMaxItems) {
+        break;
+      }
+    }
+  }
+
+  [menu addItem:[NSMenuItem separatorItem]];
+  [menu addItemWithTitle:@"Clear History…"
+                  action:@selector(clearHistory:)
+           keyEquivalent:@""];
+}
+
+// Loads in the current tab, like Safari's History menu; a new tab would
+// silently pile up strip clutter for what is a "take me back there" gesture.
+- (void)historyItemSelected:(NSMenuItem*)sender {
+  NSString* url = sender.representedObject;
+  if (![url isKindOfClass:[NSString class]] || url.length == 0) {
+    return;
+  }
+  BroHandler* handler = BroHandler::GetInstance();
+  CefRefPtr<CefBrowser> browser = handler ? handler->GetBrowser() : nullptr;
+  if (browser) {
+    browser->GetMainFrame()->LoadURL([url UTF8String]);
+  } else {
+    CreateNewBrowserTabWithURL(std::string([url UTF8String]));
+  }
+}
+
+- (void)clearHistory:(id)sender {
+  NSAlert* alert = [[NSAlert alloc] init];
+  alert.messageText = @"Clear History?";
+  alert.informativeText =
+      @"This removes every page from the History menu. It does not clear "
+      @"cookies or the browsing cache.";
+  [alert addButtonWithTitle:@"Clear History"];
+  [alert addButtonWithTitle:@"Cancel"];
+  if ([alert runModal] == NSAlertFirstButtonReturn) {
+    BroHistoryClear();
   }
 }
 
@@ -1507,6 +1685,9 @@ void CreateNewBrowserTab(void) {
     return action == @selector(goBack:) ? browser->CanGoBack()
                                         : browser->CanGoForward();
   }
+  if (action == @selector(clearHistory:)) {
+    return BroHistoryEntries().count > 0;
+  }
   if (action == @selector(selectTabAtIndex:)) {
     NSInteger count = g_tab_bar ? (NSInteger)g_tab_bar.tabs.count : 0;
     return menuItem.tag == -1 ? count > 0 : menuItem.tag < count;
@@ -1534,24 +1715,6 @@ void CreateNewBrowserTab(void) {
     return SplitActive() || (g_tab_bar && g_tab_bar.tabs.count > 1);
   }
   return YES;
-}
-
-- (void)openWasmBenchmark:(id)sender {
-  NSString* path = [[NSBundle mainBundle] pathForResource:@"wasm-bench"
-                                                   ofType:@"html"];
-  if (path) {
-    NSURL* url = [NSURL fileURLWithPath:path];
-    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
-  }
-}
-
-- (void)openGpuBenchmark:(id)sender {
-  NSString* path = [[NSBundle mainBundle] pathForResource:@"gpu-bench"
-                                                   ofType:@"html"];
-  if (path) {
-    NSURL* url = [NSURL fileURLWithPath:path];
-    CreateNewBrowserTabWithURL([[url absoluteString] UTF8String]);
-  }
 }
 
 - (void)focusAddressBar:(id)sender {
@@ -1615,7 +1778,8 @@ void CreateNewBrowserTab(void) {
 // NSWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow*)sender {
   BroHandler* handler = BroHandler::GetInstance();
-  if (handler && !handler->IsClosing()) {
+  if (handler && !handler->IsClosing() && !handler->IsClosingAll()) {
+    BroSnapshotOpenTabsForReopen();
     handler->CloseAllBrowsers(false);
     return NO;  // Don't close yet, wait for browsers to close
   }
@@ -1635,7 +1799,10 @@ void CreateNewBrowserTab(void) {
   g_split_divider = nil;
   [g_browser_views removeAllObjects];
   [g_blank_tab_ids removeAllObjects];
-  BroClearClosedTabs();
+  // The closed-tab list intentionally survives: it is persisted and feeds
+  // Reopen Closed Tab across launches.
+  // Flush any debounced history writes before the app winds down.
+  BroHistorySaveNow();
 }
 
 // Miniaturized or fully covered windows report as non-visible; treat every
@@ -1820,6 +1987,9 @@ void OnTabTitleChanged(int browser_id, const std::string& title) {
   BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabTitle:browser_id title:titleStr];
+      // Titles arrive after the URL commit; backfill the history entry.
+      BroHistoryUpdateTitle([g_tab_bar tabWithBrowserId:browser_id].tabURL,
+                            titleStr);
     }
   });
 }
@@ -1842,6 +2012,9 @@ void OnTabURLChanged(int browser_id, const std::string& url) {
     if (g_tab_bar) {
       [g_tab_bar updateTabURL:browser_id url:urlStr];
     }
+    // OnAddressChange is main-frame-only and fires at commit — the one
+    // reliable "the user visited this" signal.
+    BroHistoryRecordVisit(browser_id, urlStr);
 
     // Commit-time blank/loaded transition: unhide the CEF view for real
     // pages, return to the blank state when the tab navigates back to
@@ -1864,6 +2037,8 @@ void OnTabFaviconChanged(int browser_id, const std::string& favicon_url) {
   BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabFavicon:browser_id faviconURL:urlStr];
+      BroHistoryUpdateFavicon([g_tab_bar tabWithBrowserId:browser_id].tabURL,
+                              urlStr);
     }
   });
 }
@@ -1887,9 +2062,21 @@ void OnTabClosed(int browser_id) {
       // Record the tab for Reopen Closed Tab and the tab search panel's
       // "Recently Closed" section while the pill still exists. Blank/new-tab
       // pages aren't worth reopening.
+      //
+      // During quit (CloseAllBrowsers) every open tab lands here; those were
+      // already snapshotted synchronously by the quit path, so skip the
+      // per-tab recording to avoid duplicates. IsClosingAll covers the first
+      // N-1 browsers of a teardown, IsClosing the last — and a null handler
+      // means teardown already released it before this deferred block ran
+      // (it outlives every individual close), so that counts too.
+      BroHandler* closing_handler = BroHandler::GetInstance();
+      BOOL tearing_down =
+          !closing_handler || closing_handler->IsClosing() ||
+          closing_handler->IsClosingAll();
       for (BroTabView* tab in g_tab_bar.tabs) {
         if (tab.browserId == browser_id) {
-          if (tab.tabURL.length > 0 && !BroURLIsBlank(tab.tabURL)) {
+          if (!tearing_down && tab.tabURL.length > 0 &&
+              !BroURLIsBlank(tab.tabURL)) {
             BroRecordClosedTab(tab.tabURL, tab.pageTitle, tab.faviconURL);
           }
           break;
@@ -1910,6 +2097,7 @@ void OnTabClosed(int browser_id) {
       [g_browser_views removeObjectForKey:@(browser_id)];
     }
     [g_blank_tab_ids removeObject:@(browser_id)];
+    BroHistoryTabClosed(browser_id);
 
     BroHandler* handler = BroHandler::GetInstance();
     if (handler && g_main_window) {
@@ -2003,25 +2191,12 @@ int main(int argc, char* argv[]) {
 
     // Persistent cache in Application Support (the temp directory is purged
     // by the OS, which silently discarded the HTTP cache and the V8/WASM
-    // compiled-code caches between launches). BRO_USER_DATA_DIR overrides the
-    // location so test harnesses can run isolated instances concurrently (the
-    // profile directory holds the process-singleton lock, so two instances
-    // sharing it cannot both launch).
-    NSString* cachePath = nil;
-    if (const char* data_dir = getenv("BRO_USER_DATA_DIR")) {
-      if (data_dir[0] == '/') {
-        cachePath = [NSString stringWithUTF8String:data_dir];
-      }
-    }
-    if (!cachePath) {
-      NSString* appSupport = NSSearchPathForDirectoriesInDomains(
-          NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
-      cachePath = [appSupport stringByAppendingPathComponent:@"Bro"];
-    }
-    [[NSFileManager defaultManager] createDirectoryAtPath:cachePath
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
+    // compiled-code caches between launches). BroUserDataDirectory honors
+    // BRO_USER_DATA_DIR so test harnesses can run isolated instances
+    // concurrently (the profile directory holds the process-singleton lock,
+    // so two instances sharing it cannot both launch); the same directory
+    // holds the closed-tab and history JSON files.
+    NSString* cachePath = BroUserDataDirectory();
     CefString(&settings.root_cache_path).FromString([cachePath UTF8String]);
     CefString(&settings.cache_path).FromString([cachePath UTF8String]);
 

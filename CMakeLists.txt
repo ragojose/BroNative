@@ -64,8 +64,14 @@ set(BRO_SRCS
     src/bro_handler.cc
     src/bro_handler.h
     src/bro_handler_mac.mm
+    src/bro_history.h
+    src/bro_history.mm
     src/bro_mac.mm
     src/bro_mac_internal.h
+    src/bro_motion.h
+    src/bro_motion.mm
+    src/bro_persist.h
+    src/bro_persist.mm
     src/bro_tabsearch.mm
     src/bro_tabstrip.mm
     src/bro_toolbar.mm
@@ -86,8 +92,6 @@ set(BRO_HELPER_SRCS
 # Bundle resources
 set(BRO_RESOURCES
     src/mac/bro.icns
-    src/mac/wasm-bench.html
-    src/mac/gpu-bench.html
 )
 set_source_files_properties(${BRO_RESOURCES} PROPERTIES
     MACOSX_PACKAGE_LOCATION "Resources"

@@ -306,6 +306,16 @@ BroToolbar* g_toolbar = nil;
       editor.insertionPointColor = [NSColor whiteColor];
       editor.textColor = [NSColor whiteColor];
       editor.drawsBackground = NO;
+      // AppKit pins field-editor text to the top of its bounds, while the
+      // settled URL is vertically centered by the text-field cell. Use the
+      // settled URL's baseline for editing too, so focusing and typing never
+      // makes the text jump.
+      CGFloat textHeight =
+          [self.addressField.cell cellSizeForBounds:self.addressField.bounds]
+              .height;
+      editor.textContainerInset = NSMakeSize(
+          0.0, MAX(0.0, (self.addressField.bounds.size.height - textHeight) /
+                            2.0));
       // Selection inverts against the dark chrome: a white highlight with
       // near-black glyphs, instead of the system's blue-on-white.
       editor.selectedTextAttributes = @{

@@ -20,12 +20,6 @@ performance here:
 2. **No new command-line switches.** Kept the empirically stable trio
    (`enable-gpu`, `use-angle=metal`, `ignore-gpu-blocklist`), now gated to the
    browser process only.
-3. **Bundled benchmark**: `src/mac/wasm-bench.html` (View → WebAssembly
-   Benchmark), self-contained hand-assembled WASM with feature probes.
-   `#autorun` writes machine-readable results into `document.title`.
-   Verified live: `WASMBENCH PASS ratio=4.00 wasm_ms=11.60 simd=1 gc=1
-   threads=1`.
-
 WASM threads follow web-standard gating: available on `crossOriginIsolated`
 pages (COOP/COEP served by the site). Do NOT enable the global
 SharedArrayBuffer flag.
@@ -83,6 +77,4 @@ SharedArrayBuffer flag.
 cmake -G Ninja -B build && cmake --build build
 BRO_REMOTE_DEBUG_PORT=9223 ./build/Bro.app/Contents/MacOS/Bro &
 curl -s localhost:9223/json/list            # targets + titles
-curl -s -X PUT "localhost:9223/json/new?file://$PWD/build/Bro.app/Contents/Resources/wasm-bench.html%23autorun"
-# poll /json/list until the bench tab title reads "WASMBENCH PASS ..."
 ```

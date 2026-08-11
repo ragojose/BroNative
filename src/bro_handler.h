@@ -187,6 +187,12 @@ class BroHandler : public CefClient,
 
   bool IsClosing() const { return is_closing_; }
 
+  // True from the moment CloseAllBrowsers starts tearing everything down.
+  // IsClosing() only becomes true once the *last* browser reaches DoClose,
+  // so teardown-sensitive UI code (e.g. closed-tab recording) must check
+  // both.
+  bool IsClosingAll() const { return closing_all_; }
+
   // Show the main window
   void ShowMainWindow();
 

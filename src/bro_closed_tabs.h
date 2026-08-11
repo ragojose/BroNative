@@ -6,7 +6,9 @@
 // Recently closed tabs, oldest first, for Reopen Closed Tab (Cmd+Shift+T)
 // and the tab search panel's "Recently Closed" section. Blank/new-tab pages
 // are not recorded. The list is capped (oldest dropped) internally; callers
-// never touch the backing store directly.
+// never touch the backing store directly. Persisted to closed_tabs.json in
+// the profile directory (loaded lazily, saved on every mutation), so the
+// list survives relaunch — quitting snapshots the open tabs into it.
 
 #ifndef BRO_CLOSED_TABS_H_
 #define BRO_CLOSED_TABS_H_

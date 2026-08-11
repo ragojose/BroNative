@@ -443,8 +443,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _titleLabel.textColor = [NSColor labelColor];
   } else {
     // The split screen's right pane keeps the active pill's look while
-    // inactive, so both on-screen halves read as selected.
-    CGFloat bg = (!_isSplitPane && hovered_) ? 0.05 : 0.0;
+    // inactive, so both on-screen halves read as selected — with a faint
+    // lift so the two halves of the joined pill are still tellable apart.
+    CGFloat bg = (!_isSplitPane && hovered_) ? 0.05 : (_isSplitPane ? 0.03 : 0.0);
     self.layer.backgroundColor =
         bg > 0 ? [NSColor colorWithWhite:1.0 alpha:bg].CGColor
                : [NSColor blackColor].CGColor;
@@ -530,6 +531,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 
 - (void)setDropTarget:(BOOL)dropTarget {
   _dropTarget = dropTarget;
+  [self refreshCorners];
   [self updateAppearance];
 }
 
@@ -540,15 +542,37 @@ void BroFetchFaviconGuarded(NSString* urlString,
 
 - (void)setJoinedSide:(NSInteger)joinedSide {
   _joinedSide = joinedSide;
-  if (joinedSide == 1) {
-    self.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner;
-  } else if (joinedSide == 2) {
-    self.layer.maskedCorners = kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
-  } else {
-    self.layer.maskedCorners =
-        kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner |
-        kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
+  [self refreshCorners];
+}
+
+// Corner shape is derived state: a joined pill squares its meeting corners,
+// but a drag-over drop target rounds back to a full pill so it matches its
+// bright standalone highlight (and restores the joined shape when the drag
+// moves off). maskedCorners is a discrete property Core Animation can't
+// interpolate — the shared layer actions don't cover it — so shape changes
+// crossfade via a CATransition instead of snapping mid-slide.
+- (void)refreshCorners {
+  CACornerMask all = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner |
+                     kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
+  CACornerMask mask = all;
+  if (!_dropTarget && _joinedSide == 1) {
+    mask = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner;
+  } else if (!_dropTarget && _joinedSide == 2) {
+    mask = kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner;
   }
+  if (self.layer.maskedCorners == mask) {
+    return;
+  }
+  if (self.window != nil &&
+      ![NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion) {
+    CATransition* fade = [CATransition animation];
+    fade.type = kCATransitionFade;
+    fade.duration = kCloseButtonFadeDuration;
+    fade.timingFunction =
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    [self.layer addAnimation:fade forKey:@"cornerShape"];
+  }
+  self.layer.maskedCorners = mask;
 }
 
 - (void)performSelect {
@@ -731,7 +755,23 @@ void BroFetchFaviconGuarded(NSString* urlString,
   NSString* label = host.length > 0
       ? host
       : (self.pageTitle.length > 0 ? self.pageTitle : kBroBlankTabTitle);
-  return _pinned ? [label stringByAppendingString:@", pinned"] : label;
+  if (_pinned) {
+    label = [label stringByAppendingString:@", pinned"];
+  }
+  // Announce split membership: sighted users see the joined pill and the two
+  // panes, but this label is all VoiceOver gets. Left/right mirrors the pane
+  // framing rule (strip order decides sides).
+  BroHandler* handler = BroHandler::GetInstance();
+  int active_id = handler ? handler->GetActiveBrowserId() : -1;
+  int my_id = self.browserId;
+  if (SplitActive() &&
+      (my_id == active_id || my_id == g_split_browser_id)) {
+    int partner = my_id == active_id ? g_split_browser_id : active_id;
+    BOOL left = BroTabStripIndex(my_id) < BroTabStripIndex(partner);
+    label = [label stringByAppendingString:left ? @", split screen left pane"
+                                                : @", split screen right pane"];
+  }
+  return label;
 }
 
 - (id)accessibilityValue {
@@ -1029,8 +1069,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   // The new pill starts at its final slot fully transparent and fades in
   // while its neighbors and the "+" button slide over to make room.
   CGFloat tabWidth = [self fittedTabWidth];
-  tab.frame = NSMakeRect((_tabs.count - 1) * (tabWidth + 8.0), pillY, tabWidth,
-                         kTabPillHeight);
+  tab.frame = NSMakeRect((_tabs.count - 1) * (tabWidth + kTabGap), pillY,
+                         tabWidth, kTabPillHeight);
   tab.alphaValue = 0.0;
   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
     ctx.duration = 0.22;
@@ -1091,7 +1131,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   if (!tab.pinned) {
     NSArray<NSNumber*>* widths = [self tabWidths];
     for (NSUInteger i = 0; i < pinnedCount; i++) {
-      groupOriginX += widths[i].doubleValue + 8.0;
+      groupOriginX += widths[i].doubleValue + kTabGap;
     }
   }
   CGFloat maxX = groupOriginX + (CGFloat)(groupEnd - groupStart) * slotWidth;
@@ -1235,6 +1275,12 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   NSUInteger destination = [self pinnedCount];
   tab.pinned = pinning;
   [_tabs insertObject:tab atIndex:destination];
+  if (SplitActive()) {
+    // The pin move may have separated (or reunited) the joined split pair;
+    // this restyles corners/seam and animates the same 0.18s layout.
+    [self ensureSplitPairAdjacent];
+    return;
+  }
   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
     ctx.duration = 0.18;
     ctx.timingFunction = [CAMediaTimingFunction
@@ -1415,7 +1461,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 // Strip width left for expandable pills once the pinned squares took theirs.
 - (CGFloat)expandableStripWidth {
   return [self availableStripWidth] -
-         (CGFloat)[self squarePinnedCount] * (kTabPillSquareWidth + 8.0);
+         (CGFloat)[self squarePinnedCount] * (kTabPillSquareWidth + kTabGap);
 }
 
 // Fits expandable pills to the remaining strip width (minus the "+" button
@@ -1425,14 +1471,14 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 // describing every pill (see -tabWidths).
 - (CGFloat)fittedTabWidth {
   NSUInteger count = MAX(_tabs.count - [self squarePinnedCount], (NSUInteger)1);
-  CGFloat fitWidth = [self expandableStripWidth] / count - 8.0;
+  CGFloat fitWidth = [self expandableStripWidth] / count - kTabGap;
   return MIN(MAX(fitWidth, kTabPillSquareWidth), kTabPillMaxWidth);
 }
 
 // YES once an even split would leave no room for text: pills become squares.
 - (BOOL)isCollapsed {
   NSUInteger count = MAX(_tabs.count - [self squarePinnedCount], (NSUInteger)1);
-  return [self expandableStripWidth] / count - 8.0 < kTabPillTextMinWidth;
+  return [self expandableStripWidth] / count - kTabGap < kTabPillTextMinWidth;
 }
 
 // Width of one drag slot for `tab`. Pinned pills only travel their group of
@@ -1441,7 +1487,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 - (CGFloat)dragSlotWidthForTab:(BroTabView*)tab {
   return (tab.pinned || [self isCollapsed] ? kTabPillSquareWidth
                                            : [self fittedTabWidth]) +
-         8.0;
+         kTabGap;
 }
 
 // Per-pill widths in strip order. Pinned inactive pills are always squares;
@@ -1459,8 +1505,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     }
     return widths;
   }
-  CGFloat squares = (CGFloat)(_tabs.count - 1) * (kTabPillSquareWidth + 8.0);
-  CGFloat slack = [self availableStripWidth] - squares - 8.0;
+  CGFloat squares =
+      (CGFloat)(_tabs.count - 1) * (kTabPillSquareWidth + kTabGap);
+  CGFloat slack = [self availableStripWidth] - squares - kTabGap;
   // Open the active pill to the full pill width when the slack allows, so the
   // URL has as much room to be typed as it would in a roomy strip. Below the
   // comfortable minimum expanding buys nothing readable, so it stays square.
@@ -1497,9 +1544,10 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     } else {
       tab.frame = target;
     }
-    // The split pair sits nearly flush (a 1pt seam) so it reads as one
-    // joined control; every other neighbor keeps the normal gap.
-    x += tabWidth + (tab.joinedSide == 1 ? 1.0 : 8.0);
+    // The split pair overlaps by 1pt so the two borders coincide and the
+    // pair reads as one continuous pill; every other neighbor keeps the
+    // normal gap.
+    x += tabWidth - (tab.joinedSide == 1 ? kSplitJoinedOverlap : -kTabGap);
   }
 
   NSRect addTarget =
