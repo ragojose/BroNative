@@ -57,6 +57,7 @@ set(SPARKLE_FRAMEWORK "${sparkle_SOURCE_DIR}/Sparkle.framework")
 set(BRO_SRCS
     src/bro_app.cc
     src/bro_app.h
+    src/bro_downloads.mm
     src/bro_favicon.mm
     src/bro_handler.cc
     src/bro_handler.h
