@@ -203,11 +203,23 @@ static CGFloat BroWindowCornerRadius(NSWindow* window) {
   return kWindowCornerRadiusFallback;
 }
 
-@interface BroWindow : NSWindow
+// Dark-glass scrim over the behind-window blur (the contentView
+// NSVisualEffectView): the chrome row wears it permanently, and the
+// browser-area tint fades down to it when the active tab is blank. Matches
+// the command palette's 60% black glass tint (bro_palette.mm) so both glass
+// surfaces read as the same material.
+static const CGFloat kGlassBackdropScrimAlpha = 0.6;
+static const CFTimeInterval kGlassBackdropFadeDuration = 0.30;
+
+@interface BroWindow : NSWindow {
+  BOOL _glassBackdropVisible;
+}
 @property (nonatomic, strong) NSView* browserContainer;
 @property (nonatomic, strong) BroToolbar* navToolbar;
 @property (nonatomic, strong) BroTabBar* tabBar;
 @property (nonatomic, strong) NSView* borderOverlay;
+@property (nonatomic, strong) NSView* backdropTint;
+- (void)setGlassBackdropVisible:(BOOL)visible;
 @end
 
 NSView* BroBrowserContainerView(void) {
@@ -250,13 +262,28 @@ NSView* BroBrowserContainerView(void) {
     content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.contentView = content;
 
-    // Opaque black backdrop: every surface — chrome and browser area alike —
-    // sits on pure #000.
-    NSView* tint = [[NSView alloc] initWithFrame:frame];
+    // The window backdrop splits at the toolbar line. The chrome row keeps a
+    // permanent partial scrim so it always reads as dark glass over the
+    // behind-window blur; the browser area below carries an opaque black tint
+    // that fades to the same scrim when the active tab is blank (see
+    // -setGlassBackdropVisible:). CEF pages are opaque, so with a page showing
+    // the browser-area tint is only visible in the mobile-mode gutters.
+    CGFloat chromeY = frame.size.height - kToolbarHeight;
+    NSView* tint = [[NSView alloc]
+        initWithFrame:NSMakeRect(0, 0, frame.size.width, chromeY)];
     tint.wantsLayer = YES;
     tint.layer.backgroundColor = [NSColor blackColor].CGColor;
     tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:tint];
+    _backdropTint = tint;
+
+    NSView* chromeTint = [[NSView alloc]
+        initWithFrame:NSMakeRect(0, chromeY, frame.size.width, kToolbarHeight)];
+    chromeTint.wantsLayer = YES;
+    chromeTint.layer.backgroundColor = [NSColor blackColor].CGColor;
+    chromeTint.alphaValue = kGlassBackdropScrimAlpha;
+    chromeTint.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [content addSubview:chromeTint];
 
     // Single chrome row at the very top; its content is inset past the
     // traffic lights.
@@ -313,6 +340,24 @@ NSView* BroBrowserContainerView(void) {
     self.minSize = NSMakeSize(760, 400);
   }
   return self;
+}
+
+// Cross-fades the browser-area black tint to the chrome row's partial scrim
+// (glass on) or back to opaque (glass off). Animates alphaValue via the
+// animator so rapid tab flips retarget the in-flight fade; `hidden` is never
+// touched — a hidden tint would flash the window transparent.
+- (void)setGlassBackdropVisible:(BOOL)visible {
+  if (visible == _glassBackdropVisible) {
+    return;
+  }
+  _glassBackdropVisible = visible;
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = BroMotionReduced() ? 0.0 : kGlassBackdropFadeDuration;
+    ctx.timingFunction = [CAMediaTimingFunction
+        functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    self.backdropTint.animator.alphaValue =
+        visible ? kGlassBackdropScrimAlpha : 1.0;
+  } completionHandler:nil];
 }
 
 @end
@@ -675,6 +720,14 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
     }
   }
   UpdateSplitDivider();
+  // Glass backdrop iff every visible pane is blank: a blank tab draws no page
+  // pixels, so the backdrop is its entire surface. With a split showing one
+  // loaded pane the window stays opaque black — half-glass at the divider
+  // would look broken. active_browser_id == -1 (no tabs) resolves to black.
+  BOOL activeBlank = [g_blank_tab_ids containsObject:@(active_browser_id)];
+  BOOL partnerBlank =
+      !SplitActive() || [g_blank_tab_ids containsObject:@(g_split_browser_id)];
+  [g_main_window setGlassBackdropVisible:(activeBlank && partnerBlank)];
 }
 
 static void UpdateChromeLayout(void) {
