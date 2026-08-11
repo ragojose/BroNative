@@ -18,7 +18,6 @@
 // hairline is its primary structural selection cue.
 static const CGFloat kActiveTabBorderAlpha = 0.28;
 static const CGFloat kHoveredTabBorderAlpha = 0.18;
-static const CGFloat kInactiveTabForegroundAlpha = 0.42;
 static const CFTimeInterval kTabColorTransitionDuration = 0.18;
 
 static NSDictionary* BroTabLayerTransitionActions(void) {
@@ -266,8 +265,9 @@ BOOL BroEventMatchesShortcut(NSEvent* event,
     alpha = 0.08;
   }
   self.layer.backgroundColor =
-      alpha > 0 ? [NSColor colorWithWhite:1.0 alpha:alpha].CGColor
-                : [NSColor clearColor].CGColor;
+      alpha > 0
+          ? [[NSColor labelColor] colorWithAlphaComponent:alpha].CGColor
+          : [NSColor clearColor].CGColor;
 }
 
 // Single funnel for the hover/press scale, mirroring refreshBackground.
@@ -410,8 +410,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 @implementation BroTabView {
-  // Native Liquid Glass backdrop for the active browse input. Older macOS
-  // versions keep the same view slot with an NSVisualEffectView fallback.
+  // macOS 12–25 keep the active browse input's established HUD glass. On
+  // macOS 26+ the whole toolbar is one Regular glass surface, so a nested
+  // pill surface would be glass-on-glass and is deliberately omitted.
   NSView* glassBackdrop_;
   BOOL hovered_;
   BOOL focused_;
@@ -444,24 +445,15 @@ void BroFetchFaviconGuarded(NSString* urlString,
     self.layer.cornerRadius = pillCornerRadius;
     self.layer.borderWidth = 1.0;
     self.layer.actions = BroTabLayerTransitionActions();
-    // Keyboard focus shows as a white pill border instead of the system's
+    // Keyboard focus shows as an adaptive pill border instead of the system's
     // accent-colored ring.
     self.focusRingType = NSFocusRingTypeNone;
 
-    // The active tab is also the browser's address input, so give that pill
-    // its own untinted AppKit glass surface. It must remain transparent in
-    // every resting/editing/loading state; the glass refraction and hairline
-    // provide separation without an opaque or black fill. Keep it a sibling
-    // behind the controls: nesting the field in NSGlassEffectView.contentView
-    // would change hit testing and field-editor ownership.
+    // Older systems retain the active pill's HUD surface. Regular Liquid
+    // Glass on macOS 26+ belongs to the toolbar host instead, with this pill
+    // communicating selection through an adaptive fill and hairline.
     if (@available(macOS 26.0, *)) {
-      NSGlassEffectView* glass =
-          [[NSGlassEffectView alloc] initWithFrame:self.bounds];
-      glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      glass.cornerRadius = BroNestedCornerRadius(pillCornerRadius, 0.0);
-      glass.style = BroGlassEffectStyle();
-      glass.tintColor = [NSColor clearColor];
-      glassBackdrop_ = glass;
+      glassBackdrop_ = nil;
     } else {
       NSVisualEffectView* glass =
           [[NSVisualEffectView alloc] initWithFrame:self.bounds];
@@ -477,8 +469,10 @@ void BroFetchFaviconGuarded(NSString* urlString,
 
       glassBackdrop_ = glass;
     }
-    glassBackdrop_.hidden = YES;
-    [self addSubview:glassBackdrop_];
+    if (glassBackdrop_) {
+      glassBackdrop_.hidden = YES;
+      [self addSubview:glassBackdrop_];
+    }
 
     // Favicon view
     _faviconView = [[NSImageView alloc]
@@ -711,17 +705,25 @@ void BroFetchFaviconGuarded(NSString* urlString,
   _faviconView.contentTintColor = color;
 }
 
-// Every pill uses the same untinted AppKit glass backdrop. Selection is
-// communicated through content and border contrast, never by swapping to an
-// opaque fill; this keeps the tab strip one continuous glass material.
+// Pills share the toolbar's Regular glass on macOS 26+. Selection is
+// communicated through adaptive content, border contrast, and a restrained
+// translucent fill; older systems retain the active pill's HUD backdrop.
 - (void)updateAppearance {
   [CATransaction begin];
   [CATransaction setDisableActions:BroMotionReduced()];
+  BOOL usesAdaptiveToolbarGlass = NO;
+  if (@available(macOS 26.0, *)) {
+    usesAdaptiveToolbarGlass = YES;
+  }
   if (_isActive) {
     glassBackdrop_.hidden = _dropTarget;
-    self.layer.backgroundColor = [NSColor clearColor].CGColor;
+    self.layer.backgroundColor =
+        usesAdaptiveToolbarGlass
+            ? [[NSColor labelColor] colorWithAlphaComponent:0.08].CGColor
+            : [NSColor clearColor].CGColor;
     self.layer.borderColor =
-        [NSColor colorWithWhite:1.0 alpha:kActiveTabBorderAlpha].CGColor;
+        [[NSColor labelColor]
+            colorWithAlphaComponent:kActiveTabBorderAlpha].CGColor;
     self.layer.borderWidth = kBroGlassBorderWidth;
     NSColor* foreground = [NSColor labelColor];
     _titleLabel.color = foreground;
@@ -733,9 +735,8 @@ void BroFetchFaviconGuarded(NSString* urlString,
     CGFloat borderAlpha =
         emphasizeBorder ? kHoveredTabBorderAlpha : 0.05;
     self.layer.borderColor =
-        [NSColor colorWithWhite:1.0 alpha:borderAlpha].CGColor;
-    NSColor* foreground =
-        [NSColor colorWithWhite:1.0 alpha:kInactiveTabForegroundAlpha];
+        [[NSColor labelColor] colorWithAlphaComponent:borderAlpha].CGColor;
+    NSColor* foreground = [NSColor secondaryLabelColor];
     _titleLabel.color = foreground;
     [self applyDefaultFaviconColor:foreground];
   }
@@ -743,8 +744,10 @@ void BroFetchFaviconGuarded(NSString* urlString,
   // every other state so the target is unmistakable.
   if (_dropTarget) {
     glassBackdrop_.hidden = YES;
-    self.layer.backgroundColor = [NSColor colorWithWhite:1.0 alpha:0.14].CGColor;
-    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.6].CGColor;
+    self.layer.backgroundColor =
+        [[NSColor labelColor] colorWithAlphaComponent:0.14].CGColor;
+    self.layer.borderColor =
+        [[NSColor labelColor] colorWithAlphaComponent:0.6].CGColor;
   }
   [CATransaction commit];
   // The same trailing control closes a normal tab or unpins a pinned one.
@@ -1170,6 +1173,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
 @end
 
 @implementation BroTabHoverCard {
+  NSView* contentHost_;
   BroShimmerTextView* titleLabel_;
   NSTextField* urlLabel_;
   NSTextField* descriptionLabel_;
@@ -1184,7 +1188,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   label.bordered = NO;
   label.drawsBackground = NO;
   label.font = font;
-  label.textColor = [NSColor colorWithWhite:1.0 alpha:whiteAlpha];
+  label.textColor = whiteAlpha >= 0.8
+                        ? [NSColor labelColor]
+                        : (whiteAlpha >= 0.5
+                               ? [NSColor secondaryLabelColor]
+                               : [NSColor tertiaryLabelColor]);
   label.lineBreakMode = NSLineBreakByTruncatingTail;
   label.cell.truncatesLastVisibleLine = YES;
   return label;
@@ -1197,20 +1205,20 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     self.layer.cornerRadius =
         BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
     BroApplyElevation(self, BroElevationOverlay);
-    BroInstallGlassBackdrop(self, self.layer.cornerRadius);
+    contentHost_ = BroInstallGlassSurface(self, self.layer.cornerRadius);
 
     self.accessibilityRole = NSAccessibilityGroupRole;
     self.accessibilityLabel = @"Tab preview";
 
     titleLabel_ = [[BroShimmerTextView alloc]
-        initWithFont:BroUIFontBold(12.0) color:[NSColor whiteColor]];
+        initWithFont:BroUIFontBold(12.0) color:[NSColor labelColor]];
     urlLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.55);
     descriptionLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.75);
     descriptionLabel_.lineBreakMode = NSLineBreakByWordWrapping;
     descriptionLabel_.cell.wraps = YES;
-    [self addSubview:titleLabel_];
-    [self addSubview:urlLabel_];
-    [self addSubview:descriptionLabel_];
+    [contentHost_ addSubview:titleLabel_];
+    [contentHost_ addSubview:urlLabel_];
+    [contentHost_ addSubview:descriptionLabel_];
 
     _pinButton = [self makeActionButton];
     _splitButton = [self makeActionButton];
@@ -1235,7 +1243,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   button.bordered = NO;
   button.title = @"";
   button.imagePosition = NSImageOnly;
-  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+  button.contentTintColor = [NSColor labelColor];
   __weak BroTabHoverCard* weakSelf = self;
   button.focusChangedHandler = ^(BroHoverButton* focusedButton, BOOL focused) {
     BroTabHoverCard* card = weakSelf;
@@ -1245,7 +1253,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
       [card.hoverDelegate cardHoverEnded];
     }
   };
-  [self addSubview:button];
+  [contentHost_ addSubview:button];
   return button;
 }
 
@@ -1374,7 +1382,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _addTabButton.title = @"";
     _addTabButton.image = RadixIconImage(RadixIconPlus, 10);
     _addTabButton.imagePosition = NSImageOnly;
-    _addTabButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    _addTabButton.contentTintColor = [NSColor labelColor];
     _addTabButton.layer.cornerRadius = BroCornerRadiusForSize(
         BroCompactControlCornerRadius(), _addTabButton.bounds.size);
     _addTabButton.target = self;
@@ -1397,7 +1405,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     _tabSearchButton.title = @"";
     _tabSearchButton.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
     _tabSearchButton.imagePosition = NSImageOnly;
-    _tabSearchButton.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+    _tabSearchButton.contentTintColor = [NSColor labelColor];
     _tabSearchButton.target = self;
     _tabSearchButton.action = @selector(toggleTabSearch:);
     [_tabSearchButton configureActionLabel:@"Search Tabs"

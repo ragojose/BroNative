@@ -201,7 +201,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
   button.title = @"";
   button.image = RadixIconImage(icon, 15);
   button.imagePosition = NSImageOnly;
-  button.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.85];
+  button.contentTintColor = [NSColor labelColor];
   button.target = self;
   button.action = action;
   [button configureActionLabel:label
@@ -448,8 +448,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
 }
 
 - (void)setViewportMode:(BOOL)mobile {
-  NSColor* active = [NSColor whiteColor];
-  NSColor* inactive = [NSColor colorWithWhite:1.0 alpha:0.35];
+  NSColor* active = [NSColor labelColor];
+  NSColor* inactive = [NSColor tertiaryLabelColor];
   _desktopButton.contentTintColor = mobile ? inactive : active;
   _mobileButton.contentTintColor = mobile ? active : inactive;
   _desktopButton.selectedState = !mobile;
@@ -471,8 +471,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
 
   NSFont* font = BroUIFont(kTabTextFontSize);
   editor.font = font;
-  editor.insertionPointColor = [NSColor whiteColor];
-  editor.textColor = [NSColor whiteColor];
+  editor.insertionPointColor = [NSColor labelColor];
+  editor.textColor = [NSColor labelColor];
   editor.drawsBackground = NO;
 
   // NSTextView adds five points of line-fragment padding by default. The
@@ -495,12 +495,11 @@ NSString* BroResolveQueryToURL(NSString* query) {
   editor.textContainerInset =
       NSMakeSize(0.0, MAX(0.0, baselineFromTop - font.ascender));
 
-  // Selection inverts against the dark chrome: a white highlight with
-  // near-black glyphs, instead of the system's blue-on-white.
+  // Selection inverts against whichever treatment Regular glass resolves:
+  // semantic label and background colors stay legible in both variants.
   editor.selectedTextAttributes = @{
-    NSBackgroundColorAttributeName : [NSColor whiteColor],
-    NSForegroundColorAttributeName :
-        [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0],
+    NSBackgroundColorAttributeName : [NSColor labelColor],
+    NSForegroundColorAttributeName : [NSColor textBackgroundColor],
   };
   [editor selectAll:nil];
   return YES;
@@ -514,10 +513,10 @@ NSString* BroResolveQueryToURL(NSString* query) {
     return;
   }
   // Show the full URL for editing; the host pill shows the focused look
-  // (gray hairline border, pure white text) from click-in through typing.
+  // (adaptive hairline border and primary text) from click-in through typing.
   field.stringValue = BroURLIsBlank(tab.tabURL) ? @"" : tab.tabURL;
   tab.editingAddress = YES;
-  field.textColor = [NSColor whiteColor];
+  field.textColor = [NSColor labelColor];
   // Configure synchronously so AppKit never presents one frame with its
   // default font/insets before snapping to the shared tab metrics. Some
   // responder paths install the field editor just after becomeFirstResponder;

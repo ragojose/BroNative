@@ -105,10 +105,6 @@ static const CGFloat kSplitPaneMinWidth = 120.0;
 // accessibility label, and the window title AppKit shows in the Window menu.
 static NSString* const kBroBlankTabTitle = @"New Tab";
 
-// Window chrome: solid #000 backdrop with a #111 hairline frame. The hover
-// card keeps its own lighter border (kWindowBorderAlpha over its gray fill).
-extern const CGFloat kWindowBorderAlpha;
-
 // UI font: bundled Geist (registered via ATSApplicationFontsPath), falling
 // back to the system font if the resource is missing. SemiBold stands in for
 // bold — Geist Bold reads too heavy at chrome sizes (11–14pt).
@@ -182,14 +178,13 @@ extern void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
 extern void CreateNewBrowserTab(void);
 extern void CreateNewBrowserTabWithURL(const std::string& url);
 
-// Every emphasized control border — selected pill, hover, keyboard focus,
-// address-editing ring, the "+" button — and the window frame is the same
-// 1pt #111111 hairline.
+// Shared semantic hairline for emphasized controls and keyboard focus. It
+// resolves with the current AppKit/glass appearance instead of freezing a
+// dark-only RGB value.
 extern NSColor* BroControlBorderColor(void);
 
-// Shared tint for the template globe shown while a tab has no fetched
-// favicon. Kept darker than regular chrome icons so it stays defined when
-// glass lifts over a light desktop background.
+// Shared semantic tint for the template globe shown while a tab has no
+// fetched favicon.
 extern NSColor* BroPlaceholderFaviconColor(void);
 
 // True if the given tab has mobile emulation active.

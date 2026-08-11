@@ -9,6 +9,8 @@ NSString* IconResourceName(RadixIcon icon) {
   switch (icon) {
     case RadixIconArrowLeft:  return @"arrow-left";
     case RadixIconArrowRight: return @"arrow-right";
+    case RadixIconArrowUp:    return @"arrow-up";
+    case RadixIconArrowDown:  return @"arrow-down";
     case RadixIconReload:     return @"reload";
     case RadixIconPlus:       return @"plus";
     case RadixIconCross2:     return @"cross-2";

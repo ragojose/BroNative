@@ -502,7 +502,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   faviconGeneration_++;
   if (item.icon) {
     iconView_.image = item.icon;
-    iconView_.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    iconView_.contentTintColor = [NSColor secondaryLabelColor];
   } else if (item.adoptFaviconFrom.image) {
     iconView_.image = item.adoptFaviconFrom.image;
     iconView_.contentTintColor = item.adoptFaviconFrom.contentTintColor;
@@ -622,6 +622,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
 @end
 
 @implementation BroCommandPalette {
+  NSView* contentHost_;
   NSTextField* searchField_;
   NSImageView* searchIcon_;
   NSTextField* shortcutHint_;
@@ -652,17 +653,17 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
     self.layer.cornerRadius =
         BroCornerRadiusForSize(BroSurfaceCornerRadius(), self.bounds.size);
     BroApplyElevation(self, BroElevationPanel);
-    BroInstallGlassBackdrop(self, self.layer.cornerRadius);
+    contentHost_ = BroInstallGlassSurface(self, self.layer.cornerRadius);
 
     searchIcon_ = [[NSImageView alloc] initWithFrame:NSZeroRect];
     searchIcon_.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
-    searchIcon_.contentTintColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    searchIcon_.contentTintColor = [NSColor secondaryLabelColor];
     searchIcon_.accessibilityElement = NO;
-    [self addSubview:searchIcon_];
+    [contentHost_ addSubview:searchIcon_];
 
     searchField_ = [[NSTextField alloc] initWithFrame:NSZeroRect];
     searchField_.font = BroUIFont(13.0);
-    searchField_.textColor = [NSColor whiteColor];
+    searchField_.textColor = [NSColor labelColor];
     searchField_.bordered = NO;
     searchField_.bezeled = NO;
     searchField_.drawsBackground = NO;
@@ -670,16 +671,15 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
     searchField_.cell.usesSingleLineMode = YES;
     searchField_.cell.scrollable = YES;
     searchField_.delegate = self;
-    [self addSubview:searchField_];
+    [contentHost_ addSubview:searchField_];
 
     shortcutHint_ = BroHoverCardLabel(BroUIFont(11.0), 0.35);
-    [self addSubview:shortcutHint_];
+    [contentHost_ addSubview:shortcutHint_];
 
     separator_ = [[NSView alloc] initWithFrame:NSZeroRect];
     separator_.wantsLayer = YES;
-    separator_.layer.backgroundColor =
-        [NSColor colorWithWhite:1.0 alpha:kWindowBorderAlpha].CGColor;
-    [self addSubview:separator_];
+    separator_.layer.backgroundColor = [NSColor separatorColor].CGColor;
+    [contentHost_ addSubview:separator_];
 
     listView_ = [[BroPaletteListView alloc] initWithFrame:NSZeroRect];
     scrollView_ = [[NSScrollView alloc] initWithFrame:NSZeroRect];
@@ -690,7 +690,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
     scrollView_.scrollerStyle = NSScrollerStyleOverlay;
     scrollView_.automaticallyAdjustsContentInsets = NO;
     scrollView_.documentView = listView_;
-    [self addSubview:scrollView_];
+    [contentHost_ addSubview:scrollView_];
     rowHighlightGroup_ =
         [[BroHoverHighlightGroup alloc] initWithContainerView:listView_];
   }
@@ -707,8 +707,7 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
       initWithString:placeholder
           attributes:@{
             NSFontAttributeName : BroUIFont(13.0),
-            NSForegroundColorAttributeName :
-                [NSColor colorWithWhite:1.0 alpha:0.35],
+            NSForegroundColorAttributeName : [NSColor tertiaryLabelColor],
           }];
   searchField_.accessibilityLabel = placeholder;
   shortcutHint_.stringValue = tabsOnly ? @"⇧⌘A" : @"⌘K";

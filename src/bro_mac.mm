@@ -31,12 +31,9 @@
 @class BroTabBar;
 @class BroTabView;
 
-// Layout/timing constants shared across the split family (toolbar, tab
-// strip, hover card, tab search, downloads popover) are declared in
+// Layout/timing constants shared across the split family (toolbar, tab strip,
+// hover card, command palette, downloads popover) live in
 // bro_mac_internal.h.
-// kWindowBorderAlpha is declared there too but keeps its single definition
-// here (the rest are compile-time constants safe to duplicate per file).
-const CGFloat kWindowBorderAlpha = 0.12;
 
 // BroUIFont/BroUIFontBold are declared in bro_mac_internal.h.
 NSFont* BroUIFont(CGFloat size) {
@@ -51,11 +48,11 @@ NSFont* BroUIFontBold(CGFloat size) {
 
 // BroControlBorderColor is declared extern in bro_mac_internal.h.
 NSColor* BroControlBorderColor(void) {
-  return [NSColor colorWithWhite:0x11 / 255.0 alpha:1.0];
+  return [NSColor separatorColor];
 }
 
 NSColor* BroPlaceholderFaviconColor(void) {
-  return [NSColor colorWithWhite:0x24 / 255.0 alpha:1.0];
+  return [NSColor tertiaryLabelColor];
 }
 
 // Global references
@@ -68,7 +65,7 @@ BroTabBar* g_tab_bar = nil;
 static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
 
 // Tabs currently on a blank page (about:blank or no committed URL yet). Their
-// container stays hidden even while active so the black window shows through
+// container stays hidden even while active so the unified shell shows through
 // as the new-tab state.
 static NSMutableSet<NSNumber*>* g_blank_tab_ids = nil;
 
@@ -231,15 +228,14 @@ static CGFloat BroResolveShellCornerRadius(NSWindow* window) {
                                kShellCornerRadiusReduction);
 }
 
-// Dark-glass scrim over the behind-window blur (the contentView
-// NSVisualEffectView): the chrome row wears the same shared tint as every
-// glass surface, and the browser-area tint fades down to it when blank.
-static const CFTimeInterval kGlassBackdropFadeDuration = 0.30;
-static const CFTimeInterval kGlassPageFadeInDuration = 0.42;
-static const CFTimeInterval kGlassHandoffDelay = 0.02;
+// A compact dissolve keeps tab switching responsive while leaving enough
+// time for the AppKit-owned veil to hide CEF's non-animatable IOSurface.
+static const CFTimeInterval kGlassBackdropFadeDuration = 0.18;
+static const CFTimeInterval kGlassPageFadeInDuration = 0.22;
+static const CFTimeInterval kGlassHandoffDelay = 0.01;
 
-// A pronounced ease-in-out keeps the page and tint changes gentle at both
-// ends while still moving decisively through the middle of the dissolve.
+// A pronounced ease-in-out keeps the page/shell handoff gentle at both ends
+// while still moving decisively through the middle of the dissolve.
 static CAMediaTimingFunction* BroGlassTransitionTimingFunction(void) {
   return [CAMediaTimingFunction functionWithControlPoints:0.65
                                                        :0.0
@@ -247,8 +243,8 @@ static CAMediaTimingFunction* BroGlassTransitionTimingFunction(void) {
                                                        :1.0];
 }
 
-// Coming out of glass needs a gentler curve so an incoming CEF frame joins
-// the dissolve instead of appearing to snap in through the middle.
+// Coming out of glass stays slightly gentler so an incoming CEF frame joins
+// the shortened dissolve instead of snapping in through the middle.
 static CAMediaTimingFunction* BroPageFadeInTimingFunction(void) {
   return [CAMediaTimingFunction functionWithControlPoints:0.37
                                                        :0.0
@@ -256,35 +252,26 @@ static CAMediaTimingFunction* BroPageFadeInTimingFunction(void) {
                                                        :1.0];
 }
 
-// Builds a live copy of the blank-tab glass material above the browser area.
-// Unlike a CEF snapshot, this is entirely AppKit-owned and its opacity is
-// reliable in both directions.
+// Returns a live copy of the shell material above the browser area. Reusing
+// an in-flight veil lets a rapid reversal retarget its current presentation
+// instead of replacing it with a differently composed frame.
 static NSView* BroCreateGlassTransitionOverlay(NSView* parent,
                                                CGFloat initialAlpha) {
   if (!parent) {
     return nil;
   }
+  if (g_glass_transition_overlay.superview == parent) {
+    return g_glass_transition_overlay;
+  }
   [g_glass_transition_overlay removeFromSuperview];
 
-  NSVisualEffectView* glass =
-      [[NSVisualEffectView alloc] initWithFrame:parent.bounds];
-  glass.material = NSVisualEffectMaterialHUDWindow;
-  glass.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-  glass.state = NSVisualEffectStateActive;
-  glass.wantsLayer = YES;
-  glass.alphaValue = initialAlpha;
-  glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-  NSView* tint = [[NSView alloc] initWithFrame:glass.bounds];
-  tint.wantsLayer = YES;
-  tint.layer.backgroundColor = [NSColor blackColor].CGColor;
-  tint.alphaValue = kBroGlassTintAlpha;
-  tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [glass addSubview:tint];
-
-  [parent addSubview:glass positioned:NSWindowAbove relativeTo:nil];
-  g_glass_transition_overlay = glass;
-  return glass;
+  NSView* surface = [[NSView alloc] initWithFrame:parent.bounds];
+  surface.alphaValue = initialAlpha;
+  surface.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  BroInstallShellSurface(surface, 0.0);
+  [parent addSubview:surface positioned:NSWindowAbove relativeTo:nil];
+  g_glass_transition_overlay = surface;
+  return surface;
 }
 
 @interface BroWindow : NSWindow {
@@ -293,8 +280,8 @@ static NSView* BroCreateGlassTransitionOverlay(NSView* parent,
 @property (nonatomic, strong) NSView* browserContainer;
 @property (nonatomic, strong) BroToolbar* navToolbar;
 @property (nonatomic, strong) BroTabBar* tabBar;
+@property (nonatomic, strong) NSView* shellSurface;
 @property (nonatomic, strong) NSView* borderOverlay;
-@property (nonatomic, strong) NSView* backdropTint;
 - (BOOL)glassBackdropVisible;
 - (void)setGlassBackdropVisible:(BOOL)visible;
 @end
@@ -316,9 +303,9 @@ NSView* BroBrowserContainerView(void) {
                             backing:NSBackingStoreBuffered
                               defer:NO];
   if (self) {
-    // Solid #000 chrome. The window itself stays non-opaque with a clear
-    // background only so the rounded corners composite cleanly; the transparent
-    // titlebar keeps the traffic lights floating inline with the toolbar row.
+    // The window stays non-opaque with a clear background so the rounded
+    // corners composite cleanly and the shell blur can sample behind the
+    // window. The transparent titlebar keeps the traffic lights inline.
     self.titlebarAppearsTransparent = YES;
     self.titleVisibility = NSWindowTitleHidden;
     self.backgroundColor = [NSColor clearColor];
@@ -332,41 +319,29 @@ NSView* BroBrowserContainerView(void) {
     self.toolbar = titlebarSpacer;
     self.toolbarStyle = NSWindowToolbarStyleUnified;
 
-    NSVisualEffectView* content = [[NSVisualEffectView alloc] initWithFrame:frame];
-    content.material = NSVisualEffectMaterialHUDWindow;
-    content.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-    content.state = NSVisualEffectStateActive;
+    NSView* content = [[NSView alloc] initWithFrame:frame];
+    content.wantsLayer = YES;
+    content.layer.backgroundColor = [NSColor clearColor].CGColor;
     content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.contentView = content;
     g_shell_corner_radius = BroResolveShellCornerRadius(self);
 
-    // The window backdrop splits at the toolbar line. The chrome row keeps a
-    // permanent partial scrim so it always reads as dark glass over the
-    // behind-window blur; the browser area below carries an opaque black tint
-    // that fades to the same scrim when the active tab is blank (see
-    // -setGlassBackdropVisible:). CEF pages are opaque, so with a page showing
-    // the browser-area tint is only visible in the mobile-mode gutters.
-    CGFloat chromeY = frame.size.height - kToolbarHeight;
-    NSView* tint = [[NSView alloc]
-        initWithFrame:NSMakeRect(0, 0, frame.size.width, chromeY)];
-    tint.wantsLayer = YES;
-    tint.layer.backgroundColor = [NSColor blackColor].CGColor;
-    tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [content addSubview:tint];
-    _backdropTint = tint;
-
-    NSView* chromeTint = [[NSView alloc]
-        initWithFrame:NSMakeRect(0, chromeY, frame.size.width, kToolbarHeight)];
-    chromeTint.wantsLayer = YES;
-    chromeTint.layer.backgroundColor = BroGlassTintColor().CGColor;
-    chromeTint.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [content addSubview:chromeTint];
+    // A single stable shell-wide blur removes the material boundary at the
+    // page edge without stretching Liquid Glass lensing across the content
+    // area. Opaque CEF pages are composited above it in the browser area.
+    NSView* shellSurface = [[NSView alloc] initWithFrame:frame];
+    shellSurface.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSView* shellContent =
+        BroInstallShellSurface(shellSurface, BroShellCornerRadius());
+    [content addSubview:shellSurface];
+    _shellSurface = shellSurface;
 
     // Single chrome row at the very top; its content is inset past the
     // traffic lights.
     CGFloat toolbarY = frame.size.height - kToolbarHeight;
-    _navToolbar = [[BroToolbar alloc] initWithFrame:NSMakeRect(0, toolbarY, frame.size.width, kToolbarHeight)];
-    [content addSubview:_navToolbar];
+    _navToolbar = [[BroToolbar alloc]
+        initWithFrame:NSMakeRect(0, toolbarY, frame.size.width, kToolbarHeight)];
+    [shellContent addSubview:_navToolbar];
     g_toolbar = _navToolbar;
 
     // Tab strip inline in the toolbar row: after the nav buttons, before the
@@ -424,29 +399,15 @@ NSView* BroBrowserContainerView(void) {
   return self;
 }
 
-// Cross-fades the browser-area black tint to the chrome row's partial scrim
-// (glass on) or back to opaque (glass off). Animates alphaValue via the
-// animator so rapid tab flips retarget the in-flight fade; `hidden` is never
-// touched — a hidden tint would flash the window transparent.
+// Tracks whether the shell is exposed by a blank tab. The material itself is
+// always present now; only the opaque CEF page and its matching glass veil
+// transition above it.
 - (BOOL)glassBackdropVisible {
   return _glassBackdropVisible;
 }
 
 - (void)setGlassBackdropVisible:(BOOL)visible {
-  if (visible == _glassBackdropVisible) {
-    return;
-  }
   _glassBackdropVisible = visible;
-  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
-    ctx.duration = BroMotionReduced()
-                       ? 0.0
-                       : (visible ? kGlassBackdropFadeDuration
-                                  : kGlassPageFadeInDuration);
-    ctx.timingFunction = visible ? BroGlassTransitionTimingFunction()
-                                 : BroPageFadeInTimingFunction();
-    self.backdropTint.animator.alphaValue =
-        visible ? kBroGlassTintAlpha : 1.0;
-  } completionHandler:nil];
 }
 
 @end
@@ -534,7 +495,7 @@ static BOOL g_split_divider_dragging = NO;
     grip_.wantsLayer = YES;
     grip_.layer.cornerRadius = BroCapsuleCornerRadius(NSWidth(grip_.frame));
     grip_.layer.backgroundColor =
-        [NSColor colorWithWhite:1.0 alpha:0.4].CGColor;
+        [[NSColor labelColor] colorWithAlphaComponent:0.4].CGColor;
     grip_.layer.actions = BroLayerTransitionActions();
     grip_.autoresizingMask = NSViewMinYMargin | NSViewMaxYMargin;
     [self addSubview:grip_];
@@ -562,10 +523,10 @@ static BOOL g_split_divider_dragging = NO;
 - (void)updateHighlight {
   BOOL lit = hovered_ || g_split_divider_dragging;
   line_.layer.backgroundColor =
-      lit ? [NSColor colorWithWhite:1.0 alpha:0.25].CGColor
+      lit ? [[NSColor labelColor] colorWithAlphaComponent:0.25].CGColor
           : BroControlBorderColor().CGColor;
   grip_.layer.backgroundColor =
-      [NSColor colorWithWhite:1.0 alpha:lit ? 0.7 : 0.4].CGColor;
+      [[NSColor labelColor] colorWithAlphaComponent:lit ? 0.7 : 0.4].CGColor;
 }
 
 - (void)mouseEntered:(NSEvent*)event {
@@ -770,8 +731,8 @@ static NSView* CreateTabContainerView(void) {
 static BOOL g_window_occluded = NO;
 
 // Central visibility rule: only the active tab's container is visible, and
-// not even that one while the tab is blank (the black window backdrop is the
-// new-tab state). Hiding the container NSView is not
+// not even that one while the tab is blank (the shell surface is the new-tab
+// state). Hiding the container NSView is not
 // enough for Chromium's occlusion tracking in windowed CEF (measured:
 // background tabs kept rendering rAF at ~45fps and timers at ~4.5Hz), so
 // hidden containers are detached from the window entirely —
@@ -787,10 +748,15 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
   BroHandler* handler = BroHandler::GetInstance();
   ValidateSplitState(active_browser_id);
   NSView* parent = g_main_window.browserContainer;
-  // Glass backdrop iff every visible pane is blank: a blank tab draws no page
-  // pixels, so the backdrop is its entire surface. With a split showing one
-  // loaded pane the window stays opaque black — half-glass at the divider
-  // would look broken. active_browser_id == -1 (no tabs) resolves to black.
+  if (BroMotionReduced() && g_glass_transition_overlay) {
+    ++g_glass_transition_token;
+    [g_glass_transition_overlay removeFromSuperview];
+    g_glass_transition_overlay = nil;
+    [g_fading_out_ids removeAllObjects];
+  }
+  // Use the full-browser veil only when every visible pane is blank. A mixed
+  // split exposes the same shell in its blank pane without covering the loaded
+  // partner. With no active tab there is no page transition to animate.
   BOOL activeBlank = [g_blank_tab_ids containsObject:@(active_browser_id)];
   BOOL partnerBlank =
       !SplitActive() || [g_blank_tab_ids containsObject:@(g_split_browser_id)];
@@ -809,7 +775,8 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
       BOOL shouldFadeOut = wantsGlass && wasOnScreen && !g_window_occluded &&
                            !BroMotionReduced();
       if (shouldFadeOut) {
-        if (![g_fading_out_ids containsObject:key]) {
+        if (![g_fading_out_ids containsObject:key] ||
+            !g_glass_transition_overlay) {
           [g_fading_out_ids addObject:key];
           NSView* glassOverlay =
               BroCreateGlassTransitionOverlay(parent, 0.0);
@@ -825,19 +792,19 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
                     g_glass_transition_overlay != glassOverlay) {
                   return;
                 }
-                if ([g_fading_out_ids containsObject:key] &&
-                    g_browser_views[key] == container) {
-                  [g_fading_out_ids removeObject:key];
-                  [container removeFromSuperview];
-                  container.hidden = YES;
-                  container.alphaValue = 1.0;
+                for (NSNumber* fadingKey in g_fading_out_ids.allObjects) {
+                  NSView* fadingContainer = g_browser_views[fadingKey];
+                  [fadingContainer removeFromSuperview];
+                  fadingContainer.hidden = YES;
+                  fadingContainer.alphaValue = 1.0;
                   BroHandler* currentHandler = BroHandler::GetInstance();
                   if (currentHandler) {
-                    currentHandler->SetBrowserHidden(key.intValue, true);
+                    currentHandler->SetBrowserHidden(fadingKey.intValue, true);
                   }
                 }
-                // Keep the finished veil for one display frame so the real
-                // backdrop tint has certainly reached its matching endpoint.
+                [g_fading_out_ids removeAllObjects];
+                // Keep the finished veil just long enough for the CEF detach
+                // to commit; the shell below is already the matching material.
                 dispatch_after(
                     dispatch_time(DISPATCH_TIME_NOW,
                                   (int64_t)(kGlassHandoffDelay * NSEC_PER_SEC)),
@@ -867,8 +834,11 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
     } else {
       [g_fading_out_ids removeObject:key];
       BOOL wasDetached = container.superview != parent;
-      BOOL shouldFadeIn = glassWasVisible && !wantsGlass && wasDetached &&
-                          !BroMotionReduced();
+      BOOL hasTransitionVeil =
+          g_glass_transition_overlay.superview == parent;
+      BOOL shouldFadeIn =
+          !wantsGlass && !BroMotionReduced() &&
+          ((glassWasVisible && wasDetached) || hasTransitionVeil);
       NSView* revealOverlay =
           shouldFadeIn ? BroCreateGlassTransitionOverlay(parent, 1.0) : nil;
       container.alphaValue = 1.0;
@@ -1154,6 +1124,7 @@ static double NextZoomPercent(double currentPercent, BOOL zoomingIn) {
 
 // Transient bubble showing the current zoom percentage.
 static NSView* g_zoom_hud = nil;
+static NSView* g_zoom_hud_content = nil;
 static NSTextField* g_zoom_hud_label = nil;
 static NSTimer* g_zoom_hud_timer = nil;
 
@@ -1169,6 +1140,8 @@ static void ShowZoomHUD(int percent) {
     g_zoom_hud.layer.cornerRadius = BroCornerRadiusForSize(
         BroSurfaceCornerRadius(), g_zoom_hud.bounds.size);
     BroApplyElevation(g_zoom_hud, BroElevationOverlay);
+    g_zoom_hud_content =
+        BroInstallGlassSurface(g_zoom_hud, g_zoom_hud.layer.cornerRadius);
     g_zoom_hud.hidden = YES;
 
     g_zoom_hud_label = [[NSTextField alloc] initWithFrame:NSZeroRect];
@@ -1178,9 +1151,9 @@ static void ShowZoomHUD(int percent) {
     g_zoom_hud_label.bordered = NO;
     g_zoom_hud_label.drawsBackground = NO;
     g_zoom_hud_label.font = BroUIFontBold(14.0);
-    g_zoom_hud_label.textColor = [NSColor whiteColor];
+    g_zoom_hud_label.textColor = [NSColor labelColor];
     g_zoom_hud_label.alignment = NSTextAlignmentCenter;
-    [g_zoom_hud addSubview:g_zoom_hud_label];
+    [g_zoom_hud_content addSubview:g_zoom_hud_label];
   }
   // (Re-)add last so the HUD composites above the native CEF browser view.
   if (g_zoom_hud.superview != container) {
@@ -1472,8 +1445,14 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 @implementation BroAppDelegate
 
 - (void)createApplication:(id)object {
-  // The chrome is designed dark-only; force dark so system controls match.
-  NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  // Regular Liquid Glass owns local light/dark adaptation on macOS 26+.
+  // Older systems keep Bro's established dark HUD fallback unchanged.
+  if (@available(macOS 26.0, *)) {
+    NSApp.appearance = nil;
+  } else {
+    NSApp.appearance =
+        [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  }
 
   // Before the menu, so the "Check for Updates…" item can bind to a live
   // updater rather than a nil target.
