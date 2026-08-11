@@ -8,8 +8,17 @@ Bro Computer strips browsing down to what matters: the page. One quiet row of ch
 
 Download the latest DMG from the [**latest release**](../../releases/latest) — it is rebuilt automatically on every commit to `main`. The release always holds exactly one DMG: the current build.
 
-> **First launch:** builds are ad-hoc signed (not notarized), so macOS will warn you.
-> Right-click `Bro Computer.app` → **Open** → **Open** the first time. After that it opens normally.
+> **First launch:** builds are ad-hoc signed (not notarized), so macOS blocks the
+> first open with a "cannot be verified" warning. To get past it once:
+>
+> - **macOS 15 (Sequoia) and later:** open the app, dismiss the warning, then go to
+>   **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+>   (The old right-click → Open shortcut no longer works on these versions.)
+> - **Any version, from the terminal:** run
+>   `xattr -dr com.apple.quarantine "/Applications/Bro Computer.app"` (adjust the path
+>   to wherever you moved it), then open it normally.
+>
+> After the first successful open it launches like any other app.
 
 Requires macOS 12.0+ on Apple Silicon.
 
