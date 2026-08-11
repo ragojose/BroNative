@@ -153,6 +153,13 @@ static int g_viewport_anim_token = 0;
 static BOOL g_viewport_animating = NO;
 static BOOL g_visibility_update_pending = NO;
 
+// True while screenshot mode (Cmd+S) is hiding the chrome. Declared up here
+// (rather than with the rest of the feature, in the pragma mark below) so
+// UpdateTabContainerVisibility's glass-backdrop check can read it -- that
+// function is defined earlier in the file. See "#pragma mark - Screenshot
+// Mode" for the toggle itself.
+static BOOL g_screenshot_mode_active = NO;
+
 // TabIsMobile is declared extern in bro_mac_internal.h.
 BOOL TabIsMobile(int browser_id) {
   BroHandler* handler = BroHandler::GetInstance();
@@ -794,7 +801,10 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
   BOOL activeBlank = [g_blank_tab_ids containsObject:@(active_browser_id)];
   BOOL partnerBlank =
       !SplitActive() || [g_blank_tab_ids containsObject:@(g_split_browser_id)];
-  BOOL wantsGlass = activeBlank && partnerBlank;
+  // Screenshot mode forces the glass on unconditionally: the browser
+  // container sits inset from the window edge there, and the gutter around
+  // it is this same glass, regardless of whether the page itself is blank.
+  BOOL wantsGlass = g_screenshot_mode_active || (activeBlank && partnerBlank);
   BOOL glassWasVisible = [g_main_window glassBackdropVisible];
   for (NSNumber* key in g_browser_views) {
     // Split screen widens the visible set to both panes; each stays attached
@@ -1068,6 +1078,141 @@ void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
       }
       completionHandler:finish];
 }
+
+#pragma mark - Screenshot Mode
+
+// Cmd+S (View menu) hides the toolbar -- and the tab strip nested inside it,
+// since BroTabBar is one of its subviews -- and the traffic lights, leaving
+// an Arc-style frame: the page sits as a rounded card inset by
+// kScreenshotModeGutter on all four sides, with the window's existing glass
+// (the same material the chrome row already wears -- setGlassBackdropVisible:
+// below) showing through the gutter, and the existing hairline
+// (BroWindowBorderView) still tracing the true window edge outside all of
+// it. The active tab's container(s) already fill 100% of browserContainer's
+// bounds in every mode -- desktop, mobile, split -- so animating just
+// browserContainer's own frame is enough: AppKit's autoresizing reflows the
+// CEF containers, their CEF child views, and the split divider at every
+// tick, the same way applyTabLayout: leans on autoresizing instead of
+// hand-reframing each child (bro_tabstrip.mm). g_screenshot_mode_active
+// itself lives up with the other early globals -- UpdateTabContainerVisibility
+// reads it and is defined earlier in this file.
+static const CGFloat kScreenshotModeGutter = 8.0;
+static id g_screenshot_esc_monitor = nil;
+// Traffic-light visibility as it was the moment screenshot mode was entered;
+// restored exactly rather than assumed, since fullscreen and other states can
+// already have them hidden independently.
+static BOOL g_screenshot_saved_close_hidden = NO;
+static BOOL g_screenshot_saved_miniaturize_hidden = NO;
+static BOOL g_screenshot_saved_zoom_hidden = NO;
+
+static void RemoveScreenshotEscMonitor(void) {
+  if (g_screenshot_esc_monitor) {
+    [NSEvent removeMonitor:g_screenshot_esc_monitor];
+    g_screenshot_esc_monitor = nil;
+  }
+}
+
+// Toggles the mode; shared by the View menu item and by newTab:/
+// focusAddressBar:, which exit the mode before doing their own thing --
+// both need the chrome back to be usable. Declared static; BroAppDelegate's
+// toggleScreenshotMode: is the entry point from outside this pragma mark.
+static void ToggleScreenshotMode(void) {
+  if (!g_main_window) {
+    return;
+  }
+  BroDismissTransientOverlays();
+  // Releases focus from an editing address field or tab search field --
+  // hidden views stay in the responder chain otherwise.
+  [g_main_window makeFirstResponder:nil];
+
+  g_screenshot_mode_active = !g_screenshot_mode_active;
+  BOOL active = g_screenshot_mode_active;
+
+  if (active) {
+    if (!g_screenshot_esc_monitor) {
+      // Mirrors the command palette's and downloads popover's own Esc
+      // monitors (bro_palette.mm, bro_downloads.mm): a local monitor is the
+      // established way this codebase gives a transient mode first claim on
+      // Escape without touching BroApplication's global sendEvent: path.
+      g_screenshot_esc_monitor = [NSEvent
+          addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                       handler:^NSEvent*(NSEvent* event) {
+        if (event.keyCode == 53 /* Esc */) {
+          ToggleScreenshotMode();
+          return nil;
+        }
+        return event;
+      }];
+    }
+  } else {
+    RemoveScreenshotEscMonitor();
+  }
+
+  NSButton* closeButton = [g_main_window standardWindowButton:NSWindowCloseButton];
+  NSButton* miniaturizeButton =
+      [g_main_window standardWindowButton:NSWindowMiniaturizeButton];
+  NSButton* zoomButton = [g_main_window standardWindowButton:NSWindowZoomButton];
+  if (active) {
+    g_screenshot_saved_close_hidden = closeButton.hidden;
+    g_screenshot_saved_miniaturize_hidden = miniaturizeButton.hidden;
+    g_screenshot_saved_zoom_hidden = zoomButton.hidden;
+    closeButton.hidden = YES;
+    miniaturizeButton.hidden = YES;
+    zoomButton.hidden = YES;
+  } else {
+    closeButton.hidden = g_screenshot_saved_close_hidden;
+    miniaturizeButton.hidden = g_screenshot_saved_miniaturize_hidden;
+    zoomButton.hidden = g_screenshot_saved_zoom_hidden;
+  }
+
+  NSRect contentBounds = g_main_window.contentView.bounds;
+  NSRect containerTarget =
+      active ? NSInsetRect(contentBounds, kScreenshotModeGutter,
+                           kScreenshotModeGutter)
+             : NSMakeRect(0, 0, contentBounds.size.width,
+                          contentBounds.size.height - kToolbarHeight);
+
+  if (!active) {
+    // Make the toolbar visible again before fading it in -- a hidden view's
+    // alpha animation never draws.
+    g_toolbar.hidden = NO;
+    g_toolbar.alphaValue = 0.0;
+  }
+
+  // The card's own corner radius derives from the window's (bro_geometry's
+  // concentric rule): normally browserContainer needs no rounding of its
+  // own, since it fills edge-to-edge and the window's NSThemeFrame clips it
+  // to the window shape for free (see BroWindowCornerRadius above). Inset
+  // from the edge by the gutter, it has to carry its own curve to read as a
+  // card rather than a clipped rectangle.
+  g_main_window.browserContainer.wantsLayer = YES;
+  CALayer* containerLayer = g_main_window.browserContainer.layer;
+  containerLayer.masksToBounds = YES;
+  containerLayer.cornerCurve = kCACornerCurveContinuous;
+  CGFloat cardRadius = active
+      ? BroNestedCornerRadius(BroWindowCornerRadius(g_main_window),
+                              kScreenshotModeGutter)
+      : 0.0;
+
+  BroRunLayoutSpring(^{
+    g_toolbar.animator.alphaValue = active ? 0.0 : 1.0;
+    g_main_window.browserContainer.animator.frame = containerTarget;
+    containerLayer.cornerRadius = cardRadius;
+  }, ^{
+    g_toolbar.hidden = active;
+    UpdateChromeLayout();  // final snap: exact per-tab/divider frames
+    BroHandler* handler = BroHandler::GetInstance();
+    if (handler) {
+      // Recomputes the glass backdrop now that g_screenshot_mode_active has
+      // changed -- forces it on while active, restores the blank-tab-driven
+      // default on exit. Attach/detach state is unchanged, so this is a
+      // no-op for every container's frame.
+      UpdateTabContainerVisibility(handler->GetActiveBrowserId());
+    }
+  });
+}
+
+#pragma mark - Split Screen
 
 // Enters or exits split screen for |browser_id| (hover-card button and menu
 // item). A non-active tab becomes the right pane; either pane toggles the
@@ -1588,6 +1733,12 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
                    keyEquivalent:@"m"];
   mobileItem.keyEquivalentModifierMask =
       NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  // Screenshot mode: hides the chrome so the page floats as a rounded card
+  // inside the glass gutter. Plain Cmd+S -- Split Screen uses Cmd+Shift+S,
+  // so the two don't collide.
+  [viewMenu addItemWithTitle:@"Screenshot Mode"
+                       action:@selector(toggleScreenshotMode:)
+                keyEquivalent:@"s"];
   [viewMenu addItem:[NSMenuItem separatorItem]];
 
   // Zoom controls. Cmd+"=" is the unshifted "+" key; a "+" key equivalent
@@ -1966,6 +2117,10 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)newTab:(id)sender {
+  // The user needs the chrome back to see the new tab land.
+  if (g_screenshot_mode_active) {
+    ToggleScreenshotMode();
+  }
   CreateNewBrowserTab();
 }
 
@@ -2171,11 +2326,24 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
     menuItem.title = SplitActive() ? @"Exit Split Screen" : @"Split Screen";
     return SplitActive() || (g_tab_bar && g_tab_bar.tabs.count > 1);
   }
+  if (action == @selector(toggleScreenshotMode:)) {
+    menuItem.state = g_screenshot_mode_active ? NSControlStateValueOn
+                                              : NSControlStateValueOff;
+    return YES;
+  }
   return YES;
+}
+
+- (void)toggleScreenshotMode:(id)sender {
+  ToggleScreenshotMode();
 }
 
 - (void)focusAddressBar:(id)sender {
   BroDismissTransientOverlays();
+  // Typing needs the chrome back.
+  if (g_screenshot_mode_active) {
+    ToggleScreenshotMode();
+  }
   if (g_toolbar) {
     [g_toolbar focusAddressField];
   }
