@@ -580,6 +580,13 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   return ok;
 }
 
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  if (focused_) {
+    self.layer.borderColor = BroControlBorderColor().CGColor;
+  }
+}
+
 - (void)keyDown:(NSEvent*)event {
   NSString* characters = event.charactersIgnoringModifiers;
   unichar key = characters.length > 0 ? [characters characterAtIndex:0] : 0;
@@ -638,6 +645,11 @@ static NSArray<BroPaletteItem*>* BroPaletteHistoryItems(void) {
   NSArray<BroPaletteItem*>* closedItems_;
   NSArray<BroPaletteItem*>* commandItems_;
   NSArray<BroPaletteItem*>* historyItems_;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  separator_.layer.backgroundColor = [NSColor separatorColor].CGColor;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {

@@ -140,6 +140,13 @@ static const CGFloat kDownloadsFooterHeight = 36.0;
   return ok;
 }
 
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  if (focused_) {
+    self.layer.borderColor = BroControlBorderColor().CGColor;
+  }
+}
+
 - (void)keyDown:(NSEvent*)event {
   NSString* characters = event.charactersIgnoringModifiers;
   unichar key = characters.length > 0 ? [characters characterAtIndex:0] : 0;
@@ -180,6 +187,11 @@ static const CGFloat kDownloadsFooterHeight = 36.0;
   BroHoverHighlightGroup* rowHighlightGroup_;
   __weak BroHoverButton* focusedRevealButton_;
   __weak BroHoverButton* hoveredRevealButton_;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  separator_.layer.backgroundColor = [NSColor separatorColor].CGColor;
 }
 
 static NSAttributedString* BroDownloadsButtonTitle(NSString* text,

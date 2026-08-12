@@ -18,6 +18,9 @@
 // hairline is its primary structural selection cue.
 static const CGFloat kActiveTabBorderAlpha = 0.28;
 static const CGFloat kHoveredTabBorderAlpha = 0.18;
+// Resting pills keep the strip's 8pt gap. As a dragged pill comes within 6pt
+// of a neighbor, AppKit's glass container performs the native merge/split.
+static const CGFloat kTabGlassMergeSpacing = 6.0;
 static const CFTimeInterval kTabColorTransitionDuration = 0.18;
 
 static NSDictionary* BroTabLayerTransitionActions(void) {
@@ -194,6 +197,12 @@ BOOL BroEventMatchesShortcut(NSEvent* event,
     self.layer.borderColor = _baseBorderColor.CGColor;
     self.layer.borderWidth = _baseBorderWidth;
   }
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  [self refreshBorder];
+  [self refreshBackground];
 }
 
 - (void)setBaseBorderWidth:(CGFloat)width {
@@ -410,10 +419,12 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 @implementation BroTabView {
-  // macOS 12–25 keep the active browse input's established HUD glass. On
-  // macOS 26+ the whole toolbar is one Regular glass surface, so a nested
-  // pill surface would be glass-on-glass and is deliberately omitted.
+  // Every macOS 26 pill owns a native glass descendant so the tab strip's
+  // NSGlassEffectContainerView can batch it and merge neighboring pills
+  // during drag. Older systems retain the established HUD fallback.
   NSView* glassBackdrop_;
+  NSView* pillContentHost_;
+  BOOL nativeGlassBackdrop_;
   BOOL hovered_;
   BOOL focused_;
   // Target state of the trailing action fade; guards against the many
@@ -448,12 +459,22 @@ void BroFetchFaviconGuarded(NSString* urlString,
     // accent-colored ring.
     self.focusRingType = NSFocusRingTypeNone;
 
-    // Older systems retain the active pill's HUD surface. Regular Liquid
-    // Glass on macOS 26+ belongs to the toolbar host instead, with this pill
-    // communicating selection through an adaptive fill and hairline.
+    // Native pills stay neutral; selection is layered through adaptive
+    // content and a restrained fill so all descendants remain sufficiently
+    // similar for NSGlassEffectContainerView to merge them.
     if (@available(macOS 26.0, *)) {
-      glassBackdrop_ = nil;
-    } else {
+      if (BroShouldUseNativeGlass()) {
+        NSGlassEffectView* glass =
+            [[NSGlassEffectView alloc] initWithFrame:self.bounds];
+        glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        glass.cornerRadius = BroNestedCornerRadius(pillCornerRadius, 0.0);
+        glass.style = BroGlassEffectStyle();
+        glass.tintColor = nil;
+        glassBackdrop_ = glass;
+        nativeGlassBackdrop_ = YES;
+      }
+    }
+    if (!glassBackdrop_) {
       NSVisualEffectView* glass =
           [[NSVisualEffectView alloc] initWithFrame:self.bounds];
       glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -469,8 +490,23 @@ void BroFetchFaviconGuarded(NSString* urlString,
       glassBackdrop_ = glass;
     }
     if (glassBackdrop_) {
-      glassBackdrop_.hidden = YES;
+      glassBackdrop_.hidden = !nativeGlassBackdrop_;
       [self addSubview:glassBackdrop_];
+    }
+
+    // NSGlassEffectView composites its contentView above the refractive
+    // material. Keeping controls as siblings puts their glyphs and text below
+    // the effect and can wash them out completely. The legacy path uses the
+    // same host as an ordinary sibling so both layouts remain identical.
+    pillContentHost_ = [[NSView alloc] initWithFrame:self.bounds];
+    pillContentHost_.autoresizingMask =
+        NSViewWidthSizable | NSViewHeightSizable;
+    if (nativeGlassBackdrop_) {
+      if (@available(macOS 26.0, *)) {
+        ((NSGlassEffectView*)glassBackdrop_).contentView = pillContentHost_;
+      }
+    } else {
+      [self addSubview:pillContentHost_];
     }
 
     // Favicon view
@@ -483,7 +519,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _faviconView.image = RadixIconImage(RadixIconGlobe, 15);
     _faviconView.contentTintColor = BroPlaceholderFaviconColor();
     showingDefaultFavicon_ = YES;
-    [self addSubview:_faviconView];
+    [pillContentHost_ addSubview:_faviconView];
 
     // The host remains authoritative while loading; its shimmer is the one
     // loading treatment, so the favicon never swaps to a second animation.
@@ -495,7 +531,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
         frame.size.width - 32 - 26, kTabTextFrameHeight);
     [_titleLabel setText:kBroBlankTabTitle];
     _titleLabel.autoresizingMask = NSViewWidthSizable;
-    [self addSubview:_titleLabel];
+    [pillContentHost_ addSubview:_titleLabel];
 
     // Trailing tab action: normal tabs show close; pinned tabs reuse the same
     // slot and hover behavior for unpin.
@@ -535,7 +571,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _closeButton = closeButton;
     // Start hidden to match trailingActionShown_'s NO default.
     _closeButton.hidden = YES;
-    [self addSubview:_closeButton];
+    [pillContentHost_ addSubview:_closeButton];
 
     [self updateAppearance];
 
@@ -662,10 +698,10 @@ void BroFetchFaviconGuarded(NSString* urlString,
   [CATransaction setDisableActions:BroMotionReduced()];
   BOOL usesAdaptiveToolbarGlass = NO;
   if (@available(macOS 26.0, *)) {
-    usesAdaptiveToolbarGlass = YES;
+    usesAdaptiveToolbarGlass = BroShouldUseNativeGlass();
   }
   if (_isActive) {
-    glassBackdrop_.hidden = _dropTarget;
+    glassBackdrop_.hidden = nativeGlassBackdrop_ ? NO : _dropTarget;
     self.layer.backgroundColor =
         usesAdaptiveToolbarGlass
             ? [[NSColor labelColor] colorWithAlphaComponent:0.08].CGColor
@@ -678,7 +714,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
     _titleLabel.color = foreground;
     [self applyDefaultFaviconColor:foreground];
   } else {
-    glassBackdrop_.hidden = _dropTarget;
+    glassBackdrop_.hidden = nativeGlassBackdrop_ ? NO : _dropTarget;
     self.layer.backgroundColor = [NSColor clearColor].CGColor;
     BOOL emphasizeBorder = _isSplitPane || hovered_ || focused_;
     CGFloat borderAlpha =
@@ -692,7 +728,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
   // A dragged pill hovering this one (drop = split the two tabs) outshines
   // every other state so the target is unmistakable.
   if (_dropTarget) {
-    glassBackdrop_.hidden = YES;
+    glassBackdrop_.hidden = !nativeGlassBackdrop_;
     self.layer.backgroundColor =
         [[NSColor labelColor] colorWithAlphaComponent:0.14].CGColor;
     self.layer.borderColor =
@@ -720,6 +756,11 @@ void BroFetchFaviconGuarded(NSString* urlString,
       : (_closable && (_isActive || hovered_ || focused_ ||
                        trailingActionFocused_));
   [self setTrailingActionShown:showAction];
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  [self updateAppearance];
 }
 
 // Fades the close/unpin action in/out instead of snapping.
@@ -1264,6 +1305,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 @implementation BroTabBar {
   BroHorizontalTabScrollView* tabScrollView_;
+  NSView* tabDocumentView_;
   NSView* tabContentView_;
   BroTabView* draggingTab_;
   BOOL dragging_;
@@ -1316,7 +1358,9 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     tabContentView_ =
         [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
     tabContentView_.wantsLayer = YES;
-    tabScrollView_.documentView = tabContentView_;
+    tabDocumentView_ = BroGlassContainerForContentView(
+        tabContentView_, kTabGlassMergeSpacing);
+    tabScrollView_.documentView = tabDocumentView_;
     [self addSubview:tabScrollView_];
 
     // Borderless "+" control, pinned between the scroll viewport and Search.
@@ -1954,7 +1998,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   }
 
   CGFloat documentWidth = MAX(viewportWidth, x);
-  tabContentView_.frame = NSMakeRect(0, 0, documentWidth, height);
+  tabDocumentView_.frame = NSMakeRect(0, 0, documentWidth, height);
+  tabContentView_.frame = tabDocumentView_.bounds;
   [self clampScrollOffset];
 
   // The "+" trails the last pill by one gap (`x` already carries it) so it

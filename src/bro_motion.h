@@ -53,27 +53,32 @@ extern void BroRunLayoutSpring(void (^changes)(void),
 extern void BroApplyElevation(NSView* view, BroElevation elevation);
 
 // Shared material tokens for every glass surface. macOS 26 uses untinted
-// Regular glass; older systems retain the dark HUD-style fallback.
+// Regular glass; older systems retain an appearance-adaptive HUD fallback.
 extern const CGFloat kBroGlassTintAlpha;
 extern const CGFloat kBroGlassBorderWidth;
 extern NSColor* BroGlassTintColor(void);
 extern NSColor* BroGlassBorderColor(void);
 extern NSGlassEffectViewStyle BroGlassEffectStyle(void)
     API_AVAILABLE(macos(26.0));
+// Runtime gate shared by every native surface. BRO_FORCE_LEGACY_GLASS=1 is a
+// test seam for exercising the macOS 12–25 fallback on a macOS 26 machine.
+extern BOOL BroShouldUseNativeGlass(void);
 
-// Installs the stable, shell-sized backdrop. It deliberately uses the
-// conventional behind-window blur plus one tint rather than Liquid Glass,
-// whose large-surface lensing continuously refracts background geometry.
-// The returned sibling host owns the toolbar and other shell content.
+// Installs the shell-sized native Liquid Glass backdrop on macOS 26. The
+// returned host is NSGlassEffectView.contentView there; older systems receive
+// the same content over the existing visual-effect fallback.
 extern NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius);
 
 // Replaces the elevation's flat fill with the shared glass surface and
-// returns the sibling host that must own the surface's controls. Keeping the
-// host outside NSGlassEffectView.contentView preserves normal field-editor,
-// hit-testing, visibility, and Core Animation behavior on macOS 26; older
-// systems use the same hierarchy above the existing HUD blur + tint.
+// returns the host that must own the surface's controls. On macOS 26 this is
+// the native glass view's contentView; older systems use a sibling host above
+// the existing HUD blur + tint.
 // Call after BroApplyElevation and add all visible content to the result.
 extern NSView* BroInstallGlassSurface(NSView* panel, CGFloat cornerRadius);
+// Wraps related glass descendants in AppKit's batching/merging container on
+// macOS 26 and returns |contentView| unchanged on the legacy path.
+extern NSView* BroGlassContainerForContentView(NSView* contentView,
+                                               CGFloat spacing);
 extern void BroOverlayShow(NSView* view);
 extern void BroOverlayHide(NSView* view);
 
