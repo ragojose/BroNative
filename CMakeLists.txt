@@ -88,6 +88,8 @@ set(BRO_SRCS
     src/radix_icons.mm
     src/tab_description_fetcher.cc
     src/tab_description_fetcher.h
+    src/tab_thumbnail_fetcher.cc
+    src/tab_thumbnail_fetcher.h
 )
 
 set(BRO_HELPER_SRCS
@@ -194,6 +196,7 @@ target_link_libraries(${EXECUTABLE_NAME}
     libcef_dll_wrapper
     ${CEF_STANDARD_LIBS}
     "-framework QuartzCore"
+    "-framework ImageIO"
     "-F${sparkle_SOURCE_DIR}"
     "-framework Sparkle"
 )

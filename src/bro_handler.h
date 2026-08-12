@@ -10,6 +10,7 @@
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_download_handler.h"
 #include "tab_description_fetcher.h"
+#include "tab_thumbnail_fetcher.h"
 
 #include <set>
 
@@ -116,6 +117,12 @@ class BroHandler : public CefClient,
   // Best-effort: silently does nothing if the browser is gone, and never
   // assumes the DevTools result callback fires.
   void FetchTabDescription(int browser_id);
+
+  // Asynchronously captures a snapshot of the tab's page via the DevTools
+  // protocol; the result arrives through OnTabThumbnailAvailable.
+  // Best-effort: silently does nothing if the browser is gone, and never
+  // assumes the DevTools result callback fires.
+  void FetchTabThumbnail(int browser_id);
 
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
@@ -253,6 +260,9 @@ class BroHandler : public CefClient,
 
   // DevTools CDP round trip that backs FetchTabDescription.
   TabDescriptionFetcher tab_description_fetcher_;
+
+  // DevTools CDP round trip that backs FetchTabThumbnail.
+  TabThumbnailFetcher tab_thumbnail_fetcher_;
 
   // True while CloseAllBrowsers is tearing everything down (window close /
   // app quit). Individual tab closes are handled by detaching the tab's view

@@ -44,7 +44,9 @@ std::string EscapeHTML(const std::string& text) {
 }  // namespace
 
 BroHandler::BroHandler(bool is_alloy_style)
-    : is_alloy_style_(is_alloy_style), tab_description_fetcher_(this) {
+    : is_alloy_style_(is_alloy_style),
+      tab_description_fetcher_(this),
+      tab_thumbnail_fetcher_(this) {
   DCHECK(!g_instance);
   g_instance = this;
 }
@@ -76,6 +78,12 @@ void BroHandler::SetActiveBrowser(int browser_id) {
   if (browser_id == browser_registry_.active_id()) {
     return;
   }
+
+  // Snapshot the outgoing tab for its hover-card thumbnail while the
+  // compositor surface still holds the on-screen frame; the capture resolves
+  // asynchronously and tolerates the WasHidden that follows.
+  tab_thumbnail_fetcher_.Fetch(
+      browser_registry_.GetById(browser_registry_.active_id()));
 
   CefRefPtr<CefBrowser> browser = browser_registry_.SetActive(browser_id);
   if (browser) {
@@ -202,6 +210,17 @@ void BroHandler::FetchTabDescription(int browser_id) {
   tab_description_fetcher_.Fetch(browser);
 }
 
+void BroHandler::FetchTabThumbnail(int browser_id) {
+  if (!CefCurrentlyOn(TID_UI)) {
+    CefPostTask(TID_UI, base::BindOnce(&BroHandler::FetchTabThumbnail, this,
+                                       browser_id));
+    return;
+  }
+
+  CefRefPtr<CefBrowser> browser = browser_registry_.GetById(browser_id);
+  tab_thumbnail_fetcher_.Fetch(browser);
+}
+
 void BroHandler::OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
                                         int message_id,
                                         bool success,
@@ -210,6 +229,8 @@ void BroHandler::OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
   CEF_REQUIRE_UI_THREAD();
   tab_description_fetcher_.HandleMethodResult(browser, message_id, success,
                                               result, result_size);
+  tab_thumbnail_fetcher_.HandleMethodResult(browser, message_id, success,
+                                            result, result_size);
 }
 
 void BroHandler::ApplyEmulationToBrowser(CefRefPtr<CefBrowser> browser,
@@ -405,6 +426,7 @@ void BroHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
   browser_registry_.Remove(browser);
   mobile_tab_ids_.erase(browser_id);
   tab_description_fetcher_.OnBrowserClosed(browser_id);
+  tab_thumbnail_fetcher_.OnBrowserClosed(browser_id);
 
   // Notify UI about tab closure
   OnTabClosed(browser_id);

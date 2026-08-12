@@ -4,6 +4,7 @@
 // found in the LICENSE file.
 
 #import <Cocoa/Cocoa.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 
 #include <cmath>
@@ -2674,6 +2675,51 @@ void OnTabDescriptionAvailable(int browser_id, const std::string& description) {
   });
 }
 
+void OnTabThumbnailAvailable(int browser_id, const std::string& jpeg_base64) {
+  // Convert before dispatching (see UpdateURL).
+  NSString* base64Str =
+      [NSString stringWithUTF8String:jpeg_base64.c_str()] ?: @"";
+  // Decode and downscale off-main (the favicon loader's pattern); only
+  // delivery hops to main. The 512px cap bounds decoded memory to ~1MB per
+  // tab while staying above 2x of the hover card's drawn size.
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    NSImage* image = nil;
+    NSData* data = [[NSData alloc]
+        initWithBase64EncodedString:base64Str
+                            options:
+                                NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (data.length > 0) {
+      CGImageSourceRef source =
+          CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+      if (source) {
+        NSDictionary* opts = @{
+          (__bridge NSString*)kCGImageSourceCreateThumbnailFromImageAlways :
+              @YES,
+          (__bridge NSString*)kCGImageSourceThumbnailMaxPixelSize : @512,
+        };
+        CGImageRef thumb = CGImageSourceCreateThumbnailAtIndex(
+            source, 0, (__bridge CFDictionaryRef)opts);
+        if (thumb) {
+          image = [[NSImage alloc]
+              initWithCGImage:thumb
+                         size:NSMakeSize(CGImageGetWidth(thumb),
+                                         CGImageGetHeight(thumb))];
+          CGImageRelease(thumb);
+        }
+        CFRelease(source);
+      }
+    }
+    if (!image) {
+      return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (g_tab_bar) {
+        [g_tab_bar updateTabThumbnail:browser_id image:image];
+      }
+    });
+  });
+}
+
 void OnTabURLChanged(int browser_id, const std::string& url) {
   // Convert before dispatching (see UpdateURL).
   NSString* urlStr = [NSString stringWithUTF8String:url.c_str()] ?: @"";
@@ -2716,6 +2762,18 @@ void OnTabLoadingChanged(int browser_id, bool is_loading) {
   BroRunOnMain(^{
     if (g_tab_bar) {
       [g_tab_bar updateTabLoading:browser_id loading:is_loading];
+    }
+    // Refresh the hover-card thumbnail when a visible tab finishes loading;
+    // hidden tabs get theirs at switch-away time instead (their compositor
+    // may not produce frames).
+    if (!is_loading && ![g_blank_tab_ids containsObject:@(browser_id)]) {
+      BroHandler* handler = BroHandler::GetInstance();
+      BOOL visible = handler &&
+                     (browser_id == handler->GetActiveBrowserId() ||
+                      (SplitActive() && browser_id == g_split_browser_id));
+      if (visible) {
+        handler->FetchTabThumbnail(browser_id);
+      }
     }
   });
 }

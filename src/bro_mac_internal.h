@@ -85,6 +85,11 @@ static const NSTimeInterval kViewportAnimDuration = 0.28;
 static const NSTimeInterval kHoverCardDelay = 1.0;
 static const NSTimeInterval kHoverCardHideGrace = 0.3;
 static const CGFloat kHoverCardButtonSize = 24.0;
+// The card's page-snapshot band: inset from the card edges (its corner
+// radius stays concentric with the glass surface) and the fixed 16:10
+// crop it is aspect-filled into.
+static const CGFloat kHoverCardThumbnailInset = 6.0;
+static const CGFloat kHoverCardThumbnailAspect = 10.0 / 16.0;
 // Hover/press icon feedback: the whole button scales about its center,
 // animated by the shared 0.15s ease-out layer actions. Kept subtle so the
 // chrome stays calm; skipped entirely under Reduce Motion.
@@ -325,6 +330,10 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 // nil until fetched (empty string = fetched, page has none). Cleared whenever
 // tabURL changes.
 @property (nonatomic, copy) NSString* pageDescription;
+// Page snapshot captured via DevTools for the hover card; nil until a
+// capture lands. Cleared whenever tabURL changes; refreshed at switch-away,
+// on load-complete while visible, and on hover.
+@property (nonatomic, strong) NSImage* pageThumbnail;
 @property (nonatomic, weak) id target;
 @property (nonatomic, assign) SEL selectAction;
 @property (nonatomic, assign) SEL closeAction;
@@ -382,6 +391,7 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 - (void)tabFocusEnded:(BroTabView*)tab;
 - (void)hideHoverCard;
 - (void)updateTabDescription:(int)browserId description:(NSString*)desc;
+- (void)updateTabThumbnail:(int)browserId image:(NSImage*)image;
 // Toggles the tab's pinned state, moving it across the pinned/unpinned
 // boundary (pinned pills are a strict prefix of the strip).
 - (void)togglePinForTab:(BroTabView*)tab;
