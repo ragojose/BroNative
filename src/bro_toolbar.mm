@@ -506,9 +506,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
 }
 
 - (void)addressFieldDidFocus:(BroAddressField*)field {
-  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
-                        ? (BroTabView*)field.superview
-                        : nil;
+  BroTabView* tab = field.owningTab;
   if (!tab || !tab.isActive) {
     return;
   }
@@ -542,9 +540,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
     return;
   }
   BroAddressField* field = (BroAddressField*)notification.object;
-  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
-                        ? (BroTabView*)field.superview
-                        : nil;
+  BroTabView* tab = field.owningTab;
   NSNumber* reason = notification.userInfo[@"NSTextMovement"];
   if (tab.isActive && reason &&
       reason.integerValue == NSReturnTextMovement) {

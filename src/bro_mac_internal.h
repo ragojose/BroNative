@@ -278,6 +278,9 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 // NSTextField subclass that tells the toolbar when it gains focus, so the
 // pill can swap from host-only display to the full editable URL.
 @interface BroAddressField : NSTextField
+// The native glass pill owns this field through an intermediate contentView,
+// so the direct superview is not necessarily the BroTabView.
+@property (nonatomic, weak) BroTabView* owningTab;
 @end
 
 // One tab pill in the tab strip. Each pill permanently owns its address field;

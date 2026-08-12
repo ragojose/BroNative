@@ -160,6 +160,14 @@ CGFloat LineHeight(NSFont* font) {
   [self updateBackingScale];
 }
 
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  // BroTextLayer resolves its dynamic NSColor while drawing; invalidate the
+  // cached layer contents so an in-place System/Light/Dark change redraws it.
+  [baseTextLayer_ setNeedsDisplay];
+  [shimmerMaskLayer_ setNeedsDisplay];
+}
+
 - (void)viewDidMoveToWindow {
   [super viewDidMoveToWindow];
   [self updateBackingScale];
