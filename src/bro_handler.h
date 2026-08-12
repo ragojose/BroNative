@@ -35,6 +35,9 @@ void OpenLinkInNewTab(const std::string& url);
 void DetachTabView(int browser_id);
 // True if the browser was adopted as a tab in the main window.
 bool HasTabView(int browser_id);
+// True while the tab sits on a blank page (its CEF view is detached and the
+// welcome state fronts the window).
+bool BroTabIsBlank(int browser_id);
 // Creates a hidden tab container view for an incoming popup browser and
 // returns its CefWindowHandle plus current bounds. Returns nullptr if no
 // window is available to host it.
@@ -60,6 +63,7 @@ std::string ResolveDownloadTargetPath(const std::string& suggested_name);
 class BroHandler : public CefClient,
                    public CefDisplayHandler,
                    public CefFindHandler,
+                   public CefFocusHandler,
                    public CefLifeSpanHandler,
                    public CefLoadHandler,
                    public CefContextMenuHandler,
@@ -120,6 +124,7 @@ class BroHandler : public CefClient,
   // CefClient methods:
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
+  CefRefPtr<CefFocusHandler> GetFocusHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
@@ -141,6 +146,9 @@ class BroHandler : public CefClient,
                     const CefRect& selectionRect,
                     int activeMatchOrdinal,
                     bool finalUpdate) override;
+
+  // CefFocusHandler methods:
+  bool OnSetFocus(CefRefPtr<CefBrowser> browser, FocusSource source) override;
 
   // CefDevToolsMessageObserver methods:
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,

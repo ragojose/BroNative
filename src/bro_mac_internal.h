@@ -46,22 +46,22 @@ static inline CGFloat BroTrailingControlX(CGFloat toolbarWidth,
   return toolbarWidth - kToolbarTrailingInset - kButtonSize -
          indexFromRight * (kButtonSize + kButtonSpacing);
 }
-// Wide enough that the "Enter URL or search" placeholder reads in full.
+// Wide enough that a typical host label reads in full.
 static const CGFloat kTabPillMaxWidth = 180.0;
 static const CGFloat kTabPillMinWidth = 110.0;
 // In narrow windows (mobile shell) pills may shrink below the comfortable
 // minimum rather than overlap the controls to the right of the strip.
 // Below kTabPillTextMinWidth there is no room for readable text beside the
 // favicon, so pills collapse to squares — favicon only, as wide as they are
-// tall — and the active pill alone opens back up so its URL stays typable.
+// tall — and the active pill alone opens back up so its host stays readable.
 static const CGFloat kTabPillTextMinWidth = 64.0;
 // Pills narrower than this drop their close button so it doesn't crowd the
 // favicon and title.
 static const CGFloat kTabPillCloseMinWidth = 80.0;
 static const CGFloat kTabPillHeight = 28.0;
-// Every tab-text state shares these metrics: inactive morph, active resting
-// morph, and the editable address field. Keeping them tokenized prevents a
-// tab switch from changing either font size or baseline geometry.
+// Every tab-text state shares these metrics: inactive morph and active
+// resting morph. Keeping them tokenized prevents a tab switch from changing
+// either font size or baseline geometry.
 static const CGFloat kTabTextFontSize = 10.0;
 static const CGFloat kTabTextFrameHeight = 18.0;
 // A collapsed pill is exactly square.
@@ -215,6 +215,17 @@ extern void HideCommandPalette(void);
 // Releases the retained palette; called when the main window is torn down.
 extern void TeardownCommandPalette(void);
 
+// Welcome (new-tab) state: a centered logo + glass search input shown over
+// the shell while the active tab is blank, and the only URL entry point for
+// blank tabs. Visibility is driven from UpdateTabContainerVisibility, which
+// already runs on every relevant transition. Defined in bro_welcome.mm.
+extern void BroWelcomeSetVisible(BOOL visible, int activeBrowserId);
+extern BOOL BroWelcomeVisible(void);
+// ⌘L on a blank tab focuses this input (loaded tabs open the palette).
+extern void BroWelcomeFocusInput(void);
+// Releases the retained view; called when the main window is torn down.
+extern void BroTeardownWelcome(void);
+
 // Implicit-animation actions so state changes (hover/focus/active) fade
 // instead of snapping. Backing layers suppress implicit animations by
 // default; installing explicit actions re-enables them for these keys.
@@ -275,13 +286,9 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 
 #pragma mark - BroTabView
 
-// NSTextField subclass that tells the toolbar when it gains focus, so the
-// pill can swap from host-only display to the full editable URL.
-@interface BroAddressField : NSTextField
-@end
-
-// One tab pill in the tab strip. Each pill permanently owns its address field;
-// the active pill reveals it only while editing.
+// One tab pill in the tab strip: favicon, host label, and a trailing
+// close/unpin action. URL entry lives elsewhere (the welcome input on blank
+// tabs, the command palette everywhere).
 @interface BroTabView : NSView
 @property (nonatomic, assign) int browserId;
 // The tab bar remains the interaction owner even though pills live inside its
@@ -289,22 +296,16 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 @property (nonatomic, weak) BroTabBar* owningTabBar;
 @property (nonatomic, strong) NSImageView* faviconView;
 @property (nonatomic, strong) BroShimmerTextView* titleLabel;
-// Each pill owns its editor for its entire lifetime. Only the active pill may
-// reveal it, which avoids moving a live AppKit field editor between views.
-@property (nonatomic, strong) BroAddressField* addressField;
 @property (nonatomic, strong) BroHoverButton* closeButton;
 @property (nonatomic, assign) BOOL isActive;
 @property (nonatomic, assign) BOOL isLoading;
 // NO on a lone tab: closing it would close the window, so the pill hides ✕.
 @property (nonatomic, assign) BOOL closable;
-// YES while the owned address field is being edited; keeps the focused
-// border through hover/layout appearance refreshes.
-@property (nonatomic, assign) BOOL editingAddress;
 // YES once the pill is too narrow for text: favicon only, centered.
 @property (nonatomic, assign) BOOL iconOnly;
 // Pinned pills sit as compact favicon-only controls at the left edge of the
 // strip, with a separate hover-revealed unpin action. The active pinned pill
-// expands so the hosted address field stays usable; Cmd+W still closes it.
+// expands so its host label stays readable; Cmd+W still closes it.
 @property (nonatomic, assign) BOOL pinned;
 // YES while this tab is the split screen's right pane; inactive pills get the
 // active-ish border so both halves read as "on screen".
@@ -333,16 +334,13 @@ extern NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha);
 @property (nonatomic, copy) NSString* faviconURL;
 - (void)setLoading:(BOOL)loading;
 - (void)setTabURL:(NSString*)url;
-- (void)focusAddressField;
-- (void)finishAddressEditing;
 @end
 
 #pragma mark - BroTabBar
 
 // The tab strip lives INSIDE the toolbar row: tab pills scroll horizontally,
-// the active pill hosts the editable address field, the "+" trails the last
-// pill until the pills overflow, and the search control stays pinned at the
-// trailing edge.
+// the "+" trails the last pill until the pills overflow, and the search
+// control stays pinned at the trailing edge.
 @interface BroTabBar : NSView
 @property (nonatomic, strong) NSMutableArray<BroTabView*>* tabs;
 @property (nonatomic, strong) BroHoverButton* addTabButton;
@@ -412,12 +410,16 @@ extern BroTabBar* g_tab_bar;
 @property (nonatomic, strong) BroHoverButton* downloadsButton;
 @property (nonatomic, strong) BroHoverHighlightGroup* navigationHighlightGroup;
 @property (nonatomic, strong) BroHoverHighlightGroup* trailingHighlightGroup;
-- (void)addressFieldDidFocus:(BroAddressField*)field;
 - (void)setViewportMode:(BOOL)mobile;
 - (void)updateURL:(NSString*)url;
-- (void)focusAddressField;
+// While the window holds a single blank tab, the strip region shows one
+// full-width search field (mock-style: magnifier + placeholder) instead of
+// the lone "New Tab" pill; pills return the moment a page opens or a second
+// tab exists. Driven from UpdateTabContainerVisibility.
+- (void)setCanvasSearchVisible:(BOOL)visible;
 // Resolves |urlString| via BroResolveQueryToURL and loads it in the active
-// browser; also used by the command palette's fallback row.
+// browser; used by the welcome input, the toolbar's canvas search field, and
+// the command palette's fallback row.
 - (void)navigateToURL:(NSString*)urlString;
 // Download started/finished nudge: reveals the hidden search + downloads
 // icons briefly (they hide at rest and show on hover; the toolbar owns the

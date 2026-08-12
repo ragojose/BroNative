@@ -100,6 +100,15 @@ void BroHandler::OnFindResult(CefRefPtr<CefBrowser> browser,
   }
 }
 
+bool BroHandler::OnSetFocus(CefRefPtr<CefBrowser> browser, FocusSource source) {
+  CEF_REQUIRE_UI_THREAD();
+  // A blank tab's CEF view is detached behind the welcome state, so letting
+  // the browser take focus (creation and navigation both request it) would
+  // only tear keyboard focus away from the welcome input. Cancel it; loaded
+  // tabs keep the default behavior.
+  return browser && BroTabIsBlank(browser->GetIdentifier());
+}
+
 void BroHandler::SetBrowserHidden(int browser_id, bool hidden) {
   if (!CefCurrentlyOn(TID_UI)) {
     CefPostTask(TID_UI, base::BindOnce(&BroHandler::SetBrowserHidden, this,

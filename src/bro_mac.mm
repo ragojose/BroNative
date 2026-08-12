@@ -88,11 +88,6 @@ static int g_glass_transition_token = 0;
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
 
-// Blank tabs created by the shell should be ready for typing as soon as CEF
-// adopts them. Track the exact container rather than a shared boolean: browser
-// creation is asynchronous, and several tabs may be in flight at once.
-static NSHashTable<NSView*>* g_pending_address_focus_containers = nil;
-
 // Downloads: BroDownloadEntry, BroDownloadsList, the popover, and the
 // bridge callbacks live in bro_downloads.mm. BroHideDownloadsPopover and
 // BroToggleDownloadsPopover are declared extern in bro_mac_internal.h.
@@ -390,7 +385,6 @@ NSView* BroBrowserContainerView(void) {
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
     g_blank_tab_ids = [NSMutableSet set];
-    g_pending_address_focus_containers = [NSHashTable weakObjectsHashTable];
     g_fading_out_ids = [NSMutableSet set];
     // Closed-tab history lazily initializes itself on first use.
 
@@ -887,6 +881,18 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
   }
   UpdateSplitDivider();
   [g_main_window setGlassBackdropVisible:wantsGlass];
+  // The welcome state fronts the plain glass whenever every visible pane is
+  // blank -- except in screenshot mode, where a blank tab deliberately reads
+  // as a clean glass card. A mixed split keeps its blank pane plain too: a
+  // centered welcome would straddle the loaded partner.
+  BOOL welcomeVisible = activeBlank && partnerBlank &&
+                        !g_screenshot_mode_active && active_browser_id >= 0;
+  BroWelcomeSetVisible(welcomeVisible, active_browser_id);
+  // With the whole window still a blank canvas (one tab, nothing open), the
+  // strip shows the mock's full-width search field instead of a lone "New
+  // Tab" pill; pills return the moment a page opens or a second tab exists.
+  [g_toolbar
+      setCanvasSearchVisible:welcomeVisible && g_tab_bar.tabs.count == 1];
 }
 
 static void UpdateChromeLayout(void) {
@@ -1091,8 +1097,8 @@ static void ToggleScreenshotMode(void) {
     return;
   }
   BroDismissTransientOverlays();
-  // Releases focus from an editing address field or tab search field --
-  // hidden views stay in the responder chain otherwise.
+  // Releases focus from the welcome input or tab search field -- hidden
+  // views stay in the responder chain otherwise.
   [g_main_window makeFirstResponder:nil];
 
   g_screenshot_mode_active = !g_screenshot_mode_active;
@@ -1333,8 +1339,8 @@ static void ShowZoomHUD(int percent) {
       }];
 }
 
-static void CreateNewBrowserTabWithURLAndFocus(const std::string& url,
-                                               BOOL focusAddressWhenReady) {
+// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
+void CreateNewBrowserTabWithURL(const std::string& url) {
   BroHandler* handler = BroHandler::GetInstance();
   if (!handler) {
     return;
@@ -1359,26 +1365,17 @@ static void CreateNewBrowserTabWithURLAndFocus(const std::string& url,
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  if (focusAddressWhenReady) {
-    [g_pending_address_focus_containers addObject:browserContainer];
-  }
-
-  // Create the browser with the specified URL. If creation is rejected
-  // synchronously, discard the pending focus request with the container.
+  // Create the browser with the specified URL. A blank tab needs no explicit
+  // focus plumbing: the welcome input auto-focuses when the visibility
+  // update in OnTabCreated shows it.
   if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
                                      browser_settings, nullptr, nullptr)) {
-    [g_pending_address_focus_containers removeObject:browserContainer];
     [browserContainer removeFromSuperview];
   }
 }
 
-// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
-void CreateNewBrowserTabWithURL(const std::string& url) {
-  CreateNewBrowserTabWithURLAndFocus(url, NO);
-}
-
 void CreateNewBrowserTab(void) {
-  CreateNewBrowserTabWithURLAndFocus("about:blank", YES);
+  CreateNewBrowserTabWithURL("about:blank");
 }
 
 #pragma mark - BroAppDelegate
@@ -1954,12 +1951,11 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  // Create the browser on a blank page; the address bar stays empty.
+  // Create the browser on a blank page; the welcome input takes focus once
+  // OnTabCreated's visibility update shows it.
   std::string url = "about:blank";
-  [g_pending_address_focus_containers addObject:browserContainer];
   if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
                                      browser_settings, nullptr, nullptr)) {
-    [g_pending_address_focus_containers removeObject:browserContainer];
     [browserContainer removeFromSuperview];
   }
 
@@ -2343,8 +2339,13 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   if (g_screenshot_mode_active) {
     ToggleScreenshotMode();
   }
-  if (g_toolbar) {
-    [g_toolbar focusAddressField];
+  // The pills no longer host an editable URL: a blank tab types into the
+  // welcome input, and a loaded tab gets the palette (its fallback row
+  // navigates), so ⌘L still always means "give me a typing surface".
+  if (BroWelcomeVisible()) {
+    BroWelcomeFocusInput();
+  } else {
+    ToggleCommandPalette(BroPaletteScopeAll);
   }
 }
 
@@ -2417,6 +2418,7 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   // fresh for any future window.
   TeardownCommandPalette();
   BroTeardownFindBar();
+  BroTeardownWelcome();
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
@@ -2531,10 +2533,6 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
     return false;
   }
 
-  BOOL shouldFocusAddress =
-      [g_pending_address_focus_containers containsObject:container];
-  [g_pending_address_focus_containers removeObject:container];
-
   g_browser_views[@(browser_id)] = container;
 
   // If this was a popup's container, it is no longer pending.
@@ -2581,26 +2579,15 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   // as it does on every other tab switch.
   UpdateWindowForViewportMode(SplitActive() ? NO : TabIsMobile(browser_id),
                               YES);
-
-  if (shouldFocusAddress) {
-    // Let adoption and layout finish before asking AppKit for its field
-    // editor. The active-ID and blank-URL guards make multiple rapid new-tab
-    // requests deterministic: only the latest still-blank tab receives focus.
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (!g_tab_bar || g_tab_bar.activeTabId != browser_id) {
-        return;
-      }
-      BroTabView* tab = [g_tab_bar tabWithBrowserId:browser_id];
-      if (tab && BroURLIsBlank(tab.tabURL)) {
-        [tab focusAddressField];
-      }
-    });
-  }
   return true;
 }
 
 bool HasTabView(int browser_id) {
   return g_browser_views[@(browser_id)] != nil;
+}
+
+bool BroTabIsBlank(int browser_id) {
+  return [g_blank_tab_ids containsObject:@(browser_id)];
 }
 
 void DetachTabView(int browser_id) {

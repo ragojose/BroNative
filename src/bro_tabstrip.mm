@@ -391,9 +391,9 @@ BOOL BroEventMatchesShortcut(NSEvent* event,
 
 #pragma mark - BroTabView
 
-// BroTabView's and BroAddressField's @interfaces are declared in
-// bro_mac_internal.h (shared with the toolbar). BroTabBar's @interface is
-// declared there too (shared with bro_tabsearch.mm).
+// BroTabView's @interface is declared in bro_mac_internal.h (shared with the
+// toolbar). BroTabBar's @interface is declared there too (shared with
+// bro_tabsearch.mm).
 
 // BroFetchFaviconGuarded is declared extern in bro_mac_internal.h.
 void BroFetchFaviconGuarded(NSString* urlString,
@@ -416,7 +416,6 @@ void BroFetchFaviconGuarded(NSString* urlString,
   NSView* glassBackdrop_;
   BOOL hovered_;
   BOOL focused_;
-  BOOL wasActiveAtMouseDown_;
   // Target state of the trailing action fade; guards against the many
   // updateAppearance callers restarting an in-flight fade.
   BOOL trailingActionShown_;
@@ -497,43 +496,6 @@ void BroFetchFaviconGuarded(NSString* urlString,
     [_titleLabel setText:kBroBlankTabTitle];
     _titleLabel.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_titleLabel];
-
-    // Every tab owns its editor permanently. Moving one shared NSTextField
-    // while AppKit's window-owned field editor was live could leave the old
-    // editor visible over the compact label. Permanent ownership makes that
-    // invalid state unrepresentable; layoutPillContents only chooses which of
-    // the two renderers is visible.
-    _addressField = [[BroAddressField alloc]
-        initWithFrame:NSMakeRect(0, 0, 100, kTabTextFrameHeight)];
-    _addressField.font = BroUIFont(kTabTextFontSize);
-    _addressField.bezeled = NO;
-    _addressField.bordered = NO;
-    _addressField.drawsBackground = NO;
-    _addressField.focusRingType = NSFocusRingTypeNone;
-    // The window-owned NSTextView is transparent, so a visible cell value
-    // would remain underneath it and draw every URL twice. The cell owns only
-    // the explicitly colored placeholder; live text is colored on the field
-    // editor in configureAddressFieldEditor:.
-    _addressField.textColor = [NSColor clearColor];
-    _addressField.delegate = g_toolbar;
-    _addressField.cell.scrollable = YES;
-    _addressField.cell.usesSingleLineMode = YES;
-    _addressField.cell.lineBreakMode = NSLineBreakByTruncatingTail;
-    _addressField.cell.truncatesLastVisibleLine = YES;
-    CGFloat placeholderHeight =
-        [_addressField.cell cellSizeForBounds:_addressField.bounds].height;
-    CGFloat placeholderBaselineOffset = ceil(
-        MAX(0.0, (kTabTextFrameHeight - placeholderHeight) / 2.0));
-    _addressField.placeholderAttributedString = [[NSAttributedString alloc]
-        initWithString:@"Enter URL or search"
-            attributes:@{
-              NSFontAttributeName : BroUIFont(kTabTextFontSize),
-              NSForegroundColorAttributeName : [NSColor placeholderTextColor],
-              NSBaselineOffsetAttributeName : @(placeholderBaselineOffset),
-            }];
-    _addressField.accessibilityLabel = @"Address and search bar";
-    _addressField.hidden = YES;
-    [self addSubview:_addressField];
 
     // Trailing tab action: normal tabs show close; pinned tabs reuse the same
     // slot and hover behavior for unpin.
@@ -619,16 +581,11 @@ void BroFetchFaviconGuarded(NSString* urlString,
                           ? kBroBlankTabTitle
                           : BroDisplayHostForURL(_tabURL);
   [_titleLabel setText:display];
-  // URL callbacks continue to update canonical tab state while the user is
-  // typing, but never replace the live edit buffer.
-  if (!_addressField.currentEditor) {
-    _addressField.stringValue = BroURLIsBlank(_tabURL) ? @"" : _tabURL;
-  }
 }
 
 // Single place deciding what the pill shows at its current width: normally the
 // favicon sits at the left inset with text beside it; collapsed, the favicon
-// centers and both the host label and the hosted address field step aside.
+// centers and the host label steps aside.
 - (void)layoutPillContents {
   BOOL compactPinned =
       _pinned && self.bounds.size.width >= kPinnedTabPillWidth - 0.5;
@@ -640,12 +597,6 @@ void BroFetchFaviconGuarded(NSString* urlString,
   CGFloat actionX = self.bounds.size.width - 26.0;
   _closeButton.frame = NSMakeRect(
       actionX, (self.bounds.size.height - 16.0) / 2.0, 16.0, 16.0);
-  // Resting active and inactive tabs deliberately share the atomic text view.
-  // NSTextField appears only while editing, eliminating the renderer/baseline
-  // swap that made text jump when merely changing tabs.
-  BOOL showEditor = _isActive && _editingAddress;
-  BOOL showCompactText = !_iconOnly && !showEditor;
-
   // Text runs from the favicon's right edge to just inside the ✕ (or the
   // pill's edge when there is no room for one). Clamped at zero so a collapsed
   // pill can't produce a negative width.
@@ -655,24 +606,18 @@ void BroFetchFaviconGuarded(NSString* urlString,
                  (self.bounds.size.height - kTabTextFrameHeight) / 2.0,
                  MAX(0.0, self.bounds.size.width - 32 - textRight),
                  kTabTextFrameHeight);
-  // Commit frames and visibility together. At the end of every state change
-  // exactly one text renderer is eligible to draw (or neither in icon-only
-  // mode), and neither Core Animation nor AppKit gets an intermediate frame.
+  // Commit frame and visibility together so neither Core Animation nor
+  // AppKit gets an intermediate frame mid state change.
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   _titleLabel.frame = textFrame;
-  _addressField.frame = textFrame;
-  _titleLabel.hidden = !showCompactText;
-  _addressField.hidden = !showEditor;
+  _titleLabel.hidden = _iconOnly;
   [CATransaction commit];
 }
 
 - (void)setIconOnly:(BOOL)iconOnly {
   if (_iconOnly == iconOnly) {
     return;
-  }
-  if (iconOnly && _addressField.currentEditor) {
-    [self finishAddressEditing];
   }
   _iconOnly = iconOnly;
   [self layoutPillContents];
@@ -838,44 +783,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 - (void)setIsActive:(BOOL)isActive {
-  if (!isActive && _addressField.currentEditor) {
-    [self finishAddressEditing];
-  }
   _isActive = isActive;
-  if (!isActive) {
-    _editingAddress = NO;
-  }
   [self updateAppearance];
   [self layoutPillContents];
-}
-
-- (void)setEditingAddress:(BOOL)editingAddress {
-  _editingAddress = editingAddress;
-  [self updateAppearance];
-  [self layoutPillContents];
-}
-
-- (void)focusAddressField {
-  if (!_isActive || _iconOnly || !self.window) {
-    return;
-  }
-  _addressField.stringValue = BroURLIsBlank(_tabURL) ? @"" : _tabURL;
-  self.editingAddress = YES;
-  if (![self.window makeFirstResponder:_addressField]) {
-    self.editingAddress = NO;
-  }
-}
-
-- (void)finishAddressEditing {
-  if (_addressField.currentEditor) {
-    [self.window makeFirstResponder:nil];
-    if (_addressField.currentEditor) {
-      // A formatter or responder veto must never leave AppKit's window-owned
-      // field editor alive after this pill hides its NSTextField.
-      [_addressField abortEditing];
-    }
-  }
-  self.editingAddress = NO;
 }
 
 - (void)setDropTarget:(BOOL)dropTarget {
@@ -940,8 +850,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
   return NO;
 }
 
-// The pill owns its whole surface, so it can be picked up anywhere — the same
-// click-through BroAddressField gives the active pill while idle. Without
+// The pill owns its whole surface, so it can be picked up anywhere. Without
 // this, the title label (and the favicon and spinner) swallow the gesture and
 // only the active tab can be dragged.
 - (NSView*)hitTest:(NSPoint)point {
@@ -953,23 +862,13 @@ void BroFetchFaviconGuarded(NSString* urlString,
   if (hit == _closeButton || [hit isDescendantOf:_closeButton]) {
     return hit;
   }
-  // While the address field is being edited it owns the mouse, so text
-  // selection still works. Idle, it already hit-tests to nil, so this only
-  // matches mid-edit; the field editor is a descendant, hence the walk.
-  for (NSView* v = hit; v && v != self; v = v.superview) {
-    if ([v isKindOfClass:[BroAddressField class]]) {
-      return hit;
-    }
-  }
   return self;
 }
 
-// Switching tabs happens on mouse-down (like real browsers). Focusing the
-// active pill's address field waits until mouse-up so starting a drag on the
-// active tab doesn't drop into URL editing. Any pill can be picked up and
-// dragged to reorder the strip.
+// Switching tabs happens on mouse-down (like real browsers). Any pill can be
+// picked up and dragged to reorder the strip; a plain click on the active
+// pill does nothing further.
 - (void)mouseDown:(NSEvent*)event {
-  wasActiveAtMouseDown_ = _isActive;
   if (!_isActive) {
     [self performSelect];
   }
@@ -985,12 +884,8 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 - (void)mouseUp:(NSEvent*)event {
-  BOOL dragged = NO;
   if (_owningTabBar) {
-    dragged = [_owningTabBar endDragForTab:self];
-  }
-  if (!dragged && wasActiveAtMouseDown_) {
-    [self performSelect];
+    [_owningTabBar endDragForTab:self];
   }
 }
 
@@ -1758,7 +1653,6 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   }
 
   if (tabToRemove) {
-    [tabToRemove finishAddressEditing];
     if (tabToRemove == draggingTab_) {
       // The close is deferred (dispatch_async) so it can land mid-drag; tear
       // down the drag now, before the pill it was tracking disappears out
@@ -1811,19 +1705,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 - (void)setActiveTab:(int)browserId {
   [self hideHoverCard];
-  BroTabView* previousActive = [self tabWithBrowserId:_activeTabId];
-  if (previousActive && previousActive.browserId != browserId) {
-    // End editing before changing active flags. The field remains in its own
-    // pill, so AppKit can tear down its field editor without any reparenting.
-    [previousActive finishAddressEditing];
-  }
   _activeTabId = browserId;
   for (BroTabView* tab in _tabs) {
     tab.isActive = (tab.browserId == browserId);
   }
 
-  // Each pill owns its address field; activation only updates shared toolbar
-  // controls and never moves a live editor through the view hierarchy.
   if (g_toolbar) {
     // The viewport toggles reflect the active tab's own emulation state.
     [g_toolbar setViewportMode:TabIsMobile(browserId)];
@@ -2123,10 +2009,8 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 - (void)tabSelected:(BroTabView*)tab {
   if (tab.browserId == _activeTabId) {
-    // Clicking the active pill starts editing its URL.
-    if (g_toolbar) {
-      [g_toolbar focusAddressField];
-    }
+    // Already active; the pill hosts no URL editor, so there is nothing
+    // further a click should do (drag-to-reorder is handled separately).
     return;
   }
   BroHandler* handler = BroHandler::GetInstance();
