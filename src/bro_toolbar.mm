@@ -16,7 +16,7 @@ BroToolbar* g_toolbar = nil;
 
 // Resolves what the user typed into a loadable URL: safe schemes pass
 // through, about: passes through, a dotted word gets https://, and anything
-// else becomes a Google search. Shared by the address field and the command
+// else becomes a Google search. Shared by the welcome input and the command
 // palette's fallback row (which shows the classification before navigating).
 // Declared extern in bro_mac_internal.h. |query| must already be trimmed;
 // returns nil for an empty query.
@@ -48,34 +48,8 @@ NSString* BroResolveQueryToURL(NSString* query) {
                                     encoded ?: @""];
 }
 
-// BroAddressField's @interface is declared in bro_mac_internal.h (shared
-// with bro_mac.mm, where BroTabView checks isKindOfClass:[BroAddressField
-// class]). BroToolbar's @interface is declared there too (shared with
+// BroToolbar's @interface is declared in bro_mac_internal.h (shared with
 // bro_downloads.mm, which reads .downloadsButton).
-
-@implementation BroAddressField
-
-// While idle the field is click-through: the pill underneath owns the mouse,
-// so the active tab can be dragged to reorder from anywhere on its surface,
-// and a plain click focuses the field on mouse-up (selecting the whole URL,
-// like other browsers). Once editing starts, the field editor takes over and
-// the mouse behaves like a normal text field.
-- (NSView*)hitTest:(NSPoint)point {
-  if (!self.currentEditor) {
-    return nil;
-  }
-  return [super hitTest:point];
-}
-
-- (BOOL)becomeFirstResponder {
-  BOOL ok = [super becomeFirstResponder];
-  if (ok && [self.delegate isKindOfClass:[BroToolbar class]]) {
-    [(BroToolbar*)self.delegate addressFieldDidFocus:self];
-  }
-  return ok;
-}
-
-@end
 
 @implementation BroToolbar {
   // Hover zone spanning the search + downloads buttons; both stay hidden
@@ -87,6 +61,11 @@ NSString* BroResolveQueryToURL(NSString* query) {
   NSArray<BroHoverButton*>* trailingButtons_;
   // Invalidates a pending auto-hide scheduled by pulseDownloadsButton.
   NSUInteger revealGeneration_;
+  // Canvas search: the full-width field shown in place of the tab strip
+  // while the window holds a single blank tab (see setCanvasSearchVisible:).
+  NSImageView* canvasSearchIcon_;
+  NSTextField* canvasSearchField_;
+  BOOL canvasSearchVisible_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -182,6 +161,39 @@ NSString* BroResolveQueryToURL(NSString* query) {
     trailingButtons_ = @[ _downloadsButton, _desktopButton, _mobileButton ];
     [self setViewportMode:NO];
 
+    // Canvas search field, hidden until the strip drops to a single blank
+    // tab. Borderless (icon + placeholder on the bare toolbar, like the
+    // mock); commits through its action so accessibility's AXConfirm works.
+    canvasSearchIcon_ = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    canvasSearchIcon_.image = RadixIconImage(RadixIconMagnifyingGlass, 15);
+    canvasSearchIcon_.contentTintColor = [NSColor secondaryLabelColor];
+    canvasSearchIcon_.accessibilityElement = NO;
+    canvasSearchIcon_.hidden = YES;
+    [self addSubview:canvasSearchIcon_];
+    canvasSearchField_ = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    canvasSearchField_.font = BroUIFont(13.0);
+    canvasSearchField_.textColor = [NSColor labelColor];
+    canvasSearchField_.bordered = NO;
+    canvasSearchField_.bezeled = NO;
+    canvasSearchField_.drawsBackground = NO;
+    canvasSearchField_.focusRingType = NSFocusRingTypeNone;
+    canvasSearchField_.cell.usesSingleLineMode = YES;
+    canvasSearchField_.cell.scrollable = YES;
+    canvasSearchField_.delegate = self;
+    // Explicitly never on focus loss: leaving the field must not navigate.
+    canvasSearchField_.cell.sendsActionOnEndEditing = NO;
+    canvasSearchField_.target = self;
+    canvasSearchField_.action = @selector(commitCanvasSearch:);
+    canvasSearchField_.placeholderAttributedString = [[NSAttributedString alloc]
+        initWithString:@"Search Google or type a URL"
+            attributes:@{
+              NSFontAttributeName : BroUIFont(13.0),
+              NSForegroundColorAttributeName : [NSColor tertiaryLabelColor],
+            }];
+    canvasSearchField_.accessibilityLabel = @"Search Google or type a URL";
+    canvasSearchField_.hidden = YES;
+    [self addSubview:canvasSearchField_];
+
     // Initial button states
     _backButton.enabled = NO;
     _forwardButton.enabled = NO;
@@ -218,6 +230,76 @@ NSString* BroResolveQueryToURL(NSString* query) {
                                     y, kButtonSize, kButtonSize);
   _downloadsButton.frame = NSMakeRect(BroTrailingControlX(NSWidth(self.bounds), 2),
                                       y, kButtonSize, kButtonSize);
+  [self layoutCanvasSearch];
+}
+
+// Spans the same region the tab strip occupies: from just past the nav
+// buttons to just before the trailing control cluster.
+- (void)layoutCanvasSearch {
+  CGFloat x = kTrafficLightInset + 3.0 * (kButtonSize + kButtonSpacing) + 12.0;
+  canvasSearchIcon_.frame =
+      NSMakeRect(x, round((NSHeight(self.bounds) - 15.0) / 2.0), 15.0, 15.0);
+  CGFloat fieldX = NSMaxX(canvasSearchIcon_.frame) + 10.0;
+  CGFloat fieldRight = BroTrailingControlX(NSWidth(self.bounds), 3) - 12.0;
+  CGFloat fieldHeight = ceil(
+      [canvasSearchField_.cell cellSizeForBounds:NSMakeRect(0, 0, 1000, 100)]
+          .height);
+  canvasSearchField_.frame =
+      NSMakeRect(fieldX, round((NSHeight(self.bounds) - fieldHeight) / 2.0),
+                 MAX(0.0, fieldRight - fieldX), fieldHeight);
+}
+
+- (void)setCanvasSearchVisible:(BOOL)visible {
+  if (canvasSearchVisible_ == visible) {
+    return;
+  }
+  canvasSearchVisible_ = visible;
+  // The field replaces the strip wholesale (pills, "+", pinned search
+  // chevron), exactly like the mock's blank-canvas top bar.
+  g_tab_bar.hidden = visible;
+  canvasSearchIcon_.hidden = !visible;
+  canvasSearchField_.hidden = !visible;
+  if (visible) {
+    canvasSearchField_.stringValue = @"";
+    [self layoutCanvasSearch];
+  } else {
+    // A hidden field must not keep AppKit's window-owned editor alive.
+    NSResponder* responder = self.window.firstResponder;
+    if ([responder isKindOfClass:[NSText class]] &&
+        ((NSText*)responder).delegate == (id)canvasSearchField_) {
+      [self.window makeFirstResponder:nil];
+    }
+  }
+}
+
+- (void)commitCanvasSearch:(id)sender {
+  NSString* text = [canvasSearchField_.stringValue
+      stringByTrimmingCharactersInSet:
+          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (text.length == 0) {
+    return;
+  }
+  [self navigateToURL:text];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self.window.firstResponder &&
+        [self.window.firstResponder isKindOfClass:[NSText class]] &&
+        ((NSText*)self.window.firstResponder).delegate ==
+            (id)canvasSearchField_) {
+      [self.window makeFirstResponder:nil];
+    }
+  });
+}
+
+- (BOOL)control:(NSControl*)control
+               textView:(NSTextView*)textView
+    doCommandBySelector:(SEL)commandSelector {
+  if (control == canvasSearchField_ &&
+      commandSelector == @selector(cancelOperation:)) {
+    // Same contract as the welcome input: nothing to restore, just clear.
+    canvasSearchField_.stringValue = @"";
+    return YES;
+  }
+  return NO;
 }
 
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
@@ -461,107 +543,6 @@ NSString* BroResolveQueryToURL(NSString* query) {
   _mobileButton.enabled = YES;
 }
 
-#pragma mark - NSTextFieldDelegate
-
-- (BOOL)configureAddressFieldEditor:(BroAddressField*)field {
-  NSTextView* editor = (NSTextView*)[field currentEditor];
-  if (![editor isKindOfClass:[NSTextView class]]) {
-    return NO;
-  }
-
-  NSFont* font = BroUIFont(kTabTextFontSize);
-  editor.font = font;
-  editor.insertionPointColor = [NSColor labelColor];
-  editor.textColor = [NSColor labelColor];
-  editor.drawsBackground = NO;
-
-  // NSTextView adds five points of line-fragment padding by default. The
-  // resting Core Text renderer starts at x=0, so leaving that default in
-  // place makes the selected URL jump right on focus even though both views
-  // have the same frame. Remove every editor-owned inset explicitly.
-  editor.textContainer.lineFragmentPadding = 0.0;
-
-  // Use the exact Core Text baseline equation from BroShimmerTextView. AppKit's
-  // cell reports a 13pt height for Geist 10 while Core Text's pixel-aligned
-  // line box is 14pt; centering the cell therefore puts selected text 1pt
-  // above the resting host. Deriving the editor inset from the same font
-  // metrics keeps both renderers on precisely the same baseline.
-  CGFloat lineHeight =
-      ceil(font.ascender - font.descender + font.leading);
-  CGFloat baselineFromBottom = ceil(-font.descender);
-  CGFloat baselineFromTop =
-      (field.bounds.size.height + lineHeight) / 2.0 -
-      baselineFromBottom;
-  editor.textContainerInset =
-      NSMakeSize(0.0, MAX(0.0, baselineFromTop - font.ascender));
-
-  // Selection inverts against whichever treatment Regular glass resolves:
-  // semantic label and background colors stay legible in both variants.
-  editor.selectedTextAttributes = @{
-    NSBackgroundColorAttributeName : [NSColor labelColor],
-    NSForegroundColorAttributeName : [NSColor textBackgroundColor],
-  };
-  [editor selectAll:nil];
-  return YES;
-}
-
-- (void)addressFieldDidFocus:(BroAddressField*)field {
-  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
-                        ? (BroTabView*)field.superview
-                        : nil;
-  if (!tab || !tab.isActive) {
-    return;
-  }
-  // Show the full URL for editing; the host pill shows the focused look
-  // (adaptive hairline border and primary text) from click-in through typing.
-  field.stringValue = BroURLIsBlank(tab.tabURL) ? @"" : tab.tabURL;
-  tab.editingAddress = YES;
-  // Configure synchronously so AppKit never presents one frame with its
-  // default font/insets before snapping to the shared tab metrics. Some
-  // responder paths install the field editor just after becomeFirstResponder;
-  // retain a one-turn fallback only for those paths.
-  if (![self configureAddressFieldEditor:field]) {
-    __weak BroAddressField* weakField = field;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      BroAddressField* strongField = weakField;
-      if (strongField) {
-        [self configureAddressFieldEditor:strongField];
-      }
-    });
-  }
-}
-
-- (void)controlTextDidBeginEditing:(NSNotification*)notification {
-  if ([notification.object isKindOfClass:[BroAddressField class]]) {
-    [self configureAddressFieldEditor:(BroAddressField*)notification.object];
-  }
-}
-
-- (void)controlTextDidEndEditing:(NSNotification*)notification {
-  if (![notification.object isKindOfClass:[BroAddressField class]]) {
-    return;
-  }
-  BroAddressField* field = (BroAddressField*)notification.object;
-  BroTabView* tab = [field.superview isKindOfClass:[BroTabView class]]
-                        ? (BroTabView*)field.superview
-                        : nil;
-  NSNumber* reason = notification.userInfo[@"NSTextMovement"];
-  if (tab.isActive && reason &&
-      reason.integerValue == NSReturnTextMovement) {
-    [self navigateToURL:field.stringValue];
-    dispatch_async(dispatch_get_main_queue(), ^{
-      [self.window makeFirstResponder:nil];
-    });
-  }
-  tab.editingAddress = NO;
-}
-
-- (void)focusAddressField {
-  BroHandler* handler = BroHandler::GetInstance();
-  int activeId = handler ? handler->GetActiveBrowserId() : -1;
-  [[g_tab_bar tabWithBrowserId:activeId] focusAddressField];
-}
-
 #pragma mark - State Updates
 
 - (void)updateNavigationState:(BOOL)canGoBack canGoForward:(BOOL)canGoForward {
@@ -570,7 +551,7 @@ NSString* BroResolveQueryToURL(NSString* query) {
 }
 
 - (void)updateURL:(NSString*)url {
-  // Blank pages keep the field empty rather than showing "about:blank".
+  // Blank pages keep the pill's URL empty rather than showing "about:blank".
   if (BroURLIsBlank(url)) {
     url = @"";
   }

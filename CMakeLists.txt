@@ -1,7 +1,42 @@
 # 3.24 for FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP, used by the Sparkle fetch
 # below. On 3.21-3.23 that keyword is unknown and configuring fails outright.
 cmake_minimum_required(VERSION 3.24)
+
+# Liquid Glass is an SDK-linked behavior as well as a runtime API. Resolve and
+# freeze the active macOS 26 SDK before project() performs its compiler checks;
+# silently falling back to an older SDK would compile out the native surface
+# types even when the app later runs on macOS 26. Keep the deployment target at
+# 12 so every use of the new API remains weak-linked behind @available.
+execute_process(
+  COMMAND /usr/bin/xcrun --sdk macosx --show-sdk-path
+  OUTPUT_VARIABLE BRO_MACOS_SDK_PATH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE BRO_MACOS_SDK_RESULT
+)
+execute_process(
+  COMMAND /usr/bin/xcrun --sdk macosx --show-sdk-version
+  OUTPUT_VARIABLE BRO_MACOS_SDK_VERSION
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE BRO_MACOS_SDK_VERSION_RESULT
+)
+if(NOT BRO_MACOS_SDK_RESULT EQUAL 0 OR
+   NOT BRO_MACOS_SDK_VERSION_RESULT EQUAL 0 OR
+   BRO_MACOS_SDK_PATH STREQUAL "")
+  message(FATAL_ERROR "A macOS 26 SDK is required to build Bro Computer")
+endif()
+if(BRO_MACOS_SDK_VERSION VERSION_LESS 26 OR
+   NOT BRO_MACOS_SDK_VERSION VERSION_LESS 27)
+  message(FATAL_ERROR
+      "Bro Computer must link the macOS 26 SDK for Liquid Glass; xcrun resolved ${BRO_MACOS_SDK_VERSION}")
+endif()
+set(CMAKE_OSX_SYSROOT "${BRO_MACOS_SDK_PATH}" CACHE PATH
+    "Pinned macOS 26 SDK used for native Liquid Glass" FORCE)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING
+    "Oldest supported macOS version" FORCE)
+
 project(Bro)
+
+include(CTest)
 
 # Default to Release build if not specified
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -82,6 +117,7 @@ set(BRO_SRCS
     src/bro_toolbar.mm
     src/bro_updater.h
     src/bro_updater.mm
+    src/bro_welcome.mm
     src/browser_registry.cc
     src/browser_registry.h
     src/radix_icons.h
@@ -221,6 +257,28 @@ set_target_properties(${EXECUTABLE_NAME} PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "@executable_path/../Frameworks"
 )
+
+if(BUILD_TESTING)
+  add_executable(bro_persist_tests
+      tests/bro_persist_tests.mm
+      src/bro_persist.mm)
+  target_include_directories(bro_persist_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(bro_persist_tests PRIVATE -fobjc-arc)
+  target_link_libraries(bro_persist_tests "-framework Foundation")
+  add_test(NAME appearance_persistence COMMAND bro_persist_tests)
+
+  add_executable(bro_glass_surface_tests
+      tests/bro_glass_surface_tests.mm
+      src/bro_motion.mm)
+  target_include_directories(bro_glass_surface_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(bro_glass_surface_tests PRIVATE -fobjc-arc)
+  target_link_libraries(bro_glass_surface_tests
+      "-framework AppKit"
+      "-framework QuartzCore")
+  add_test(NAME native_glass_surfaces COMMAND bro_glass_surface_tests)
+endif()
 
 # Helper apps. Chromium on macOS launches subprocesses from helper bundles with
 # exact names derived from the app name: "Bro Computer Helper.app",

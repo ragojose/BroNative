@@ -64,6 +64,14 @@ BroTabBar* g_tab_bar = nil;
 
 // Map browser IDs to their container views
 static NSMutableDictionary<NSNumber*, NSView*>* g_browser_views = nil;
+static BroAppearancePreference g_appearance_preference = BroAppearanceSystem;
+
+// Runs the real AppKit window/chrome without initializing CEF. This keeps UI
+// smoke tests independent of Chromium's profile lock and login-keychain
+// prompts while exercising the exact production view hierarchy.
+static BOOL BroUISmokeTestEnabled(void) {
+  return getenv("BRO_UI_SMOKE_TEST") != nullptr;
+}
 
 // Tabs currently on a blank page (about:blank or no committed URL yet). Their
 // container stays hidden even while active so the unified shell shows through
@@ -88,11 +96,6 @@ static int g_glass_transition_token = 0;
 // Containers created for incoming popup browsers, keyed by popup ID. Entries
 // are removed when the popup's browser is adopted as a tab, or on abort.
 static NSMutableDictionary<NSNumber*, NSView*>* g_pending_popup_containers = nil;
-
-// Blank tabs created by the shell should be ready for typing as soon as CEF
-// adopts them. Track the exact container rather than a shared boolean: browser
-// creation is asynchronous, and several tabs may be in flight at once.
-static NSHashTable<NSView*>* g_pending_address_focus_containers = nil;
 
 // Downloads: BroDownloadEntry, BroDownloadsList, the popover, and the
 // bridge callbacks live in bro_downloads.mm. BroHideDownloadsPopover and
@@ -212,6 +215,11 @@ NSDictionary* BroLayerTransitionActions(void) {
 @implementation BroWindowBorderView
 - (NSView*)hitTest:(NSPoint)point {
   return nil;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  self.layer.borderColor = BroGlassBorderColor().CGColor;
 }
 @end
 
@@ -391,7 +399,6 @@ NSView* BroBrowserContainerView(void) {
     // Initialize browser views dictionary
     g_browser_views = [NSMutableDictionary dictionary];
     g_blank_tab_ids = [NSMutableSet set];
-    g_pending_address_focus_containers = [NSHashTable weakObjectsHashTable];
     g_fading_out_ids = [NSMutableSet set];
     // Closed-tab history lazily initializes itself on first use.
 
@@ -535,6 +542,11 @@ static BOOL g_split_divider_dragging = NO;
           : BroControlBorderColor().CGColor;
   grip_.layer.backgroundColor =
       [[NSColor labelColor] colorWithAlphaComponent:lit ? 0.7 : 0.4].CGColor;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  [self updateHighlight];
 }
 
 - (void)mouseEntered:(NSEvent*)event {
@@ -888,6 +900,18 @@ static void UpdateTabContainerVisibility(int active_browser_id) {
   }
   UpdateSplitDivider();
   [g_main_window setGlassBackdropVisible:wantsGlass];
+  // The welcome state fronts the plain glass whenever every visible pane is
+  // blank -- except in screenshot mode, where a blank tab deliberately reads
+  // as a clean glass card. A mixed split keeps its blank pane plain too: a
+  // centered welcome would straddle the loaded partner.
+  BOOL welcomeVisible = activeBlank && partnerBlank &&
+                        !g_screenshot_mode_active && active_browser_id >= 0;
+  BroWelcomeSetVisible(welcomeVisible, active_browser_id);
+  // With the whole window still a blank canvas (one tab, nothing open), the
+  // strip shows the mock's full-width search field instead of a lone "New
+  // Tab" pill; pills return the moment a page opens or a second tab exists.
+  [g_toolbar
+      setCanvasSearchVisible:welcomeVisible && g_tab_bar.tabs.count == 1];
 }
 
 static void UpdateChromeLayout(void) {
@@ -1092,8 +1116,8 @@ static void ToggleScreenshotMode(void) {
     return;
   }
   BroDismissTransientOverlays();
-  // Releases focus from an editing address field or tab search field --
-  // hidden views stay in the responder chain otherwise.
+  // Releases focus from the welcome input or tab search field -- hidden
+  // views stay in the responder chain otherwise.
   [g_main_window makeFirstResponder:nil];
 
   g_screenshot_mode_active = !g_screenshot_mode_active;
@@ -1334,8 +1358,8 @@ static void ShowZoomHUD(int percent) {
       }];
 }
 
-static void CreateNewBrowserTabWithURLAndFocus(const std::string& url,
-                                               BOOL focusAddressWhenReady) {
+// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
+void CreateNewBrowserTabWithURL(const std::string& url) {
   BroHandler* handler = BroHandler::GetInstance();
   if (!handler) {
     return;
@@ -1360,26 +1384,17 @@ static void CreateNewBrowserTabWithURLAndFocus(const std::string& url,
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  if (focusAddressWhenReady) {
-    [g_pending_address_focus_containers addObject:browserContainer];
-  }
-
-  // Create the browser with the specified URL. If creation is rejected
-  // synchronously, discard the pending focus request with the container.
+  // Create the browser with the specified URL. A blank tab needs no explicit
+  // focus plumbing: the welcome input auto-focuses when the visibility
+  // update in OnTabCreated shows it.
   if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
                                      browser_settings, nullptr, nullptr)) {
-    [g_pending_address_focus_containers removeObject:browserContainer];
     [browserContainer removeFromSuperview];
   }
 }
 
-// CreateNewBrowserTab(WithURL) are declared extern in bro_mac_internal.h.
-void CreateNewBrowserTabWithURL(const std::string& url) {
-  CreateNewBrowserTabWithURLAndFocus(url, NO);
-}
-
 void CreateNewBrowserTab(void) {
-  CreateNewBrowserTabWithURLAndFocus("about:blank", YES);
+  CreateNewBrowserTabWithURL("about:blank");
 }
 
 #pragma mark - BroAppDelegate
@@ -1420,6 +1435,24 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
                                     [title substringFromIndex:title.length - tail]];
 }
 
+static void BroApplyAppearancePreference(
+    BroAppearancePreference preference) {
+  switch (preference) {
+    case BroAppearanceLight:
+      NSApp.appearance =
+          [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+      break;
+    case BroAppearanceDark:
+      NSApp.appearance =
+          [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+      break;
+    case BroAppearanceSystem:
+    default:
+      NSApp.appearance = nil;
+      break;
+  }
+}
+
 @interface BroAppDelegate
     : NSObject <NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate>
 - (void)createApplication:(id)object;
@@ -1445,6 +1478,10 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)sendEvent:(NSEvent*)event {
+  if (BroUISmokeTestEnabled()) {
+    [super sendEvent:event];
+    return;
+  }
   CefScopedSendingEvent sendingEventScoper;
 
   // A repeated downloads-row shortcut is only meaningful when one magnifier
@@ -1581,6 +1618,10 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 - (void)terminate:(id)sender {
+  if (BroUISmokeTestEnabled()) {
+    [super terminate:sender];
+    return;
+  }
   BroAppDelegate* delegate = static_cast<BroAppDelegate*>([NSApp delegate]);
   [delegate tryToTerminateApplication:self];
 }
@@ -1590,18 +1631,26 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 @implementation BroAppDelegate
 
 - (void)createApplication:(id)object {
-  // Regular Liquid Glass owns local light/dark adaptation on macOS 26+.
-  // Older systems keep Bro's established dark HUD fallback unchanged.
-  if (@available(macOS 26.0, *)) {
-    NSApp.appearance = nil;
-  } else {
-    NSApp.appearance =
-        [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  // Default to the system appearance and honor an explicit user override.
+  // Apply before constructing any native glass so AppKit resolves its first
+  // material frame, text colors, and field editor consistently.
+  g_appearance_preference = BroLoadAppearancePreference();
+  if (BroUISmokeTestEnabled()) {
+    NSString* override = NSProcessInfo.processInfo.environment[
+        @"BRO_UI_SMOKE_APPEARANCE"];
+    if ([override caseInsensitiveCompare:@"light"] == NSOrderedSame) {
+      g_appearance_preference = BroAppearanceLight;
+    } else if ([override caseInsensitiveCompare:@"dark"] == NSOrderedSame) {
+      g_appearance_preference = BroAppearanceDark;
+    }
   }
+  BroApplyAppearancePreference(g_appearance_preference);
 
   // Before the menu, so the "Check for Updates…" item can bind to a live
   // updater rather than a nil target.
-  BroStartUpdater();
+  if (!BroUISmokeTestEnabled()) {
+    BroStartUpdater();
+  }
 
   // Create the main menu
   [self setupMainMenu];
@@ -1635,6 +1684,28 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
     g_main_window.alphaValue = 1.0;
   });
 
+  if (BroUISmokeTestEnabled()) {
+    // Two representative pills prove the native container's resting
+    // separation. Pills are label-only now (URL entry lives in the welcome
+    // input), so the old idle → edit → Return exercise no longer applies.
+    [g_tab_bar addTabWithBrowserId:1 title:@"New Tab"];
+    [g_tab_bar updateTabURL:1 url:@"https://example.com/path"];
+    [g_tab_bar addTabWithBrowserId:2 title:@"Documentation"];
+    [g_tab_bar updateTabURL:2 url:@"https://developer.apple.com/documentation"];
+    [g_tab_bar setActiveTab:1];
+    if (NSProcessInfo.processInfo.environment[@"BRO_UI_SMOKE_SCREENSHOT"] !=
+        nil) {
+      // Exercise the production transition. A short deferred hop leaves the
+      // initial material transaction visible to AppKit before the shell is
+      // inset.
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                     dispatch_get_main_queue(), ^{
+                       ToggleScreenshotMode();
+                     });
+    }
+    return;
+  }
+
   // Create the CEF browser in our window
   [self performSelectorOnMainThread:@selector(createBrowserInWindow)
                          withObject:nil
@@ -1661,6 +1732,26 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
                          action:BroUpdaterMenuAction()
                   keyEquivalent:@""];
   updateItem.target = BroUpdaterMenuTarget();
+  [appMenu addItem:[NSMenuItem separatorItem]];
+
+  NSMenuItem* appearanceItem =
+      [[NSMenuItem alloc] initWithTitle:@"Appearance"
+                                 action:nil
+                          keyEquivalent:@""];
+  NSMenu* appearanceMenu = [[NSMenu alloc] initWithTitle:@"Appearance"];
+  for (NSDictionary* choice in @[
+         @{ @"title" : @"System", @"tag" : @(BroAppearanceSystem) },
+         @{ @"title" : @"Light", @"tag" : @(BroAppearanceLight) },
+         @{ @"title" : @"Dark", @"tag" : @(BroAppearanceDark) },
+       ]) {
+    NSMenuItem* item =
+        [appearanceMenu addItemWithTitle:choice[@"title"]
+                                  action:@selector(selectAppearance:)
+                           keyEquivalent:@""];
+    item.tag = [choice[@"tag"] integerValue];
+  }
+  appearanceItem.submenu = appearanceMenu;
+  [appMenu addItem:appearanceItem];
   [appMenu addItem:[NSMenuItem separatorItem]];
   [appMenu addItemWithTitle:@"Quit Bro Computer"
                      action:@selector(terminate:)
@@ -1955,17 +2046,39 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
       CefRect(0, 0, bounds.size.width, bounds.size.height));
   window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
-  // Create the browser on a blank page; the address bar stays empty.
-  std::string url = "about:blank";
-  [g_pending_address_focus_containers addObject:browserContainer];
+  // Create the browser on a blank page; the welcome input takes focus once
+  // OnTabCreated's visibility update shows it. The environment-only URL hook
+  // lets the real CEF compositor run deterministic local WebGL smoke
+  // fixtures without changing normal startup behavior.
+  NSString* smokeURL = NSProcessInfo.processInfo.environment[
+      @"BRO_CEF_SMOKE_URL"];
+  std::string url = smokeURL.length > 0
+                        ? std::string(smokeURL.UTF8String)
+                        : "about:blank";
   if (!CefBrowserHost::CreateBrowser(window_info, handler, url,
                                      browser_settings, nullptr, nullptr)) {
-    [g_pending_address_focus_containers removeObject:browserContainer];
     [browserContainer removeFromSuperview];
   }
 
+  NSString* secondSmokeURL = NSProcessInfo.processInfo.environment[
+      @"BRO_CEF_SMOKE_NEW_TAB_URL"];
+  if (secondSmokeURL.length > 0) {
+    std::string secondURL(secondSmokeURL.UTF8String);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+      CreateNewBrowserTabWithURL(secondURL);
+    });
+  }
+  if (NSProcessInfo.processInfo.environment[
+          @"BRO_CEF_SMOKE_SCREENSHOT"] != nil) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+      ToggleScreenshotMode();
+    });
+  }
+
   if (g_toolbar) {
-    [g_toolbar updateURL:@""];
+    [g_toolbar updateURL:smokeURL.length > 0 ? smokeURL : @""];
   }
 }
 
@@ -1999,6 +2112,22 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 }
 
 // Menu actions
+- (void)selectAppearance:(NSMenuItem*)sender {
+  NSInteger value = sender.tag;
+  if (value < BroAppearanceSystem || value > BroAppearanceDark) {
+    return;
+  }
+  BroAppearancePreference preference = (BroAppearancePreference)value;
+  if (preference == g_appearance_preference) {
+    return;
+  }
+  g_appearance_preference = preference;
+  BroSaveAppearancePreference(preference);
+  BroApplyAppearancePreference(preference);
+  [g_main_window.contentView setNeedsDisplay:YES];
+  [g_main_window.contentView displayIfNeeded];
+}
+
 - (void)goBack:(id)sender {
   BroDismissTransientOverlays();
   if (g_toolbar) {
@@ -2267,6 +2396,12 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
 // so the default branch must stay YES to keep the rest auto-enabled.
 - (BOOL)validateMenuItem:(NSMenuItem*)menuItem {
   SEL action = menuItem.action;
+  if (action == @selector(selectAppearance:)) {
+    menuItem.state =
+        menuItem.tag == g_appearance_preference ? NSControlStateValueOn
+                                                : NSControlStateValueOff;
+    return YES;
+  }
   if (action == @selector(goBack:) || action == @selector(goForward:)) {
     // Main thread == CEF UI thread, so querying the browser directly is safe
     // and never stale (the toolbar's copy updates via dispatch_async).
@@ -2344,8 +2479,13 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   if (g_screenshot_mode_active) {
     ToggleScreenshotMode();
   }
-  if (g_toolbar) {
-    [g_toolbar focusAddressField];
+  // The pills no longer host an editable URL: a blank tab types into the
+  // welcome input, and a loaded tab gets the palette (its fallback row
+  // navigates), so ⌘L still always means "give me a typing surface".
+  if (BroWelcomeVisible()) {
+    BroWelcomeFocusInput();
+  } else {
+    ToggleCommandPalette(BroPaletteScopeAll);
   }
 }
 
@@ -2418,6 +2558,7 @@ static NSString* BroTruncateMenuTitle(NSString* title, NSUInteger maxLength) {
   // fresh for any future window.
   TeardownCommandPalette();
   BroTeardownFindBar();
+  BroTeardownWelcome();
   g_main_window = nil;
   g_toolbar = nil;
   g_tab_bar = nil;
@@ -2532,10 +2673,6 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
     return false;
   }
 
-  BOOL shouldFocusAddress =
-      [g_pending_address_focus_containers containsObject:container];
-  [g_pending_address_focus_containers removeObject:container];
-
   g_browser_views[@(browser_id)] = container;
 
   // If this was a popup's container, it is no longer pending.
@@ -2582,26 +2719,15 @@ bool OnTabCreated(int browser_id, const std::string& url, void* native_view) {
   // as it does on every other tab switch.
   UpdateWindowForViewportMode(SplitActive() ? NO : TabIsMobile(browser_id),
                               YES);
-
-  if (shouldFocusAddress) {
-    // Let adoption and layout finish before asking AppKit for its field
-    // editor. The active-ID and blank-URL guards make multiple rapid new-tab
-    // requests deterministic: only the latest still-blank tab receives focus.
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (!g_tab_bar || g_tab_bar.activeTabId != browser_id) {
-        return;
-      }
-      BroTabView* tab = [g_tab_bar tabWithBrowserId:browser_id];
-      if (tab && BroURLIsBlank(tab.tabURL)) {
-        [tab focusAddressField];
-      }
-    });
-  }
   return true;
 }
 
 bool HasTabView(int browser_id) {
   return g_browser_views[@(browser_id)] != nil;
+}
+
+bool BroTabIsBlank(int browser_id) {
+  return [g_blank_tab_ids containsObject:@(browser_id)];
 }
 
 void DetachTabView(int browser_id) {
@@ -2879,6 +3005,17 @@ void OpenLinkInNewTab(const std::string& url) {
 
 // Entry point function for the browser process.
 int main(int argc, char* argv[]) {
+  if (BroUISmokeTestEnabled()) {
+    @autoreleasepool {
+      [BroApplication sharedApplication];
+      BroAppDelegate* delegate = [[BroAppDelegate alloc] init];
+      NSApp.delegate = delegate;
+      [delegate createApplication:nil];
+      [NSApp run];
+    }
+    return 0;
+  }
+
   // Load the CEF framework library at runtime instead of linking directly
   // as required by the macOS sandbox implementation.
   CefScopedLibraryLoader library_loader;

@@ -8,18 +8,25 @@ const CGFloat kBroGlassTintAlpha = 0.18;
 const CGFloat kBroGlassBorderWidth = 1.0;
 
 NSColor* BroGlassTintColor(void) {
-  return [NSColor colorWithWhite:0.0 alpha:kBroGlassTintAlpha];
+  return [[NSColor controlBackgroundColor]
+      colorWithAlphaComponent:kBroGlassTintAlpha];
 }
 
 NSColor* BroGlassBorderColor(void) {
-  if (@available(macOS 26.0, *)) {
-    return [NSColor separatorColor];
-  }
-  return [NSColor colorWithWhite:1.0 alpha:0.12];
+  return [NSColor separatorColor];
 }
 
 NSGlassEffectViewStyle BroGlassEffectStyle(void) {
   return NSGlassEffectViewStyleRegular;
+}
+
+BOOL BroShouldUseNativeGlass(void) {
+  if (@available(macOS 26.0, *)) {
+    NSString* forced = NSProcessInfo.processInfo.environment[
+        @"BRO_FORCE_LEGACY_GLASS"];
+    return forced.length == 0 || forced.boolValue == NO;
+  }
+  return NO;
 }
 
 namespace {
@@ -276,12 +283,10 @@ void BroApplyElevation(NSView* view, BroElevation elevation) {
 }
 
 // Glass surface: the elevation's flat fill is replaced by glass while border
-// and shadow stay on the panel's own layer. The controls live in a sibling
-// host above the effect rather than NSGlassEffectView.contentView. AppKit's
-// window-owned field editor and custom Core Animation content otherwise cross
-// different compositor paths inside glass, which can leave stale text or
-// controls visible when focus changes. Older systems use the same hierarchy
-// above the established HUD blur + near-black tint.
+// and shadow stay on the panel's own layer. On macOS 26 the controls live in
+// NSGlassEffectView.contentView, the only hierarchy for which AppKit promises
+// correct placement relative to the native effect. Older systems use a
+// sibling host above the established HUD blur + adaptive tint.
 // Constraint-pinned rather than autoresized: panels are typically created at
 // NSZeroRect and sized on first show, and autoresizing from a zero-size
 // superview leaves the surface or content host with stale geometry.
@@ -296,6 +301,25 @@ static void BroPinView(NSView* view, NSView* panel) {
   ]];
 }
 
+@interface BroAdaptiveGlassTintView : NSView
+@end
+
+@implementation BroAdaptiveGlassTintView
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self) {
+    self.wantsLayer = YES;
+    self.layer.backgroundColor = BroGlassTintColor().CGColor;
+  }
+  return self;
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  self.layer.backgroundColor = BroGlassTintColor().CGColor;
+}
+@end
+
 NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius) {
   if (!panel) {
     return nil;
@@ -305,13 +329,23 @@ NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius) {
   CGFloat backdropRadius = BroCornerRadiusForSize(
       BroNestedCornerRadius(cornerRadius, 0.0), panel.bounds.size);
 
+  if (@available(macOS 26.0, *)) {
+    if (BroShouldUseNativeGlass()) {
+      NSGlassEffectView* glass =
+          [[NSGlassEffectView alloc] initWithFrame:panel.bounds];
+      glass.cornerRadius = backdropRadius;
+      glass.style = BroGlassEffectStyle();
+      glass.tintColor = nil;
+      NSView* contentHost = [[NSView alloc] initWithFrame:glass.bounds];
+      contentHost.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+      glass.contentView = contentHost;
+      BroPinView(glass, panel);
+      return contentHost;
+    }
+  }
   NSVisualEffectView* backdrop =
       [[NSVisualEffectView alloc] initWithFrame:panel.bounds];
-  if (@available(macOS 26.0, *)) {
-    backdrop.material = NSVisualEffectMaterialUnderWindowBackground;
-  } else {
-    backdrop.material = NSVisualEffectMaterialHUDWindow;
-  }
+  backdrop.material = NSVisualEffectMaterialHUDWindow;
   backdrop.blendingMode = NSVisualEffectBlendingModeBehindWindow;
   backdrop.state = NSVisualEffectStateActive;
   backdrop.wantsLayer = YES;
@@ -320,12 +354,9 @@ NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius) {
   backdrop.layer.masksToBounds = YES;
   BroPinView(backdrop, panel);
 
-  // Resolve one consistent tone for the whole shell. The blur can still show
-  // ambient color, but it no longer performs Liquid Glass lensing or local
-  // light/dark flips as content moves behind the window.
-  NSView* tint = [[NSView alloc] initWithFrame:panel.bounds];
-  tint.wantsLayer = YES;
-  tint.layer.backgroundColor = BroGlassTintColor().CGColor;
+  // Pre-26 fallback tone follows the selected/system appearance.
+  NSView* tint =
+      [[BroAdaptiveGlassTintView alloc] initWithFrame:panel.bounds];
   tint.layer.cornerRadius = backdropRadius;
   tint.layer.cornerCurve = kCACornerCurveContinuous;
   tint.layer.masksToBounds = YES;
@@ -352,37 +383,56 @@ NSView* BroInstallGlassSurface(NSView* panel, CGFloat cornerRadius) {
   contentHost.wantsLayer = YES;
   contentHost.layer.backgroundColor = [NSColor clearColor].CGColor;
   if (@available(macOS 26.0, *)) {
-    NSGlassEffectView* glass =
-        [[NSGlassEffectView alloc] initWithFrame:panel.bounds];
-    glass.cornerRadius = backdropRadius;
-    glass.style = BroGlassEffectStyle();
-    glass.tintColor = nil;
-    // Regular glass supplies its own adaptive edge. A fixed white hairline
-    // would defeat that treatment on light backgrounds.
-    panel.layer.borderWidth = 0.0;
-    panel.layer.borderColor = [NSColor clearColor].CGColor;
-    BroPinView(glass, panel);
-  } else {
-    NSVisualEffectView* glass =
-        [[NSVisualEffectView alloc] initWithFrame:panel.bounds];
-    glass.material = NSVisualEffectMaterialHUDWindow;
-    glass.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-    glass.state = NSVisualEffectStateActive;
-    glass.wantsLayer = YES;
-    glass.layer.cornerRadius = backdropRadius;
-    glass.layer.masksToBounds = YES;
-    BroPinView(glass, panel);
-    NSView* tint = [[NSView alloc] initWithFrame:panel.bounds];
-    tint.wantsLayer = YES;
-    tint.layer.backgroundColor = BroGlassTintColor().CGColor;
-    tint.layer.cornerRadius = backdropRadius;
-    tint.layer.masksToBounds = YES;
-    BroPinView(tint, panel);
+    if (BroShouldUseNativeGlass()) {
+      NSGlassEffectView* glass =
+          [[NSGlassEffectView alloc] initWithFrame:panel.bounds];
+      glass.cornerRadius = backdropRadius;
+      glass.style = BroGlassEffectStyle();
+      glass.tintColor = nil;
+      // Regular glass supplies its own adaptive edge. A fixed white hairline
+      // would defeat that treatment on light backgrounds.
+      panel.layer.borderWidth = 0.0;
+      panel.layer.borderColor = [NSColor clearColor].CGColor;
+      glass.contentView = contentHost;
+      BroPinView(glass, panel);
+      return contentHost;
+    }
   }
-  // Add last so controls always stay above both the material and fallback
-  // tint without becoming part of either effect's private view hierarchy.
+  NSVisualEffectView* glass =
+      [[NSVisualEffectView alloc] initWithFrame:panel.bounds];
+  glass.material = NSVisualEffectMaterialHUDWindow;
+  glass.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+  glass.state = NSVisualEffectStateActive;
+  glass.wantsLayer = YES;
+  glass.layer.cornerRadius = backdropRadius;
+  glass.layer.masksToBounds = YES;
+  BroPinView(glass, panel);
+  NSView* tint =
+      [[BroAdaptiveGlassTintView alloc] initWithFrame:panel.bounds];
+  tint.layer.cornerRadius = backdropRadius;
+  tint.layer.masksToBounds = YES;
+  BroPinView(tint, panel);
+  // Add last so fallback controls stay above both the material and tint.
   BroPinView(contentHost, panel);
   return contentHost;
+}
+
+NSView* BroGlassContainerForContentView(NSView* contentView,
+                                        CGFloat spacing) {
+  if (!contentView) {
+    return nil;
+  }
+  if (@available(macOS 26.0, *)) {
+    if (BroShouldUseNativeGlass()) {
+      NSGlassEffectContainerView* container =
+          [[NSGlassEffectContainerView alloc]
+              initWithFrame:contentView.frame];
+      container.spacing = MAX(0.0, spacing);
+      container.contentView = contentView;
+      return container;
+    }
+  }
+  return contentView;
 }
 
 void BroOverlayShow(NSView* view) {
@@ -513,6 +563,10 @@ void BroOverlayHide(NSView* view) {
   if (!container || !view || !view.superview) {
     return;
   }
+  // CALayer stores a resolved CGColor, so refresh it at interaction time in
+  // case the app's explicit/system appearance changed while the group rested.
+  highlightLayer_.backgroundColor =
+      [[NSColor labelColor] colorWithAlphaComponent:0.08].CGColor;
   dismissGeneration_++;
   BOOL wasVisible = highlightLayer_.opacity > 0.001 ||
                     ((CALayer*)highlightLayer_.presentationLayer).opacity > 0.001;

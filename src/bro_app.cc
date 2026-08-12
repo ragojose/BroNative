@@ -4,6 +4,7 @@
 
 #include "bro_app.h"
 
+#include <cstdlib>
 #include <string>
 
 #include "include/cef_command_line.h"
@@ -29,6 +30,11 @@ void BroApp::OnBeforeCommandLineProcessing(
   command_line->AppendSwitch("enable-gpu");
   command_line->AppendSwitchWithValue("use-angle", "metal");
   command_line->AppendSwitch("ignore-gpu-blocklist");
+  // Isolated UI smoke tests must never ask for the user's login-keychain
+  // password. Production launches leave Chromium's secure storage untouched.
+  if (std::getenv("BRO_USE_MOCK_KEYCHAIN")) {
+    command_line->AppendSwitch("use-mock-keychain");
+  }
 
   // Chrome's Reading Mode ships in CEF without the profile plumbing it
   // expects: its page-load-metrics observer dereferences a null side-panel

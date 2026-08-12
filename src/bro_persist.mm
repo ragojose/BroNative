@@ -5,6 +5,9 @@
 
 #import "bro_persist.h"
 
+static NSString* const kBroPreferencesFilename = @"preferences.json";
+static NSString* const kBroAppearancePreferenceKey = @"appearance";
+
 NSString* BroUserDataDirectory(void) {
   static NSString* dir = nil;
   static dispatch_once_t once;
@@ -46,4 +49,36 @@ void BroSaveJSONFile(NSString* filename, id obj) {
   NSString* path =
       [BroUserDataDirectory() stringByAppendingPathComponent:filename];
   [data writeToFile:path options:NSDataWritingAtomic error:nil];
+}
+
+BroAppearancePreference BroLoadAppearancePreference(void) {
+  id value = BroLoadJSONFile(kBroPreferencesFilename);
+  if (![value isKindOfClass:[NSDictionary class]]) {
+    return BroAppearanceSystem;
+  }
+  NSString* appearance = ((NSDictionary*)value)[kBroAppearancePreferenceKey];
+  if ([appearance isEqualToString:@"light"]) {
+    return BroAppearanceLight;
+  }
+  if ([appearance isEqualToString:@"dark"]) {
+    return BroAppearanceDark;
+  }
+  return BroAppearanceSystem;
+}
+
+void BroSaveAppearancePreference(BroAppearancePreference preference) {
+  NSString* value = @"system";
+  if (preference == BroAppearanceLight) {
+    value = @"light";
+  } else if (preference == BroAppearanceDark) {
+    value = @"dark";
+  }
+
+  id existing = BroLoadJSONFile(kBroPreferencesFilename);
+  NSMutableDictionary* preferences =
+      [existing isKindOfClass:[NSDictionary class]]
+          ? [existing mutableCopy]
+          : [NSMutableDictionary dictionary];
+  preferences[kBroAppearancePreferenceKey] = value;
+  BroSaveJSONFile(kBroPreferencesFilename, preferences);
 }
