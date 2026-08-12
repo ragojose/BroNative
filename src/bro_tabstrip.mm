@@ -611,8 +611,9 @@ void BroFetchFaviconGuarded(NSString* urlString,
 - (void)setTabURL:(NSString*)url {
   NSString* newURL = [url copy] ?: @"";
   if (![_tabURL isEqualToString:newURL]) {
-    // The cached meta description belongs to the old page.
+    // The cached meta description and snapshot belong to the old page.
     _pageDescription = nil;
+    _pageThumbnail = nil;
   }
   _tabURL = newURL;
   NSString* display = BroURLIsBlank(_tabURL)
@@ -1167,15 +1168,18 @@ void BroFetchFaviconGuarded(NSString* urlString,
 // The tab bar owning the hover lifecycle; told when the mouse enters/leaves
 // the card so the grace-period hide can be canceled and re-armed.
 @property (nonatomic, weak) BroTabBar* hoverDelegate;
-// Populates the labels and resizes self to fit; caller positions the frame.
+// Populates the labels and snapshot band and resizes self to fit; caller
+// positions the frame.
 - (void)setTitle:(NSString*)title
              url:(NSString*)url
      pageDescription:(NSString*)desc
+       thumbnail:(NSImage*)thumbnail
            width:(CGFloat)width;
 @end
 
 @implementation BroTabHoverCard {
   NSView* contentHost_;
+  NSView* thumbnailView_;
   BroShimmerTextView* titleLabel_;
   NSTextField* urlLabel_;
   NSTextField* descriptionLabel_;
@@ -1218,6 +1222,21 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     descriptionLabel_ = BroHoverCardLabel(BroUIFont(11.0), 0.75);
     descriptionLabel_.lineBreakMode = NSLineBreakByWordWrapping;
     descriptionLabel_.cell.wraps = YES;
+
+    // Page snapshot band; absent until a capture lands. A plain layer-backed
+    // view rather than an NSImageView: aspect-fill + masksToBounds center-
+    // crops captures whose aspect differs from the band's (e.g. the portrait
+    // mobile-emulation viewport).
+    thumbnailView_ = [[NSView alloc] initWithFrame:NSZeroRect];
+    thumbnailView_.wantsLayer = YES;
+    thumbnailView_.layer.masksToBounds = YES;
+    thumbnailView_.layer.contentsGravity = kCAGravityResizeAspectFill;
+    // Hairline to seat light page content on the glass.
+    thumbnailView_.layer.borderWidth = 1.0;
+    thumbnailView_.layer.borderColor =
+        [[NSColor labelColor] colorWithAlphaComponent:0.08].CGColor;
+    thumbnailView_.hidden = YES;
+    [contentHost_ addSubview:thumbnailView_];
     [contentHost_ addSubview:titleLabel_];
     [contentHost_ addSubview:urlLabel_];
     [contentHost_ addSubview:descriptionLabel_];
@@ -1270,6 +1289,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 - (void)setTitle:(NSString*)title
              url:(NSString*)url
      pageDescription:(NSString*)desc
+       thumbnail:(NSImage*)thumbnail
            width:(CGFloat)width {
   const CGFloat padX = 12.0;
   const CGFloat padY = 10.0;
@@ -1280,6 +1300,11 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   urlLabel_.stringValue = url ?: @"";
   descriptionLabel_.stringValue = desc ?: @"";
   descriptionLabel_.hidden = desc.length == 0;
+  thumbnailView_.hidden = thumbnail == nil;
+  thumbnailView_.layer.contents =
+      thumbnail
+          ? (id)[thumbnail CGImageForProposedRect:NULL context:nil hints:nil]
+          : nil;
   self.accessibilityLabel = title.length > 0
       ? [NSString stringWithFormat:@"Tab preview: %@", title]
       : @"Tab preview";
@@ -1301,11 +1326,21 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
   // Space between the text block and the action-button row beneath it.
   const CGFloat buttonRowGap = 8.0;
+  // Space between the snapshot band and the title beneath it.
+  const CGFloat thumbnailGap = 8.0;
+  CGFloat thumbnailWidth = width - kHoverCardThumbnailInset * 2;
+  CGFloat thumbnailHeight =
+      thumbnail ? round(thumbnailWidth * kHoverCardThumbnailAspect) : 0;
 
   CGFloat height = padY * 2 + titleHeight + rowGap + urlHeight +
                    buttonRowGap + kHoverCardButtonSize;
   if (descriptionHeight > 0) {
     height += rowGap + descriptionHeight;
+  }
+  if (thumbnailHeight > 0) {
+    // The snapshot band swaps the top text padding for its tighter inset.
+    height +=
+        thumbnailHeight + thumbnailGap + kHoverCardThumbnailInset - padY;
   }
 
   // Flipped-less (default) coords: title on top, buttons at the bottom. The
@@ -1328,6 +1363,13 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   urlLabel_.frame = NSMakeRect(padX, y, textWidth, urlHeight);
   y += urlHeight + rowGap;
   titleLabel_.frame = NSMakeRect(padX, y, textWidth, titleHeight);
+  if (thumbnailHeight > 0) {
+    y += titleHeight + thumbnailGap;
+    thumbnailView_.layer.cornerRadius = BroNestedCornerRadius(
+        self.layer.cornerRadius, kHoverCardThumbnailInset);
+    thumbnailView_.frame = NSMakeRect(kHoverCardThumbnailInset, y,
+                                      thumbnailWidth, thumbnailHeight);
+  }
 
   [self setFrameSize:NSMakeSize(width, height)];
 }
@@ -2457,11 +2499,13 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     [hoverCard_ setTitle:kBroBlankTabTitle
                      url:@"Ask anything…"
          pageDescription:nil
+               thumbnail:nil
                    width:width];
   } else {
     [hoverCard_ setTitle:[self hoverCardTitleForTab:tab]
                      url:BroDisplayHostForURL(tab.tabURL)
          pageDescription:tab.pageDescription
+               thumbnail:tab.pageThumbnail
                    width:width];
   }
   [self positionHoverCardForTab:tab animated:wasVisible];
@@ -2469,10 +2513,22 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
   // Fetch the description on first hover per page; the card shows right away
   // with title + URL and fills in when (if) the result arrives.
-  if (tab.pageDescription == nil && !BroURLIsBlank(tab.tabURL)) {
+  if (!BroURLIsBlank(tab.tabURL)) {
     BroHandler* handler = BroHandler::GetInstance();
     if (handler) {
-      handler->FetchTabDescription(tab.browserId);
+      if (tab.pageDescription == nil) {
+        handler->FetchTabDescription(tab.browserId);
+      }
+      // Snapshot: refresh a visible tab (its compositor is live), or make a
+      // best-effort first capture for a background tab that has none — a
+      // hidden browser often still serves its last surface frame; if the
+      // capture never resolves, the card simply stays text-only.
+      BOOL visibleTab =
+          tab.browserId == _activeTabId ||
+          (SplitActive() && tab.browserId == g_split_browser_id);
+      if (visibleTab || tab.pageThumbnail == nil) {
+        handler->FetchTabThumbnail(tab.browserId);
+      }
     }
   }
 }
@@ -2512,6 +2568,32 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
       [hoverCard_ setTitle:[self hoverCardTitleForTab:tab]
                        url:BroDisplayHostForURL(tab.tabURL)
            pageDescription:tab.pageDescription
+                 thumbnail:tab.pageThumbnail
+                     width:hoverCard_.frame.size.width];
+      [self positionHoverCardForTab:tab animated:YES];
+    }
+    break;
+  }
+}
+
+- (void)updateTabThumbnail:(int)browserId image:(NSImage*)image {
+  if (!image) {
+    return;
+  }
+  for (BroTabView* tab in _tabs) {
+    if (tab.browserId != browserId) {
+      continue;
+    }
+    tab.pageThumbnail = image;
+    // Live-fill the visible card (the frame re-spring animates the growth).
+    // A tab that went blank since the capture keeps its "New Tab" card
+    // instead of a stale page's snapshot.
+    if (hoverCardTabId_ == browserId && hoverCard_ && !hoverCard_.hidden &&
+        !BroURLIsBlank(tab.tabURL)) {
+      [hoverCard_ setTitle:[self hoverCardTitleForTab:tab]
+                       url:BroDisplayHostForURL(tab.tabURL)
+           pageDescription:tab.pageDescription
+                 thumbnail:tab.pageThumbnail
                      width:hoverCard_.frame.size.width];
       [self positionHoverCardForTab:tab animated:YES];
     }
