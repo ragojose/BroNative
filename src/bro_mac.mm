@@ -301,6 +301,7 @@ static NSView* BroCreateGlassTransitionOverlay(NSView* parent,
 @property (nonatomic, strong) BroToolbar* navToolbar;
 @property (nonatomic, strong) BroTabBar* tabBar;
 @property (nonatomic, strong) NSView* shellSurface;
+@property (nonatomic, strong) NSView* chromeSurface;
 @property (nonatomic, strong) NSView* borderOverlay;
 - (BOOL)glassBackdropVisible;
 - (void)setGlassBackdropVisible:(BOOL)visible;
@@ -346,22 +347,40 @@ NSView* BroBrowserContainerView(void) {
     self.contentView = content;
     g_shell_corner_radius = BroResolveShellCornerRadius(self);
 
-    // A single stable shell-wide blur removes the material boundary at the
-    // page edge without stretching Liquid Glass lensing across the content
-    // area. Opaque CEF pages are composited above it in the browser area.
+    // A single stable, non-lensing shell blur removes the material boundary
+    // at the page edge. Window-sized Liquid Glass corrupts its refractive
+    // backing texture on large Retina windows, so native lensing is reserved
+    // for the constant-height chrome and bounded controls above this surface.
+    // Opaque CEF pages are composited above it in the browser area.
     NSView* shellSurface = [[NSView alloc] initWithFrame:frame];
     shellSurface.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    NSView* shellContent =
-        BroInstallShellSurface(shellSurface, BroShellCornerRadius());
+    BroInstallShellSurface(shellSurface, BroShellCornerRadius());
     [content addSubview:shellSurface];
     _shellSurface = shellSurface;
 
+    // The native refractive surface is restricted to the constant-height
+    // chrome band. Its texture budget therefore stays stable as the window
+    // grows vertically, while AppKit can still render the same Liquid Glass
+    // treatment across the full toolbar width. Older systems use the shell
+    // backdrop directly and avoid stacking two visual-effect materials.
+    CGFloat toolbarY = frame.size.height - kToolbarHeight;
+    NSView* chromeSurface = [[NSView alloc]
+        initWithFrame:NSMakeRect(0, toolbarY, frame.size.width, kToolbarHeight)];
+    chromeSurface.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    NSView* chromeContent = chromeSurface;
+    if (@available(macOS 26.0, *)) {
+      if (BroShouldUseNativeGlass()) {
+        chromeContent = BroInstallGlassSurface(chromeSurface, 0.0);
+      }
+    }
+    [content addSubview:chromeSurface];
+    _chromeSurface = chromeSurface;
+
     // Single chrome row at the very top; its content is inset past the
     // traffic lights.
-    CGFloat toolbarY = frame.size.height - kToolbarHeight;
     _navToolbar = [[BroToolbar alloc]
-        initWithFrame:NSMakeRect(0, toolbarY, frame.size.width, kToolbarHeight)];
-    [shellContent addSubview:_navToolbar];
+        initWithFrame:NSMakeRect(0, 0, frame.size.width, kToolbarHeight)];
+    [chromeContent addSubview:_navToolbar];
     g_toolbar = _navToolbar;
 
     // Tab strip inline in the toolbar row: after the nav buttons, before the
@@ -1072,9 +1091,8 @@ void UpdateWindowForViewportMode(BOOL mobile, BOOL animate,
 // Cmd+S (View menu) hides the toolbar -- and the tab strip nested inside it,
 // since BroTabBar is one of its subviews -- and the traffic lights, leaving
 // an Arc-style frame: the page sits as a rounded card inset by
-// kScreenshotModeGutter on all four sides, with the window's existing glass
-// (the same material the chrome row already wears -- setGlassBackdropVisible:
-// below) showing through the gutter, and the existing hairline
+// kScreenshotModeGutter on all four sides, with the window's stable shell
+// material showing through the gutter, and the existing hairline
 // (BroWindowBorderView) still tracing the true window edge outside all of
 // it. The active tab's container(s) already fill 100% of browserContainer's
 // bounds in every mode -- desktop, mobile, split -- so animating just
@@ -1161,10 +1179,11 @@ static void ToggleScreenshotMode(void) {
                           contentBounds.size.height - kToolbarHeight);
 
   if (!active) {
-    // Make the toolbar visible again before fading it in -- a hidden view's
-    // alpha animation never draws.
+    // Make the whole glass band visible again before fading it in -- a hidden
+    // view's alpha animation never draws.
+    g_main_window.chromeSurface.hidden = NO;
+    g_main_window.chromeSurface.alphaValue = 0.0;
     g_toolbar.hidden = NO;
-    g_toolbar.alphaValue = 0.0;
   }
 
   // The card's own corner radius derives from the window's (bro_geometry's
@@ -1182,10 +1201,11 @@ static void ToggleScreenshotMode(void) {
       : 0.0;
 
   BroRunLayoutSpring(^{
-    g_toolbar.animator.alphaValue = active ? 0.0 : 1.0;
+    g_main_window.chromeSurface.animator.alphaValue = active ? 0.0 : 1.0;
     g_main_window.browserContainer.animator.frame = containerTarget;
     containerLayer.cornerRadius = cardRadius;
   }, ^{
+    g_main_window.chromeSurface.hidden = active;
     g_toolbar.hidden = active;
     UpdateChromeLayout();  // final snap: exact per-tab/divider frames
     BroHandler* handler = BroHandler::GetInstance();

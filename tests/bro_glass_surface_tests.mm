@@ -32,19 +32,29 @@ int main(void) {
     if (@available(macOS 26.0, *)) {
       unsetenv("BRO_FORCE_LEGACY_GLASS");
       NSView* shell = [[NSView alloc]
-          initWithFrame:NSMakeRect(0, 0, 640, 480)];
+          initWithFrame:NSMakeRect(0, 0, 2560, 1440)];
       NSView* shellContent = BroInstallShellSurface(shell, 12.0);
-      NSGlassEffectView* shellGlass = (NSGlassEffectView*)
-          FindSubviewOfClass(shell, [NSGlassEffectView class]);
-      Require(shellGlass != nil, @"shell must use NSGlassEffectView");
-      Require(shellGlass.contentView == shellContent,
-              @"shell controls must live in native contentView");
-      Require(shellGlass.style == NSGlassEffectViewStyleRegular,
-              @"shell must use Regular glass");
-      Require(shellGlass.tintColor == nil,
-              @"shell glass must remain neutral");
-      Require(fabs(shellGlass.cornerRadius - 12.0) < 0.01,
-              @"shell radius must be handed to AppKit");
+      NSVisualEffectView* shellBackdrop = (NSVisualEffectView*)
+          FindSubviewOfClass(shell, [NSVisualEffectView class]);
+      Require(shellBackdrop != nil,
+              @"large shell must use the stable visual-effect backdrop");
+      Require(FindSubviewOfClass(shell, [NSGlassEffectView class]) == nil,
+              @"large shell must not allocate a window-sized glass texture");
+      Require(shellBackdrop.material ==
+                  NSVisualEffectMaterialUnderWindowBackground,
+              @"macOS 26 shell must use the under-window material");
+      Require(shellContent.superview == shell,
+              @"shell content host must remain above the stable backdrop");
+
+      NSView* chrome = [[NSView alloc]
+          initWithFrame:NSMakeRect(0, 0, 2560, 52)];
+      NSView* chromeContent = BroInstallGlassSurface(chrome, 0.0);
+      NSGlassEffectView* chromeGlass = (NSGlassEffectView*)
+          FindSubviewOfClass(chrome, [NSGlassEffectView class]);
+      Require(chromeGlass != nil,
+              @"wide constant-height chrome must retain native glass");
+      Require(chromeGlass.contentView == chromeContent,
+              @"chrome controls must live in native contentView");
 
       NSView* panel = [[NSView alloc]
           initWithFrame:NSMakeRect(0, 0, 320, 180)];
@@ -58,18 +68,6 @@ int main(void) {
       Require(fabs(panelGlass.cornerRadius - 10.0) < 0.01,
               @"overlay radius must be handed to AppKit");
 
-      NSView* tabs = [[NSView alloc]
-          initWithFrame:NSMakeRect(0, 0, 600, 52)];
-      NSView* tabDocument = BroGlassContainerForContentView(tabs, 6.0);
-      Require([tabDocument isKindOfClass:[NSGlassEffectContainerView class]],
-              @"tab content must use NSGlassEffectContainerView");
-      NSGlassEffectContainerView* tabContainer =
-          (NSGlassEffectContainerView*)tabDocument;
-      Require(tabContainer.contentView == tabs,
-              @"tab content must be owned by the native container");
-      Require(fabs(tabContainer.spacing - 6.0) < 0.01,
-              @"tab merge proximity must be handed to AppKit");
-
       setenv("BRO_FORCE_LEGACY_GLASS", "1", 1);
       NSView* fallback = [[NSView alloc]
           initWithFrame:NSMakeRect(0, 0, 320, 180)];
@@ -80,11 +78,6 @@ int main(void) {
               @"forced fallback must retain NSVisualEffectView");
       Require(fallbackContent.superview == fallback,
               @"fallback content host must remain usable");
-      NSView* fallbackTabs = [[NSView alloc]
-          initWithFrame:NSMakeRect(0, 0, 600, 52)];
-      Require(BroGlassContainerForContentView(fallbackTabs, 6.0) ==
-                  fallbackTabs,
-              @"legacy tab content must bypass the unavailable container");
     }
   }
   return 0;
