@@ -20,7 +20,6 @@ static const CGFloat kActiveTabBorderAlpha = 0.28;
 static const CGFloat kHoveredTabBorderAlpha = 0.18;
 // Resting pills keep the strip's 8pt gap. As a dragged pill comes within 6pt
 // of a neighbor, AppKit's glass container performs the native merge/split.
-static const CGFloat kTabGlassMergeSpacing = 6.0;
 static const CFTimeInterval kTabColorTransitionDuration = 0.18;
 
 static NSDictionary* BroTabLayerTransitionActions(void) {
@@ -419,9 +418,10 @@ void BroFetchFaviconGuarded(NSString* urlString,
 }
 
 @implementation BroTabView {
-  // Every macOS 26 pill owns a native glass descendant so the tab strip's
-  // NSGlassEffectContainerView can batch it and merge neighboring pills
-  // during drag. Older systems retain the established HUD fallback.
+  // Every macOS 26 pill owns a bounded native glass descendant. Keeping each
+  // effect independent prevents AppKit's rectangular batch texture from
+  // leaking behind the strip on large Retina windows. Older systems retain
+  // the established HUD fallback.
   NSView* glassBackdrop_;
   NSView* pillContentHost_;
   BOOL nativeGlassBackdrop_;
@@ -460,8 +460,7 @@ void BroFetchFaviconGuarded(NSString* urlString,
     self.focusRingType = NSFocusRingTypeNone;
 
     // Native pills stay neutral; selection is layered through adaptive
-    // content and a restrained fill so all descendants remain sufficiently
-    // similar for NSGlassEffectContainerView to merge them.
+    // content and a restrained fill.
     if (@available(macOS 26.0, *)) {
       if (BroShouldUseNativeGlass()) {
         NSGlassEffectView* glass =
@@ -1347,7 +1346,6 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
 
 @implementation BroTabBar {
   BroHorizontalTabScrollView* tabScrollView_;
-  NSView* tabDocumentView_;
   NSView* tabContentView_;
   BroTabView* draggingTab_;
   BOOL dragging_;
@@ -1400,9 +1398,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
     tabContentView_ =
         [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 0, frame.size.height)];
     tabContentView_.wantsLayer = YES;
-    tabDocumentView_ = BroGlassContainerForContentView(
-        tabContentView_, kTabGlassMergeSpacing);
-    tabScrollView_.documentView = tabDocumentView_;
+    tabScrollView_.documentView = tabContentView_;
     [self addSubview:tabScrollView_];
 
     // Borderless "+" control, pinned between the scroll viewport and Search.
@@ -2040,8 +2036,7 @@ NSTextField* BroHoverCardLabel(NSFont* font, CGFloat whiteAlpha) {
   }
 
   CGFloat documentWidth = MAX(viewportWidth, x);
-  tabDocumentView_.frame = NSMakeRect(0, 0, documentWidth, height);
-  tabContentView_.frame = tabDocumentView_.bounds;
+  tabContentView_.frame = NSMakeRect(0, 0, documentWidth, height);
   [self clampScrollOffset];
 
   // The "+" trails the last pill by one gap (`x` already carries it) so it

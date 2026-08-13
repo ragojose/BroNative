@@ -52,7 +52,7 @@ extern void BroRunLayoutSpring(void (^changes)(void),
 
 extern void BroApplyElevation(NSView* view, BroElevation elevation);
 
-// Shared material tokens for every glass surface. macOS 26 uses untinted
+// Shared material tokens for bounded glass surfaces. macOS 26 uses untinted
 // Regular glass; older systems retain an appearance-adaptive HUD fallback.
 extern const CGFloat kBroGlassTintAlpha;
 extern const CGFloat kBroGlassBorderWidth;
@@ -60,13 +60,15 @@ extern NSColor* BroGlassTintColor(void);
 extern NSColor* BroGlassBorderColor(void);
 extern NSGlassEffectViewStyle BroGlassEffectStyle(void)
     API_AVAILABLE(macos(26.0));
-// Runtime gate shared by every native surface. BRO_FORCE_LEGACY_GLASS=1 is a
-// test seam for exercising the macOS 12–25 fallback on a macOS 26 machine.
+// Runtime gate shared by native control and overlay surfaces.
+// BRO_FORCE_LEGACY_GLASS=1 is a test seam for exercising the macOS 12–25
+// fallback on a macOS 26 machine.
 extern BOOL BroShouldUseNativeGlass(void);
 
-// Installs the shell-sized native Liquid Glass backdrop on macOS 26. The
-// returned host is NSGlassEffectView.contentView there; older systems receive
-// the same content over the existing visual-effect fallback.
+// Installs the stable window-sized AppKit backdrop. The shell deliberately
+// stays non-lensing at every OS version because a full-window
+// NSGlassEffectView corrupts its backing texture on large Retina windows;
+// bounded controls and overlays still use native Liquid Glass on macOS 26.
 extern NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius);
 
 // Replaces the elevation's flat fill with the shared glass surface and
@@ -75,10 +77,6 @@ extern NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius);
 // the existing HUD blur + tint.
 // Call after BroApplyElevation and add all visible content to the result.
 extern NSView* BroInstallGlassSurface(NSView* panel, CGFloat cornerRadius);
-// Wraps related glass descendants in AppKit's batching/merging container on
-// macOS 26 and returns |contentView| unchanged on the legacy path.
-extern NSView* BroGlassContainerForContentView(NSView* contentView,
-                                               CGFloat spacing);
 extern void BroOverlayShow(NSView* view);
 extern void BroOverlayHide(NSView* view);
 

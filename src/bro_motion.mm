@@ -329,23 +329,22 @@ NSView* BroInstallShellSurface(NSView* panel, CGFloat cornerRadius) {
   CGFloat backdropRadius = BroCornerRadiusForSize(
       BroNestedCornerRadius(cornerRadius, 0.0), panel.bounds.size);
 
-  if (@available(macOS 26.0, *)) {
-    if (BroShouldUseNativeGlass()) {
-      NSGlassEffectView* glass =
-          [[NSGlassEffectView alloc] initWithFrame:panel.bounds];
-      glass.cornerRadius = backdropRadius;
-      glass.style = BroGlassEffectStyle();
-      glass.tintColor = nil;
-      NSView* contentHost = [[NSView alloc] initWithFrame:glass.bounds];
-      contentHost.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-      glass.contentView = contentHost;
-      BroPinView(glass, panel);
-      return contentHost;
-    }
-  }
+  // Keep the window-sized shell on AppKit's non-lensing material. A regular
+  // NSGlassEffectView allocates a refractive backdrop for its whole bounds;
+  // once a Retina window grows large enough, that surface starts dropping or
+  // stretching texture tiles during live move/resize. Liquid Glass remains on
+  // the bounded controls and overlays above this backdrop, where AppKit can
+  // render and batch it reliably.
+  //
+  // Under-window background is the native macOS 26 shell material. Older
+  // systems retain the established HUD blur.
   NSVisualEffectView* backdrop =
       [[NSVisualEffectView alloc] initWithFrame:panel.bounds];
-  backdrop.material = NSVisualEffectMaterialHUDWindow;
+  if (@available(macOS 26.0, *)) {
+    backdrop.material = NSVisualEffectMaterialUnderWindowBackground;
+  } else {
+    backdrop.material = NSVisualEffectMaterialHUDWindow;
+  }
   backdrop.blendingMode = NSVisualEffectBlendingModeBehindWindow;
   backdrop.state = NSVisualEffectStateActive;
   backdrop.wantsLayer = YES;
@@ -415,24 +414,6 @@ NSView* BroInstallGlassSurface(NSView* panel, CGFloat cornerRadius) {
   // Add last so fallback controls stay above both the material and tint.
   BroPinView(contentHost, panel);
   return contentHost;
-}
-
-NSView* BroGlassContainerForContentView(NSView* contentView,
-                                        CGFloat spacing) {
-  if (!contentView) {
-    return nil;
-  }
-  if (@available(macOS 26.0, *)) {
-    if (BroShouldUseNativeGlass()) {
-      NSGlassEffectContainerView* container =
-          [[NSGlassEffectContainerView alloc]
-              initWithFrame:contentView.frame];
-      container.spacing = MAX(0.0, spacing);
-      container.contentView = contentView;
-      return container;
-    }
-  }
-  return contentView;
 }
 
 void BroOverlayShow(NSView* view) {
